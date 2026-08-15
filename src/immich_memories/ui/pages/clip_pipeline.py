@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+import math
+from typing import TYPE_CHECKING, Any
 
 from nicegui import run, ui
 
 from immich_memories.api.immich import SyncImmichClient
-from immich_memories.api.models import VideoClipInfo
+from immich_memories.api.models import Asset, VideoClipInfo
+from immich_memories.planning.auto_duration import (
+    AutoDurationResult,
+    resolve_trip_auto_duration,
+)
 from immich_memories.ui.pages.clip_pipeline_helpers import (
     _poll_detail_cards,
     _poll_phase,
@@ -19,9 +24,21 @@ from immich_memories.ui.state import get_app_state
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from immich_memories.processing.timeline_budget import TimelinePlan
+
 
 class PipelineCancelled(Exception):
     """Raised when the user cancels the pipeline from the UI."""
+
+
+def _pipeline_summary_counts(result: dict) -> tuple[int, int, int]:
+    """Return reviewed, expensive-analysis, and final-plan counts."""
+    stats = result.get("stats", {})
+    eligible = int(stats.get("eligible_count", stats.get("total_analyzed", 0)))
+    deep = int(stats.get("deeply_analyzed_count", stats.get("total_analyzed", 0)))
+    planned = int(stats.get("planned_count", stats.get("selected_count", 0)))
+    return eligible, deep, planned
 
 
 def render_phase_indicator(current_phase: int, total_phases: int = 4) -> None:
@@ -48,27 +65,32 @@ def render_pipeline_summary(result: dict) -> None:
     stats = result.get("stats", {})
     errors = result.get("errors", [])
 
-    selected_count = stats.get("selected_count", 0)
-    total_analyzed = stats.get("total_analyzed", 0)
+    eligible_count, deeply_analyzed_count, planned_count = _pipeline_summary_counts(result)
     error_count = stats.get("error_count", 0)
     elapsed = stats.get("elapsed_seconds", 0)
 
     with ui.card().classes("w-full p-4").style("background: var(--im-success-bg)"):
         ui.label(
-            f"Pipeline complete! Selected {selected_count} clips from {total_analyzed} analyzed."
+            f"Pipeline complete! Planned {planned_count} clips from "
+            f"{eligible_count} eligible media items."
         ).classes("font-semibold").style("color: var(--im-success-text)")
 
         with ui.row().classes("w-full gap-8 mt-4"):
             with ui.column().classes("items-center"):
-                ui.label("Clips Selected").classes("text-sm").style(
+                ui.label("Media Eligible").classes("text-sm").style(
                     "color: var(--im-text-secondary)"
                 )
-                ui.label(str(selected_count)).classes("text-2xl font-bold")
+                ui.label(str(eligible_count)).classes("text-2xl font-bold")
             with ui.column().classes("items-center"):
-                ui.label("Clips Analyzed").classes("text-sm").style(
+                ui.label("Videos Deeply Analyzed").classes("text-sm").style(
                     "color: var(--im-text-secondary)"
                 )
-                ui.label(str(total_analyzed)).classes("text-2xl font-bold")
+                ui.label(str(deeply_analyzed_count)).classes("text-2xl font-bold")
+            with ui.column().classes("items-center"):
+                ui.label("Clips Planned").classes("text-sm").style(
+                    "color: var(--im-text-secondary)"
+                )
+                ui.label(str(planned_count)).classes("text-2xl font-bold")
             with ui.column().classes("items-center"):
                 ui.label("Time Elapsed").classes("text-sm").style("color: var(--im-text-secondary)")
                 time_str = f"{elapsed / 60:.1f}m" if elapsed > 60 else f"{elapsed:.0f}s"
@@ -158,8 +180,106 @@ def _make_progress_callback(progress_state: dict[str, Any]) -> Any:
     return on_progress
 
 
+def _eligible_pipeline_media(
+    state: Any,
+    clips: list[VideoClipInfo],
+) -> tuple[list[VideoClipInfo], list[Asset]]:
+    """Return only media explicitly kept in the Step 2 review."""
+    eligible_clips = [clip for clip in clips if clip.asset.id in state.selected_clip_ids]
+    eligible_photos = []
+    if state.include_photos:
+        eligible_photos = [
+            photo for photo in state.photo_assets if photo.id in state.selected_photo_ids
+        ]
+    return eligible_clips, eligible_photos
+
+
+def _resolve_auto_duration_for_selection(
+    state: Any,
+    clips: list[VideoClipInfo],
+    photos: list[Asset],
+) -> AutoDurationResult | None:
+    """Resolve trip Auto duration from the reviewed eligible media."""
+    if state.memory_type != "trip" or state.duration_mode != "auto":
+        return None
+
+    config = state.config
+    if config is None:
+        from immich_memories.config import get_config
+
+        config = get_config()
+    title_config = config.title_screens
+    title_duration = title_config.title_duration if title_config.enabled else 0.0
+    ending_duration = title_config.ending_duration if title_config.enabled else 0.0
+    result = resolve_trip_auto_duration(
+        clips,
+        photos,
+        avg_clip_duration=float(state.avg_clip_duration),
+        photo_duration=state.photo_duration,
+        title_duration=title_duration,
+        ending_duration=ending_duration,
+    )
+    state.target_duration = result.total_seconds / 60.0
+    if result.total_seconds > 0:
+        state.pipeline_config["target_clips"] = max(
+            1,
+            math.ceil(result.total_seconds / state.avg_clip_duration),
+        )
+    return result
+
+
+def _configure_timeline_for_selection(
+    state: Any,
+    clips: list[VideoClipInfo],
+    photos: list[Asset],
+) -> TimelinePlan:
+    """Persist one preliminary timeline and apply its content budget."""
+    from pathlib import Path
+
+    from immich_memories.generate import GenerationParams
+    from immich_memories.generate_settings import _build_title_settings
+    from immich_memories.processing.timeline_budget import plan_timeline
+
+    config = state.config
+    if config is None:
+        from immich_memories.config import get_config
+
+        config = get_config()
+    person = state.selected_person
+    date_range = state.date_range
+    planning_params = GenerationParams(
+        clips=clips,
+        output_path=Path("ui-timeline-plan.mp4"),
+        config=config,
+        memory_type=state.memory_type,
+        person_name=person.name if person else None,
+        date_start=date_range.start if date_range else None,
+        date_end=date_range.end if date_range else None,
+        memory_preset_params=state.memory_preset_params,
+    )
+    title_settings = _build_title_settings(planning_params, config, [])
+    average = float(state.pipeline_config.get("avg_clip_duration", state.avg_clip_duration))
+    plan = plan_timeline(
+        [*clips, *photos],
+        title_settings,
+        state.target_duration_seconds,
+        state.memory_type,
+        expected_clip_duration=average,
+        transition_mode="smart",
+        transition_duration=config.defaults.transition_duration,
+    )
+    state.timeline_plan = plan
+    state.pipeline_config["target_duration_seconds"] = plan.content_budget
+    state.pipeline_config["target_clips"] = max(1, math.ceil(plan.content_budget / average))
+    return plan
+
+
 def _run_pipeline_blocking(
-    state: Any, config: Any, clips: list[VideoClipInfo], progress_state: dict[str, Any]
+    state: Any,
+    config: Any,
+    clips: list[VideoClipInfo],
+    photos: list[Asset],
+    progress_state: dict[str, Any],
 ) -> None:
     """Run the SmartPipeline in a background thread — no UI calls here."""
     from immich_memories.analysis.smart_pipeline import SmartPipeline
@@ -171,6 +291,7 @@ def _run_pipeline_blocking(
         with SyncImmichClient(
             base_url=state.immich_url,
             api_key=state.immich_api_key,
+            api_version=state.immich_api_version,
         ) as client:
             from immich_memories.config import get_config
 
@@ -192,14 +313,14 @@ def _run_pipeline_blocking(
 
             # Merge photos into the unified pool (same as CLI path)
             all_candidates = analyzed
-            if state.include_photos and state.photo_assets:
+            if state.include_photos and photos:
                 from pathlib import Path
 
                 from immich_memories.cli._pipeline_runner import _merge_photos_into_pool
 
                 all_candidates = _merge_photos_into_pool(
                     analyzed,
-                    photo_assets=state.photo_assets,
+                    photo_assets=photos,
                     include_photos=True,
                     config=app_config,
                     client=client,
@@ -207,6 +328,13 @@ def _run_pipeline_blocking(
                 )
 
             result = pipeline.run_selection(all_candidates)
+            result.stats.update(
+                {
+                    "eligible_count": len(clips) + len(photos),
+                    "deeply_analyzed_count": pipeline.last_deep_analysis_count,
+                    "planned_count": len(result.selected_clips),
+                }
+            )
 
             state.pipeline_result = {
                 "selected_clips": result.selected_clips,
@@ -241,35 +369,43 @@ def _run_pipeline_blocking(
         progress_state["done"] = True
 
 
-def _detect_overnight_bases(state: Any) -> list | None:
+def _detect_overnight_bases(
+    state: Any,
+    clips: list[VideoClipInfo] | None = None,
+) -> list | None:
     """Detect overnight stop bases for trip memories."""
-    if not (state.memory_type == "trip" and state.clips):
+    source_clips = state.clips if clips is None else clips
+    if not (state.memory_type == "trip" and source_clips):
         return None
     try:
         from immich_memories.analysis.trip_detection import detect_overnight_stops
 
-        trip_assets = [c.asset for c in state.clips]
+        trip_assets = [c.asset for c in source_clips]
         return detect_overnight_stops(trip_assets) or None
     except Exception:  # WHY: UI graceful degradation
         logger.debug("Trip segment detection failed", exc_info=True)
         return None
 
 
-def _build_pipeline_config(state: Any) -> Any:
+def _build_pipeline_config(
+    state: Any,
+    clips: list[VideoClipInfo] | None = None,
+) -> Any:
     """Build PipelineConfig from app state."""
     from immich_memories.analysis.smart_pipeline import PipelineConfig
 
     config_dict = state.pipeline_config
-    overnight_bases = _detect_overnight_bases(state)
+    overnight_bases = _detect_overnight_bases(state, clips)
     return PipelineConfig(
         target_clips=config_dict.get("target_clips", 120),
         avg_clip_duration=config_dict.get("avg_clip_duration", 5.0),
+        target_duration_seconds=config_dict.get("target_duration_seconds"),
         hdr_only=config_dict.get("hdr_only", False),
         prioritize_favorites=config_dict.get("prioritize_favorites", True),
         max_non_favorite_ratio=config_dict.get("max_non_favorite_ratio", 0.25),
         analyze_all=config_dict.get("analyze_all", False),
         overnight_bases=overnight_bases,
-        analysis_depth=getattr(state, "analysis_depth", "fast"),
+        analysis_depth=getattr(state, "analysis_depth", "auto"),
     )
 
 
@@ -288,6 +424,7 @@ def _wire_progress_timer(
     stats_eta_label: Any,
     stats_errors_label: Any,
     clips: list[VideoClipInfo],
+    photos: list[Asset],
     config: Any,
 ) -> None:
     """Wire up the poll timer and background pipeline runner."""
@@ -315,7 +452,7 @@ def _wire_progress_timer(
     progress_timer = ui.timer(1.0, poll_progress)
 
     async def start_pipeline() -> None:
-        await run.io_bound(_run_pipeline_blocking, state, config, clips, progress_state)
+        await run.io_bound(_run_pipeline_blocking, state, config, clips, photos, progress_state)
 
     ui.timer(0.1, start_pipeline, once=True)
 
@@ -323,7 +460,10 @@ def _wire_progress_timer(
 def _render_pipeline_progress_ui(clips: list[VideoClipInfo]) -> None:
     """Render pipeline progress UI."""
     state = get_app_state()
-    config = _build_pipeline_config(state)
+    eligible_clips, eligible_photos = _eligible_pipeline_media(state, clips)
+    _resolve_auto_duration_for_selection(state, eligible_clips, eligible_photos)
+    _configure_timeline_for_selection(state, eligible_clips, eligible_photos)
+    config = _build_pipeline_config(state, eligible_clips)
 
     ui.label("Generating Memories...").classes("text-2xl font-bold mb-4")
 
@@ -415,6 +555,7 @@ def _render_pipeline_progress_ui(clips: list[VideoClipInfo]) -> None:
         stats_avg_label,
         stats_eta_label,
         stats_errors_label,
-        clips,
+        eligible_clips,
+        eligible_photos,
         config,
     )

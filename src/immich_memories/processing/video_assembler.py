@@ -13,6 +13,7 @@ from immich_memories.processing.assembly_config import (
     AssemblyClip,
     AssemblySettings,
     TransitionType,
+    standalone_assembly_encoding_plan,
 )
 from immich_memories.processing.assembly_engine import AssemblyEngine
 from immich_memories.processing.audio_mixer_service import AudioMixerService
@@ -26,6 +27,7 @@ from immich_memories.processing.title_inserter import TitleInserter
 
 if TYPE_CHECKING:
     from immich_memories.config_loader import Config
+    from immich_memories.processing.probe_cache import ProbeCache
 
 __all__ = [
     "VideoAssembler",
@@ -54,22 +56,23 @@ class VideoAssembler:
         output_crf: int = 23,
         default_transition_duration: float = 0.5,
         default_resolution: tuple[int, int] = (1920, 1080),
+        probe_cache: ProbeCache | None = None,
     ):
-        self.settings = settings or AssemblySettings()
+        self.settings = settings or AssemblySettings(
+            encoding_plan=standalone_assembly_encoding_plan(output_crf)
+        )
 
         # Face detection cache: path -> (center_x, center_y) or None
         self._face_cache: OrderedDict[Path, tuple[float, float] | None] = OrderedDict()
 
         # Apply caller-provided defaults where settings left them unset
-        if self.settings.output_crf is None:
-            self.settings.output_crf = output_crf
         if self.settings.transition_duration is None:
             self.settings.transition_duration = default_transition_duration
         if self.settings.default_resolution is None:
             self.settings.default_resolution = default_resolution
 
         # Wire composed services
-        self.prober = FFmpegProber(self.settings)
+        self.prober = FFmpegProber(self.settings, probe_cache=probe_cache)
         self.filter_builder = FilterBuilder(self.settings, self.prober, self._get_face_center)
         self.encoder = ClipEncoder(
             self.settings,
@@ -146,23 +149,13 @@ class VideoAssembler:
         return result
 
     def _process_single_clip(self, clip: AssemblyClip, output_path: Path) -> Path:
-        needs_processing = (
-            self.settings.privacy_mode
-            or (not self.settings.auto_resolution and self.settings.target_resolution)
-            or (clip.rotation_override is not None and clip.rotation_override != 0)
-        )
-
-        if needs_processing:
-            # Single clip still needs FFmpeg for filters (blur, resize, rotation)
-            return self.engine.assemble_scalable([clip], output_path)
-
+        # A one-clip memory is still a final output. Encode it under the same
+        # immutable plan as every multi-clip path instead of trusting the source
+        # codec/container to happen to match.
+        result = self.engine.assemble_scalable([clip], output_path)
         if self.settings.music_path and self.settings.music_path.exists():
-            return self.audio_mixer.add_music_to_clip(clip.path, output_path)
-
-        import shutil
-
-        shutil.copy2(clip.path, output_path)
-        return output_path
+            result = self.audio_mixer.add_music(result, output_path)
+        return result
 
 
 def assemble_montage(
@@ -176,10 +169,12 @@ def assemble_montage(
     music_accompaniment_path: Path | None = None,
 ) -> Path:
     from immich_memories.processing.clip_probing import get_video_duration
+    from immich_memories.processing.probe_cache import ProbeCache
 
+    probe_cache = ProbeCache()
     assembly_clips = []
     for path in clips:
-        duration = get_video_duration(path)
+        duration = get_video_duration(path, probe_cache=probe_cache)
         assembly_clips.append(
             AssemblyClip(
                 path=path,
@@ -188,6 +183,7 @@ def assemble_montage(
         )
 
     settings = AssemblySettings(
+        encoding_plan=standalone_assembly_encoding_plan(),
         transition=transition,
         transition_duration=transition_duration,
         music_path=music_path,
@@ -196,7 +192,7 @@ def assemble_montage(
         music_accompaniment_path=music_accompaniment_path,
     )
 
-    return VideoAssembler(settings).assemble(assembly_clips, output_path)
+    return VideoAssembler(settings, probe_cache=probe_cache).assemble(assembly_clips, output_path)
 
 
 def create_preview(
@@ -234,8 +230,8 @@ def create_preview(
             break
 
     settings = AssemblySettings(
+        encoding_plan=standalone_assembly_encoding_plan(28),
         transition=TransitionType.CUT,
-        output_crf=28,
     )
 
     return VideoAssembler(settings).assemble(preview_clips, output_path)

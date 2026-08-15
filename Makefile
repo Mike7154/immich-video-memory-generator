@@ -2,7 +2,7 @@
 # Uses uv for fast Python package management
 export PYTHONUNBUFFERED=1
 
-.PHONY: help install dev dev-ci dev-test run preflight test test-cov test-cov-xml test-integration test-integration-auth test-integration-photos test-integration-audio test-integration-titles test-fast mutation benchmark benchmark-perf benchmark-steps benchmark-assembly benchmark-titles benchmark-titles-json benchmark-pipeline benchmark-json benchmark-submit lint format typecheck check clean clean-cache clean-all build build-check docker docker-run file-length complexity cognitive-complexity security-lint bandit-ci semgrep dead-code duplication refurb dep-check arch-check diff-cover diff-cover-ci ci critique ensure-dev commitlint pip-audit docs-install docs-dev docs-build docs-check docs-cli demo-video playwright-install e2e e2e-full screenshots diagrams
+.PHONY: help install dev dev-ci dev-test run preflight test test-cov test-cov-xml test-integration test-integration-auth test-integration-photos test-integration-audio test-integration-titles test-fast mutation benchmark benchmark-perf benchmark-steps benchmark-assembly benchmark-titles benchmark-titles-json benchmark-pipeline benchmark-json benchmark-submit lint format typecheck check launch-check clean clean-cache clean-all build build-check docker docker-run docker-shell file-length complexity cognitive-complexity security-lint bandit-ci semgrep dead-code duplication refurb dep-check arch-check diff-cover diff-cover-ci ci critique ensure-dev commitlint pip-audit docs-install docs-dev docs-build docs-check docs-cli demo-video playwright-install e2e e2e-full screenshots diagrams
 
 # Default target
 help:
@@ -38,6 +38,7 @@ help:
 	@echo "  commitlint   Validate commit messages (conventional commits)"
 	@echo "  pip-audit    Check dependencies for known vulnerabilities"
 	@echo "  check        Run all checks (lint + format + type + length + complexity + test)"
+	@echo "  launch-check Run every local launch gate (check + package + docs + E2E)"
 	@echo "  ci           Full CI pipeline (check + dead-code + security-lint)"
 	@echo ""
 	@echo "Building:"
@@ -63,9 +64,9 @@ help:
 	@echo ""
 	@echo "E2E Tests (Playwright):"
 	@echo "  playwright-install  Install Playwright browsers"
-	@echo "  e2e                 Run Playwright E2E tests (fast)"
-	@echo "  e2e-full            Run ALL E2E tests + full generation (~10min)"
-	@echo "  screenshots         Capture UI screenshots (light + dark)"
+	@echo "  e2e                 Run the required hermetic launch smoke"
+	@echo "  e2e-full            Run ALL E2E and optional visual flows (~10min)"
+	@echo "  screenshots         Capture optional UI screenshots (light + dark)"
 	@echo "  diagrams            Render architecture diagrams (Mermaid)"
 	@echo ""
 	@echo "Cleanup:"
@@ -152,19 +153,22 @@ benchmark-submit:  ## Submit local benchmark results to GitHub (for non-CI runne
 	BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
 	SHA=$$(git rev-parse --short HEAD); \
 	echo "Submitting benchmarks from $$RUNNER_NAME ($$BRANCH@$$SHA)..."; \
-	for f in tests/benchmark-*.json; do \
-		[ -f "$$f" ] || continue; \
-		SUITE=$$(basename "$$f" .json | sed 's/benchmark-//'); \
-		echo "  Uploading $$SUITE results..."; \
+	if [ -f tests/perf-results.json ]; then \
+		echo "  Uploading full assembly reproduction metadata..."; \
 		gh api repos/:owner/:repo/actions/workflows/benchmark.yml/dispatches \
 			-f ref=main \
 			-f "inputs[runner]=$$RUNNER_NAME" \
-			-f "inputs[suite]=$$SUITE" \
+			-f "inputs[suite]=assembly" \
 			-f "inputs[sha]=$$SHA" \
-			-f "inputs[results]=$$(cat $$f)" \
-		&& echo "    ✓ $$SUITE submitted" \
-		|| echo "    ✗ $$SUITE failed (is GH_TOKEN set?)"; \
-	done
+			-f "inputs[results]=$$(cat tests/perf-results.json)" \
+		&& echo "    ✓ assembly submitted" \
+		|| echo "    ✗ assembly failed (is GH_TOKEN set?)"; \
+	else \
+		echo "  ✗ assembly skipped: tests/perf-results.json is required"; \
+	fi; \
+	if [ -f tests/benchmark-titles.json ]; then \
+		echo "  ! titles skipped: full reproduction metadata is not exported yet"; \
+	fi
 
 test-integration-live-photos:  ## Run ONLY live photo merge tests (~30s, needs Immich)
 	uv run pytest tests/integration/live_photos/ -v -s -m integration --log-cli-level=INFO --tb=short \
@@ -253,8 +257,9 @@ test-integration:  ## Run ALL integration tests per-suite (requires FFmpeg/Immic
 playwright-install:  ## Install Playwright browsers for E2E tests
 	uv run playwright install chromium
 
-e2e:  ## Run Playwright E2E tests (fast — screenshots + auth, ~3min)
-	uv run pytest tests/e2e/ -v -m "e2e and not slow" --log-cli-level=INFO --tb=short \
+e2e:  ## Run required fake-service contracts and real hermetic browser render
+	uv run pytest tests/e2e/test_fake_immich.py tests/e2e/test_launch_smoke.py -v \
+		-m "e2e and not visual" --log-cli-level=INFO --tb=short \
 		--junitxml=tests/e2e-junit.xml
 
 e2e-full:  ## Run ALL E2E tests including full generation pipeline (~10min)
@@ -262,7 +267,7 @@ e2e-full:  ## Run ALL E2E tests including full generation pipeline (~10min)
 		--junitxml=tests/e2e-junit.xml
 
 screenshots:  ## Capture UI screenshots in light + dark mode (coverage from server subprocess)
-	uv run pytest tests/e2e/test_screenshots.py -v -m e2e --log-cli-level=INFO --tb=short \
+	uv run pytest tests/e2e/test_screenshots.py -v -m visual --log-cli-level=INFO --tb=short \
 		--junitxml=tests/e2e-junit.xml
 
 diagrams:  ## Render architecture diagrams from Mermaid source files
@@ -365,20 +370,25 @@ commitlint:
 
 # Cognitive complexity (complements cyclomatic complexity)
 cognitive-complexity:
-	@OUTPUT=$$(uvx complexipy src/ --max-complexity-allowed 15 2>&1); \
+	@OUTPUT=$$(uvx complexipy==5.2.0 src/ --max-complexity-allowed 15 2>&1); \
+	ANALYZER_STATUS=$$?; \
 	if echo "$$OUTPUT" | grep -q "Snapshot watermark passed"; then \
 		echo "Cognitive complexity: snapshot watermark passed (no new violations)"; \
 	elif echo "$$OUTPUT" | grep -q "FAILED"; then \
 		echo "$$OUTPUT" | grep "FAILED"; \
 		echo "Cognitive complexity gate FAILED: new violations detected"; \
 		exit 1; \
+	elif [ "$$ANALYZER_STATUS" -ne 0 ]; then \
+		echo "$$OUTPUT"; \
+		echo "Cognitive complexity gate FAILED: analyzer exited $$ANALYZER_STATUS"; \
+		exit "$$ANALYZER_STATUS"; \
 	else \
 		echo "Cognitive complexity: all functions under threshold"; \
 	fi
 
 # Code duplication detection
 duplication:
-	npx jscpd src/ --threshold 5 --min-lines 5 --min-tokens 50 --format python --gitignore
+	npx --yes jscpd@5.0.14 src/ --threshold 5 --min-lines 5 --min-tokens 50 --format python
 
 # Modernization lint (cd src avoids duplicate module detection, --config-file reads ignores)
 refurb:
@@ -409,7 +419,8 @@ diff-cover:
 
 # Dependency vulnerability audit
 pip-audit:  ## Check dependencies for known vulnerabilities (warns on unfixable, fails on fixable)
-	uv pip freeze | grep -v -e '^-e ' -e '^immich-memories==' -e '^audioop-lts==' > /tmp/pip-audit-reqs.txt
+	uv export --frozen --extra dev --no-emit-project --no-hashes \
+		| grep -v -e '^audioop-lts==' > /tmp/pip-audit-reqs.txt
 	uvx pip-audit -r /tmp/pip-audit-reqs.txt --strict 2>&1 | python3 scripts/pip_audit_smart.py; \
 		EXIT=$$?; rm -f /tmp/pip-audit-reqs.txt; exit $$EXIT
 
@@ -452,12 +463,18 @@ build-check:
 	uvx twine check dist/*
 
 # Ensure dev dependencies are installed
+ENSURE_DEV_COMMAND ?= uv sync --all-extras --quiet
 ensure-dev:
-	@uv sync --all-extras --quiet
+	@$(ENSURE_DEV_COMMAND)
 
 # Run all checks (same as CI)
 check: ensure-dev lint format-check typecheck file-length complexity test
 	@echo "All checks passed!"
+
+# One non-publishing launch gate shared by operators and pull-request CI.
+launch-check: ENSURE_DEV_COMMAND = echo "Using preinstalled launch-check dependencies"
+launch-check: check build build-check docs-check e2e
+	@echo "Launch readiness checks passed!"
 
 # Full CI-equivalent pipeline (locally)
 ci: ensure-dev lint format-check typecheck file-length complexity cognitive-complexity dead-code security-lint refurb dep-check arch-check duplication critique test
@@ -501,19 +518,35 @@ build-wheel:
 
 DOCKER_IMAGE := immich-memories
 DOCKER_TAG := latest
+GIT_SHORT_SHA := $(shell git rev-parse --short HEAD)
+GIT_TRACKED_CHANGES := $(shell git status --porcelain --untracked-files=no)
+APP_VERSION ?= 0+g$(GIT_SHORT_SHA)$(if $(GIT_TRACKED_CHANGES),.dirty)
+INSTALL_EXTRAS ?= all
+VCS_REF ?= $(shell git rev-parse HEAD)
+SOURCE_URL ?= https://github.com/sam-dumont/immich-video-memory-generator
+IMMICH_CONFIG_VOLUME ?= immich-memories-config
+IMMICH_OUTPUT_VOLUME ?= immich-memories-output
 
 docker:
-	docker build -t $(DOCKER_IMAGE):$(DOCKER_TAG) -f docker/Dockerfile .
+	docker build \
+		--build-arg APP_VERSION=$(APP_VERSION) \
+		--build-arg INSTALL_EXTRAS=$(INSTALL_EXTRAS) \
+		--build-arg VCS_REF=$(VCS_REF) \
+		--build-arg SOURCE_URL=$(SOURCE_URL) \
+		-t $(DOCKER_IMAGE):$(DOCKER_TAG) \
+		-f docker/Dockerfile .
 
 docker-run:
 	docker run -it --rm \
 		-p 8080:8080 \
-		-v ~/.immich-memories:/root/.immich-memories \
+		--mount type=volume,source=$(IMMICH_CONFIG_VOLUME),target=/home/immich/.immich-memories \
+		--mount type=volume,source=$(IMMICH_OUTPUT_VOLUME),target=/app/output \
 		$(DOCKER_IMAGE):$(DOCKER_TAG)
 
 docker-shell:
 	docker run -it --rm \
-		-v ~/.immich-memories:/root/.immich-memories \
+		--mount type=volume,source=$(IMMICH_CONFIG_VOLUME),target=/home/immich/.immich-memories \
+		--mount type=volume,source=$(IMMICH_OUTPUT_VOLUME),target=/app/output \
 		$(DOCKER_IMAGE):$(DOCKER_TAG) /bin/bash
 
 # =============================================================================
@@ -615,11 +648,20 @@ docs-build:
 	cd docs-site && npm run build
 
 docs-check:
-	@cd docs-site && npm run build 2>&1 | tee /tmp/docs-build.log; \
-	if grep -qiE '(error|broken link)' /tmp/docs-build.log; then \
+	@log_file=$$(mktemp "$${TMPDIR:-/tmp}/docs-build.XXXXXX") || exit $$?; \
+	status=0; \
+	(cd docs-site && npm run build) >"$$log_file" 2>&1 || status=$$?; \
+	cat "$$log_file"; \
+	if [ "$$status" -ne 0 ]; then \
+		rm -f "$$log_file"; \
+		exit "$$status"; \
+	fi; \
+	if grep -qiE '(error|broken link)' "$$log_file"; then \
 		echo "Docs build has errors — see output above"; \
+		rm -f "$$log_file"; \
 		exit 1; \
 	fi; \
+	rm -f "$$log_file"; \
 	echo "Docs build passed."
 
 demo-music:  ## Generate 12 ACE-Step candidate tracks for demo video

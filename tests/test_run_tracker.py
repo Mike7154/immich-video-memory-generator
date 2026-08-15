@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -70,6 +71,7 @@ class TestRunTrackerPhases:
     def test_start_phase_sets_state(self, mock_db_cls: MagicMock):
         """start_phase records the phase name and time."""
         tracker = RunTracker(db_path=_TEST_DB_PATH)
+        tracker.start_run()
         tracker.start_phase("discovery", total_items=100)
         assert tracker._current_phase == "discovery"
         assert tracker._phase_items_total == 100
@@ -80,6 +82,7 @@ class TestRunTrackerPhases:
     def test_start_phase_completes_previous(self, mock_db_cls: MagicMock):
         """Starting a new phase completes the previous one."""
         tracker = RunTracker(db_path=_TEST_DB_PATH)
+        tracker.start_run()
         tracker.start_phase("phase1", total_items=10)
         tracker.start_phase("phase2", total_items=20)
         # Previous phase should be cleared
@@ -92,6 +95,7 @@ class TestRunTrackerPhases:
     def test_complete_phase_resets_state(self, mock_db_cls: MagicMock):
         """complete_phase clears phase state."""
         tracker = RunTracker(db_path=_TEST_DB_PATH)
+        tracker.start_run()
         tracker.start_phase("analysis", total_items=50)
         tracker.complete_phase(items_processed=50)
         assert tracker._current_phase is None
@@ -103,6 +107,7 @@ class TestRunTrackerPhases:
     def test_complete_phase_noop_without_active_phase(self, mock_db_cls: MagicMock):
         """complete_phase does nothing if no phase is active."""
         tracker = RunTracker(db_path=_TEST_DB_PATH)
+        tracker.start_run()
         tracker.complete_phase()  # Should not raise
         tracker.db.save_phase_stats.assert_not_called()
 
@@ -111,6 +116,7 @@ class TestRunTrackerPhases:
     def test_complete_phase_defaults_items_to_total(self, mock_db_cls: MagicMock):
         """complete_phase defaults items_processed to total_items."""
         tracker = RunTracker(db_path=_TEST_DB_PATH)
+        tracker.start_run()
         tracker.start_phase("export", total_items=25)
         tracker.complete_phase()
         call_args = tracker.db.save_phase_stats.call_args
@@ -159,6 +165,24 @@ class TestRunTrackerStartRun:
         run_id = tracker.start_run()  # Should not raise
         assert run_id is not None
 
+    # WHY: RunDatabase opens a SQLite connection — inspect persisted timestamps without disk I/O
+    @patch("immich_memories.tracking.run_tracker.RunDatabase")
+    def test_lifecycle_timestamps_are_aware_utc(self, mock_db_cls: MagicMock):
+        tracker = RunTracker(db_path=_TEST_DB_PATH, capture_system=False)
+
+        tracker.start_run()
+        saved_run = tracker.db.save_run.call_args.args[0]
+        tracker.start_phase("analysis")
+        tracker.complete_phase()
+        phase = tracker.db.save_phase_stats.call_args.args[1]
+        tracker.complete_run()
+        completed_at = tracker.db.update_run_status.call_args.kwargs["completed_at"]
+
+        assert saved_run.created_at.utcoffset() == timedelta(0)
+        assert phase.started_at.utcoffset() == timedelta(0)
+        assert phase.completed_at.utcoffset() == timedelta(0)
+        assert completed_at.utcoffset() == timedelta(0)
+
 
 class TestRunTrackerMemoryFields:
     """Tests for memory_type/memory_key propagation."""
@@ -174,12 +198,18 @@ class TestRunTrackerMemoryFields:
         tracker.start_run(
             memory_type="year_in_review",
             memory_key="year_in_review:2025-01-01:2025-12-31:",
+            memory_category="birthday",
+            memory_people=(" Alice ", "BOB\tJones"),
             source="auto",
+            automation_attempt_id="attempt-tracker-1",
         )
         saved_run = tracker.db.save_run.call_args[0][0]
         assert saved_run.memory_type == "year_in_review"
         assert saved_run.memory_key == "year_in_review:2025-01-01:2025-12-31:"
+        assert saved_run.memory_category == "birthday"
+        assert saved_run.memory_people == ("alice", "bob jones")
         assert saved_run.source == "auto"
+        assert saved_run.automation_attempt_id == "attempt-tracker-1"
 
     # WHY: RunDatabase opens a SQLite connection — isolate run lifecycle from disk I/O
     @patch("immich_memories.tracking.run_tracker.RunDatabase")
@@ -191,6 +221,41 @@ class TestRunTrackerMemoryFields:
         assert saved_run.source == "manual"
         assert saved_run.memory_type is None
         assert saved_run.memory_key is None
+        assert saved_run.automation_attempt_id is None
+
+    def test_run_metadata_json_round_trips_memory_identity(self):
+        """Automation category and people survive metadata JSON export/import."""
+        from datetime import datetime
+
+        from immich_memories.tracking.models import RunMetadata
+
+        run = RunMetadata(
+            run_id="identity-json",
+            created_at=datetime(2026, 8, 11, 9, 0),
+            memory_category="multi_person",
+            memory_people=(" alice ", "BOB\tJones"),
+        )
+
+        restored = RunMetadata.from_json(run.to_json())
+
+        assert restored.memory_category == "multi_person"
+        assert restored.memory_people == ("alice", "bob jones")
+
+    def test_run_metadata_treats_null_memory_people_as_empty(self):
+        """Explicit JSON null from older or external metadata loads as no people."""
+        from datetime import datetime
+
+        from immich_memories.tracking.models import RunMetadata
+
+        payload = RunMetadata(
+            run_id="identity-null",
+            created_at=datetime(2026, 8, 11, 9, 0),
+        ).to_dict()
+        payload["memory_people"] = None
+
+        restored = RunMetadata.from_dict(payload)
+
+        assert restored.memory_people == ()
 
 
 class TestRunTrackerFailCancel:
@@ -201,6 +266,7 @@ class TestRunTrackerFailCancel:
     def test_fail_run_updates_status(self, mock_db_cls: MagicMock):
         """fail_run marks the run as failed in the database."""
         tracker = RunTracker(db_path=_TEST_DB_PATH)
+        tracker.start_run()
         tracker.fail_run("out of memory", errors_count=3)
         tracker.db.update_run_status.assert_called_once()
         call_kwargs = tracker.db.update_run_status.call_args[1]
@@ -212,6 +278,7 @@ class TestRunTrackerFailCancel:
     def test_fail_run_completes_active_phase(self, mock_db_cls: MagicMock):
         """fail_run completes any active phase before failing."""
         tracker = RunTracker(db_path=_TEST_DB_PATH)
+        tracker.start_run()
         tracker.start_phase("analysis")
         tracker.fail_run("crash")
         # Phase should be completed first, then status updated
@@ -223,6 +290,7 @@ class TestRunTrackerFailCancel:
     def test_cancel_run_updates_status(self, mock_db_cls: MagicMock):
         """cancel_run marks the run as cancelled."""
         tracker = RunTracker(db_path=_TEST_DB_PATH)
+        tracker.start_run()
         tracker.cancel_run()
         call_kwargs = tracker.db.update_run_status.call_args[1]
         assert call_kwargs["status"] == "cancelled"

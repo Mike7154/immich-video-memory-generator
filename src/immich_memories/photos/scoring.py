@@ -11,7 +11,10 @@ videos always win in a tie.
 from __future__ import annotations
 
 import base64
+import json
 import logging
+import math
+import re
 from pathlib import Path
 
 from immich_memories.api.models import Asset
@@ -57,18 +60,19 @@ def score_photo_with_llm(
     metadata_score: float,
     config: PhotoConfig,
     app_config: Config,
-) -> float:
+    provider_circuit=None,
+) -> float | None:
     """Enhance photo score with LLM visual analysis.
 
     Sends the photo to the configured VLM (same as video content analysis)
     and gets an interest + quality rating. Blends with metadata score.
     """
     if app_config is None or not app_config.content_analysis.enabled:
-        return metadata_score
+        return None
 
-    llm_score = _query_photo_llm(photo_path, app_config)
+    llm_score = _query_photo_llm(photo_path, app_config, provider_circuit=provider_circuit)
     if llm_score is None:
-        return metadata_score
+        return None
 
     # Blend: replace the LLM placeholder weight with actual LLM score
     # metadata_score was computed with _W_LLM * 0.5 as placeholder
@@ -86,10 +90,45 @@ _PHOTO_ANALYSIS_PROMPT = """Analyze this photo for a memory video compilation. R
 Respond as JSON: {"interest": 0.X, "quality": 0.X, "emotion": "word"}"""
 
 
-def _query_photo_llm(photo_path: Path, config: object) -> float | None:
+def _photo_score_value(value: object) -> float | None:
+    """Normalize one strict 0–1 JSON score without accepting booleans."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    score = float(value)
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        return None
+    return score
+
+
+def _parse_photo_score(text: str) -> float | None:
+    """Extract complete interest and quality scores from a VLM response."""
+    match = re.search(r"\{[^}]+\}", text)
+    if not match:
+        logger.debug("LLM photo analysis: no JSON in response: %s", text[:100])
+        return None
+
+    data = json.loads(match.group())
+    if not isinstance(data, dict) or not {"interest", "quality"} <= data.keys():
+        logger.debug("LLM photo analysis: response omitted required score fields")
+        return None
+
+    interest = _photo_score_value(data["interest"])
+    quality = _photo_score_value(data["quality"])
+    if interest is None or quality is None:
+        logger.debug("LLM photo analysis: score fields were invalid")
+        return None
+    return (interest + quality) / 2
+
+
+def _query_photo_llm(photo_path: Path, config: object, provider_circuit=None) -> float | None:
     """Send photo to VLM and get a 0-1 score."""
+    if provider_circuit is not None and not provider_circuit.available:
+        return None
+
     try:
         import httpx
+
+        from immich_memories.analysis.provider_health import classify_openai_response
 
         llm_config = config.llm  # type: ignore[attr-defined]
         ca_config = config.content_analysis  # type: ignore[attr-defined]
@@ -124,23 +163,20 @@ def _query_photo_llm(photo_path: Path, config: object) -> float | None:
             headers=headers,
             timeout=llm_config.timeout_seconds,
         )
+        health = classify_openai_response(resp.status_code, resp.json(), llm_config.model)
+        if not health.available:
+            if provider_circuit is not None and provider_circuit.set_health(health):
+                logger.warning("Photo content analysis disabled for this run: %s", health.message)
+            return None
         resp.raise_for_status()
         text = resp.json()["choices"][0]["message"]["content"]
+        return _parse_photo_score(text)
 
-        # Parse JSON response
-        import json
-        import re
-
-        match = re.search(r"\{[^}]+\}", text)
-        if match:
-            data = json.loads(match.group())
-            interest = float(data.get("interest", 0.5))
-            quality = float(data.get("quality", 0.5))
-            return (interest + quality) / 2
-
-        logger.debug(f"LLM photo analysis: no JSON in response: {text[:100]}")
-        return None
-
-    except (httpx.HTTPError, RuntimeError, ValueError, OSError) as e:
+    except httpx.HTTPError as e:
+        if provider_circuit is not None:
+            provider_circuit.disable("content-analysis provider is unreachable")
         logger.debug(f"LLM photo analysis failed: {e}")
+        return None
+    except (RuntimeError, ValueError, OSError, KeyError, IndexError, TypeError) as e:
+        logger.debug(f"LLM photo analysis returned an invalid response: {e}")
         return None

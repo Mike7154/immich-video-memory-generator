@@ -84,27 +84,32 @@ Videos, live photos, and regular photos all compete in a single selection pool. 
 1. Fetch videos + live photo video components
 2. Fetch regular photos (IMAGE assets, excluding live photos)
 3. VIDEOS: SmartPipeline Phases 1-3
-   a. Thumbnail clustering → deduplicate near-identical clips
-   b. Density budget → select candidates proportional to timeline density
-   c. Download + analyze selected clips (scoring, scene detection, LLM)
-4. PHOTOS: Metadata + LLM thumbnail scoring (fast, no download)
-5. MERGE: Convert scored photos to clip candidates, merge with analyzed videos
+   a. Apply hard exclusions only: unchecked media, true duplicates, unusably short clips, and an explicit HDR-only mismatch
+   b. Density budget → choose a bounded shortlist for expensive scene/VLM analysis
+   c. Give every other eligible video a cached or metadata-based fallback segment
+4. PHOTOS: Score every eligible photo from metadata, run VLM scoring on a distributed shortlist, then merge the enhanced scores back into the full photo pool
+5. MERGE: Convert all eligible scored photos to clip candidates and combine them with videos and Live Photos
 6. UNIFIED Phase 4: Select from the combined pool
    a. Favorites first, then fill gaps by score
    b. Temporal coverage: ensure every month/week has ≥1 clip
    c. Scale to target duration (sole monthly representatives protected)
    d. Temporal dedup (same-moment clips across ALL types)
-   e. Interleave types (max 2 consecutive photos or videos in a row)
+   e. Prefer variety, then progressively relax preferences when the timeline is short
 ```
+
+The Step 2 checkboxes define the source pool. **Fast** means “deeply analyze fewer videos,” not
+“throw the rest away.” The completion summary reports eligible media, videos deeply analyzed, and
+clips finally planned as separate numbers.
 
 ### Sparse Content Adaptations
 
 When content is limited, the pipeline adapts automatically:
 
-- **Adaptive target**: If available clips are less than half the target count, the target reduces to match. A library with 8 clips won't try to fill a 120-clip video — it targets 8 clips instead, producing a shorter but better video.
-- **Auto-thorough LLM**: When favorites are too few to anchor selection (fewer than 5 per 60 seconds of target duration), the pipeline switches from fast to thorough mode — running LLM analysis on all clips, not just favorites.
+- **Media-aware trip Auto duration**: The editorial curve is 30 seconds plus 10 seconds per active day, bounded to 60–300 seconds for dense trips. Usable video excerpts, at most four photos per day for capacity estimation, and a 30-second/day diversity ceiling can lower it. Sparse trips may resolve below 60 seconds.
+- **Auto LLM budget**: Auto runs LLM analysis for every eligible clip when at most 60 clips need fresh analysis. For larger libraries it uses a time-balanced shortlist. Compatible current-model cache hits do not consume this budget.
 - **Temporal coverage**: Every time period gets at least one clip. Sole monthly representatives are protected from removal during duration scaling, even if they score lower than favorites in other months.
-- **Photo scarcity bypass**: When videos make up less than 30% of selected clips, the photo ratio cap is skipped — photos fill the budget freely.
+- **Progressive backfill**: The selector first uses strict preferences, then allows up to 70% photos, additional non-favorites, closer moments, and finally any eligible photo ratio. If the only remaining clip is slightly too long, it may accept up to two seconds of overrun for the renderer to trim.
+- **Soft diversity limits**: Two photos per day, photo ratio, non-favorite ratio, and temporal spacing are preferred-first rules. They can be exceeded to fill the requested duration. Hard exclusions are never relaxed.
 
 ### Live Photo Rendering
 
@@ -116,13 +121,15 @@ How much analysis effort to spend:
 
 | Mode | Favorites | Gap-fillers | Speed |
 |------|-----------|-------------|-------|
-| **Fast** (default) | Full analysis + LLM | Metadata score only | Quick |
-| **Thorough** | Full analysis + LLM | Full analysis + LLM | Slower, better |
-| **Auto** | Switches to thorough when < 5 favorites per 60s of target | | Adaptive |
+| **Auto** (default) | Every eligible clip for manageable cache-miss pools | Time-balanced LLM shortlist for large pools | Adaptive |
+| **Fast** | Full analysis + LLM | Local scoring/cached metadata | Quick |
+| **Thorough** | Full analysis + LLM | Full analysis + LLM | Slowest, exhaustive |
 
-CLI: `--analysis-depth fast|thorough`
+CLI: `--analysis-depth auto|fast|thorough`
 
-The auto-switch happens transparently — you don't need to set it. If you have enough favorites (> 5 per minute of target video), fast mode is sufficient because favorites drive the selection. Below that threshold, all clips need LLM scoring to distinguish quality.
+Cache reuse is model-aware. Results from the exact configured model are loaded automatically and
+shown in review; they skip another LLM request. Results with no model identity or from a different
+model are stale and are analyzed again.
 
 ## Performance: 480p Downscaling
 

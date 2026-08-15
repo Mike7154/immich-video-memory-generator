@@ -14,6 +14,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from immich_memories.processing.encoding_plan import EncodingPlan, HdrTransfer
+from immich_memories.processing.hdr_utilities import _get_hdr_conversion_filter
+
 from .styles import TitleStyle
 from .video_encoding import create_title_video
 
@@ -77,9 +80,9 @@ class RenderingService:
     ) -> Path:
         """Create title video using GPU or PIL renderer.
 
-        HDR flag is read from self.config.hdr.
+        The immutable encoding plan is read from the title config.
         """
-        hdr = self.config.hdr
+        encoding_plan = self.config.encoding_plan
         if self._use_gpu and create_title_video_taichi is not None:
             return self._create_gpu_title(
                 title,
@@ -93,7 +96,7 @@ class RenderingService:
                 animated_background,
                 fade_from_white,
                 is_birthday,
-                hdr=hdr,
+                encoding_plan=encoding_plan,
                 background_image=background_image,
                 content_clip_path=content_clip_path,
                 is_ending=is_ending,
@@ -104,7 +107,12 @@ class RenderingService:
         # use a static blurred frame from the content clip as background
         # instead of falling back to a plain gradient.
         if background_image is None and content_clip_path is not None:
-            background_image = self._extract_blurred_frame(content_clip_path, width, height)
+            background_image = self._extract_blurred_frame(
+                content_clip_path,
+                width,
+                height,
+                encoding_plan.target_transfer,
+            )
 
         return create_title_video(
             title=title,
@@ -117,8 +125,8 @@ class RenderingService:
             fps=fps,
             animated_background=animated_background,
             fade_from_white=fade_from_white,
-            hdr=hdr,
             background_image=background_image,
+            encoding_plan=encoding_plan,
         )
 
     def _create_gpu_title(
@@ -134,7 +142,7 @@ class RenderingService:
         animated_background: bool,
         fade_from_white: bool,
         is_birthday: bool,
-        hdr: bool = True,
+        encoding_plan: EncodingPlan,
         background_image: np.ndarray | None = None,
         content_clip_path: Path | None = None,
         is_ending: bool = False,
@@ -156,7 +164,7 @@ class RenderingService:
                 height,
                 fps,
                 duration,
-                hdr=hdr,
+                source_transfer=encoding_plan.target_transfer,
             )
             if not slowmo_reader.is_active:
                 slowmo_reader = None
@@ -206,20 +214,42 @@ class RenderingService:
                 config,
                 fade_from_white=fade_from_white,
                 fade_to_white=fade_to_white,
-                hdr=hdr,
+                encoding_plan=encoding_plan,
                 frame_progress=frame_progress,
+                frame_transfer=(
+                    encoding_plan.target_transfer if slowmo_reader is not None else HdrTransfer.NONE
+                ),
             )
         finally:
             if slowmo_reader is not None:
                 slowmo_reader.close()
 
     @staticmethod
-    def _extract_blurred_frame(clip_path: Path, width: int, height: int) -> np.ndarray | None:
-        """Extract a mid-clip frame, blur it, and return as background array.
+    def _extract_blurred_frame(
+        clip_path: Path,
+        width: int,
+        height: int,
+        source_transfer: HdrTransfer = HdrTransfer.NONE,
+    ) -> np.ndarray | None:
+        """Extract a mid-clip frame in the SDR title working space.
 
         Falls back to None if extraction fails (caller uses gradient instead).
         """
         try:
+            # The title pre-render is already positioned at the selected
+            # content. Frame zero exists even for the 0.5-second ending source;
+            # frame 30 does not at either 30 or 60 fps.
+            filters: list[str] = []
+            if source_transfer is not HdrTransfer.NONE:
+                conversion = _get_hdr_conversion_filter(
+                    source_transfer.value,
+                    "sdr",
+                    source_primaries="bt2020",
+                    required=True,
+                ).removeprefix(",")
+                filters.append(conversion)
+            filters.extend([f"scale={width}:{height}", "gblur=sigma=30"])
+
             # Extract mid-frame as raw RGB
             result = subprocess.run(
                 [
@@ -227,7 +257,7 @@ class RenderingService:
                     "-i",
                     str(clip_path),
                     "-vf",
-                    f"select=eq(n\\,30),scale={width}:{height},gblur=sigma=30",
+                    ",".join(filters),
                     "-vframes",
                     "1",
                     "-f",
@@ -266,7 +296,7 @@ class RenderingService:
         falls back to PIL rendering with the map as static background.
         No bokeh/particles -- clean map aesthetic.
         """
-        hdr = self.config.hdr
+        encoding_plan = self.config.encoding_plan
         if self._use_gpu and create_title_video_taichi is not None:
             # Dim the map so white text pops
             dimmed = background_array * 0.55
@@ -300,7 +330,12 @@ class RenderingService:
                 vignette_pulse=0.0,
             )
             return create_title_video_taichi(
-                title, subtitle, output_path, config, fade_from_white=True, hdr=hdr
+                title,
+                subtitle,
+                output_path,
+                config,
+                fade_from_white=True,
+                encoding_plan=encoding_plan,
             )
         # PIL fallback
         return create_title_video(
@@ -319,5 +354,5 @@ class RenderingService:
             fps=fps,
             animated_background=False,
             fade_from_white=True,
-            hdr=hdr,
+            encoding_plan=encoding_plan,
         )

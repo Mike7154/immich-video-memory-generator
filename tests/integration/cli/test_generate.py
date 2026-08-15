@@ -14,6 +14,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import click
 import pytest
 
 from immich_memories.api.models import Asset, VideoClipInfo
@@ -42,6 +43,14 @@ def fixture_mp4(tmp_path_factory: pytest.TempPathFactory) -> Path:
             "-shortest",
             "-c:v",
             "libx264",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-x264-params",
+            "colorprim=bt709:transfer=bt709:colormatrix=bt709",
             "-crf",
             "28",
             "-c:a",
@@ -123,6 +132,19 @@ class TestGenerateMemoryPipeline:
             return output_path
 
         return _assemble
+
+    def test_automation_memory_key_override_is_authoritative(self, tmp_path) -> None:
+        from immich_memories.config_loader import Config
+        from immich_memories.generate import GenerationParams, _build_memory_key
+
+        params = GenerationParams(
+            clips=[],
+            output_path=tmp_path / "memory.mp4",
+            config=Config(),
+            memory_key_override="candidate:exact:key",
+        )
+
+        assert _build_memory_key(params) == "candidate:exact:key"
 
     def test_two_clips_crossfade(self, tmp_path, fixture_mp4):
         """2 clips → generate_memory completes with valid output."""
@@ -259,6 +281,131 @@ class TestCLIGenerate:
     Click routes args correctly and handles edge cases.
     """
 
+    def test_omitted_format_preserves_configured_h265(self, tmp_path) -> None:
+        """An omitted CLI option must not become an explicit H.264 override."""
+        from click.testing import CliRunner
+
+        from immich_memories.cli import main
+        from immich_memories.config_loader import Config
+
+        config = Config(immich={"url": "http://immich.test", "api_key": "test-key"})
+        config.output.codec = "h265"
+        config.output.directory = str(tmp_path)
+        output = tmp_path / "all_memories_2025.mp4"
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        asset = MagicMock(duration_seconds=10.0)
+
+        with (
+            patch("immich_memories.cli.get_config", return_value=config),
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=client),
+            patch(
+                "immich_memories.cli.generate.fetch_videos_and_live_photos",
+                return_value=([asset], []),
+            ),
+            patch(
+                "immich_memories.cli.generate.run_pipeline_and_generate",
+                return_value=(output, False, None),
+            ) as run_pipeline,
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["generate", "--year", "2025", "--no-music", "--quiet"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert run_pipeline.call_args.kwargs["output_format"] is None
+        assert run_pipeline.call_args.kwargs["output_orientation"] == "landscape"
+
+    def test_explicit_prores_normalizes_conflicting_output_suffix(self, tmp_path) -> None:
+        """The resolved MOV container is authoritative over a typed .mp4 suffix."""
+        from click.testing import CliRunner
+
+        from immich_memories.cli import main
+        from immich_memories.config_loader import Config
+
+        config = Config(immich={"url": "http://immich.test", "api_key": "test-key"})
+        requested = tmp_path / "custom-name.mp4"
+        expected = requested.with_suffix(".mov")
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        asset = MagicMock(duration_seconds=10.0)
+
+        with (
+            patch("immich_memories.cli.get_config", return_value=config),
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=client),
+            patch(
+                "immich_memories.cli.generate.fetch_videos_and_live_photos",
+                return_value=([asset], []),
+            ),
+            patch(
+                "immich_memories.cli.generate.run_pipeline_and_generate",
+                return_value=(expected, False, None),
+            ) as run_pipeline,
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "generate",
+                    "--year",
+                    "2025",
+                    "--format",
+                    "prores",
+                    "--output",
+                    str(requested),
+                    "--no-music",
+                    "--quiet",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert run_pipeline.call_args.kwargs["output_path"] == expected
+
+    def test_explicit_h265_override_is_available(self, tmp_path) -> None:
+        from click.testing import CliRunner
+
+        from immich_memories.cli import main
+        from immich_memories.config_loader import Config
+
+        config = Config(immich={"url": "http://immich.test", "api_key": "test-key"})
+        output = tmp_path / "memory.mp4"
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        asset = MagicMock(duration_seconds=10.0)
+
+        with (
+            patch("immich_memories.cli.get_config", return_value=config),
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=client),
+            patch(
+                "immich_memories.cli.generate.fetch_videos_and_live_photos",
+                return_value=([asset], []),
+            ),
+            patch(
+                "immich_memories.cli.generate.run_pipeline_and_generate",
+                return_value=(output, False, None),
+            ) as run_pipeline,
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "generate",
+                    "--year",
+                    "2025",
+                    "--format",
+                    "h265",
+                    "--output",
+                    str(output),
+                    "--no-music",
+                    "--quiet",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert run_pipeline.call_args.kwargs["output_format"] == "h265"
+
     def test_cli_generate_invokes_pipeline(self, tmp_path):
         """CLI generate with valid args reaches the pipeline."""
         from click.testing import CliRunner
@@ -302,6 +449,139 @@ class TestCLIGenerate:
 
         # exit_code 1 is OK (no clips found), we just verify arg parsing worked
         assert result.exit_code in (0, 1), f"Unexpected: {result.output}"
+
+    def test_automation_identity_options_are_hidden_from_help(self) -> None:
+        from click.testing import CliRunner
+
+        from immich_memories.cli import main
+
+        result = CliRunner().invoke(main, ["generate", "--help"])
+
+        assert result.exit_code == 0
+        assert "--source" not in result.output
+        assert "--memory-key" not in result.output
+        assert "--memory-category" not in result.output
+        assert "--automation-target-date" not in result.output
+
+    def test_automation_identity_options_reach_pipeline(self, tmp_path) -> None:
+        from click.testing import CliRunner
+
+        from immich_memories.cli import main
+        from immich_memories.config_loader import Config
+
+        config = Config(immich={"url": "http://immich.test", "api_key": "test-key"})
+        output = tmp_path / "auto.mp4"
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        asset = MagicMock(duration_seconds=10.0)
+
+        with (
+            patch("immich_memories.cli.get_config", return_value=config),
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=mock_client),
+            patch(
+                "immich_memories.cli.generate.fetch_videos_and_live_photos",
+                return_value=([asset], []),
+            ),
+            patch(
+                "immich_memories.cli.generate.run_pipeline_and_generate",
+                return_value=(output, False, None),
+            ) as mock_pipeline,
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "generate",
+                    "--memory-type",
+                    "year_in_review",
+                    "--year",
+                    "2025",
+                    "--source=auto",
+                    "--memory-key=candidate:key",
+                    "--memory-category=birthday",
+                    "--no-music",
+                    "--output",
+                    str(output),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert mock_pipeline.call_args.kwargs["source"] == "auto"
+        assert mock_pipeline.call_args.kwargs["memory_key"] == "candidate:key"
+        assert mock_pipeline.call_args.kwargs["memory_category"] == "birthday"
+
+    def test_automation_on_this_day_uses_candidate_date_in_child(self, tmp_path) -> None:
+        """A child starting after midnight must retain the parent's target day."""
+        from click.testing import CliRunner
+
+        from immich_memories.cli import main
+        from immich_memories.config_loader import Config
+
+        config = Config(immich={"url": "http://immich.test", "api_key": "test-key"})
+        output = tmp_path / "on-this-day.mp4"
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        asset = MagicMock(duration_seconds=10.0)
+
+        with (
+            patch("immich_memories.cli.get_config", return_value=config),
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=client),
+            patch(
+                "immich_memories.cli.generate.fetch_videos_and_live_photos",
+                return_value=([asset], []),
+            ) as fetch,
+            patch(
+                "immich_memories.cli.generate.run_pipeline_and_generate",
+                return_value=(output, False, None),
+            ),
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "generate",
+                    "--memory-type",
+                    "on_this_day",
+                    "--automation-target-date=2026-02-03",
+                    "--source=auto",
+                    "--memory-key=on-this-day:2026-02-03",
+                    "--memory-category=on_this_day",
+                    "--automation-attempt-id=attempt-123",
+                    "--no-music",
+                    "--output",
+                    str(output),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        date_ranges = fetch.call_args.kwargs["date_ranges"]
+        assert date_ranges
+        assert {(item.start.month, item.start.day) for item in date_ranges} == {(2, 2)}
+        assert {(item.end.month, item.end.day) for item in date_ranges} == {(2, 4)}
+
+    def test_automation_target_date_rejects_manual_context(self, tmp_path) -> None:
+        """The hidden exact-date selector cannot change public manual semantics."""
+        from click.testing import CliRunner
+
+        from immich_memories.cli import main
+        from immich_memories.config_loader import Config
+
+        config = Config(immich={"url": "http://immich.test", "api_key": "test-key"})
+        with patch("immich_memories.cli.get_config", return_value=config):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "generate",
+                    "--memory-type",
+                    "on_this_day",
+                    "--automation-target-date=2026-02-03",
+                    "--output",
+                    str(tmp_path / "manual.mp4"),
+                ],
+            )
+
+        assert result.exit_code != 0
+        assert "requires complete on_this_day automation identity" in result.output
 
     @requires_immich
     def test_cli_generate_nonexistent_person(self, tmp_path):
@@ -428,28 +708,49 @@ class TestCLIGenerate:
         assert result.exit_code in (0, 1), f"Unexpected: {result.output}"
 
     def test_cli_dry_run(self, tmp_path):
-        """--dry-run shows parameters without generating."""
+        """--dry-run connects, discovers assets, and delegates read-only planning."""
         from click.testing import CliRunner
 
         from immich_memories.cli import main
+        from immich_memories.config_loader import Config
 
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "generate",
-                "--start",
-                "2025-01-01",
-                "--end",
-                "2025-01-31",
-                "--dry-run",
-                "-O",
-                str(tmp_path / "out.mp4"),
-            ],
-        )
-        # Dry run should exit 0 without connecting to Immich
-        assert result.exit_code == 0
-        assert "dry run" in result.output.lower() or "Dry" in result.output
+        config = Config(immich={"url": "http://immich.test", "api_key": "test-key"})
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.__exit__.return_value = False
+        asset = MagicMock(duration_seconds=10.0)
+        output = tmp_path / "out.mp4"
+
+        with (
+            patch("immich_memories.cli.get_config", return_value=config),
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=client),
+            patch(
+                "immich_memories.cli.generate.fetch_videos_and_live_photos",
+                return_value=([asset], []),
+            ),
+            patch(
+                "immich_memories.cli.generate.run_pipeline_and_generate",
+                return_value=(output, False, None),
+            ) as run_pipeline,
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "generate",
+                    "--start",
+                    "2025-01-01",
+                    "--end",
+                    "2025-01-31",
+                    "--dry-run",
+                    "--quiet",
+                    "-O",
+                    str(output),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert run_pipeline.call_args.kwargs["dry_run"] is True
+        assert not output.exists()
 
     def test_cli_include_photos_flag(self, tmp_path):
         """--include-photos is accepted without error."""
@@ -691,11 +992,17 @@ class TestPipelineRunner:
                 music=None,
                 no_music=True,
                 output_path=output,
+                output_resolution="720p",
+                output_orientation="landscape",
                 memory_type="year_in_review",
-                person_names=[],
+                person_names=[" Alice ", "BOB\tJones"],
                 date_range=dr,
                 upload_to_immich=False,
                 album=None,
+                source="auto",
+                memory_key="candidate:key",
+                memory_category="birthday",
+                automation_attempt_id="attempt-pipeline-1",
             )
 
         assert result_path == output
@@ -705,7 +1012,138 @@ class TestPipelineRunner:
         assert gen_params.transition == "cut"
         assert gen_params.no_music is True
         assert gen_params.memory_type == "year_in_review"
+        assert gen_params.source == "auto"
+        assert gen_params.memory_key_override == "candidate:key"
+        assert gen_params.memory_category == "birthday"
+        assert gen_params.automation_attempt_id == "attempt-pipeline-1"
+        assert gen_params.memory_people == ("alice", "bob jones")
         assert gen_params.target_duration_seconds == 60.0
+        assert gen_params.timeline_plan.target_duration == 60.0
+        assert gen_params.timeline_plan.content_budget >= 48.0
+        assert gen_params.output_canvas.width == 1280
+        assert gen_params.output_canvas.height == 720
+        pipeline_config = MockPipeline.call_args.kwargs["config"]
+        assert pipeline_config.target_duration_seconds == gen_params.timeline_plan.content_budget
+        assert pipeline_config.output_resolution == 720
+
+    def test_dry_run_selects_and_writes_no_artifact(self, tmp_path, fixture_mp4, capsys):
+        """Planning uses cached/metadata analysis and stops before generation."""
+        from immich_memories.analysis.smart_pipeline import ClipWithSegment, PipelineResult
+        from immich_memories.cli._pipeline_runner import run_pipeline_and_generate
+        from immich_memories.config_loader import Config
+        from immich_memories.timeperiod import DateRange
+
+        config = Config(
+            cache={"database": str(tmp_path / "analysis.db"), "directory": str(tmp_path / "cache")}
+        )
+        clips = [_make_fake_clip(f"asset{i}", tmp_path, fixture_mp4) for i in range(3)]
+        analyzed = [
+            ClipWithSegment(clip=clip, start_time=0.0, end_time=3.0, score=0.5) for clip in clips
+        ]
+        result = PipelineResult(
+            selected_clips=clips,
+            clip_segments={clip.asset.id: (0.0, 3.0) for clip in clips},
+            errors=[],
+        )
+        output = tmp_path / "preview.mp4"
+
+        with (
+            patch("immich_memories.generate.assets_to_clips", return_value=clips),
+            patch("immich_memories.analysis.smart_pipeline.SmartPipeline") as pipeline_type,
+            patch("immich_memories.generate.generate_memory") as generate,
+        ):
+            pipeline_type.return_value.run_planning_analysis.return_value = analyzed
+            pipeline_type.return_value.run_selection.return_value = result
+            actual, should_upload, _ = run_pipeline_and_generate(
+                assets=[clip.asset for clip in clips],
+                client=MagicMock(),
+                config=config,
+                progress=MagicMock(),
+                duration=60.0,
+                transition="cut",
+                music=None,
+                no_music=True,
+                output_path=output,
+                memory_type="year_in_review",
+                person_names=[],
+                date_range=DateRange(
+                    start=datetime(2025, 1, 1), end=datetime(2025, 12, 31, 23, 59, 59)
+                ),
+                upload_to_immich=True,
+                album="Memories",
+                dry_run=True,
+            )
+
+        assert actual == output
+        assert should_upload is True
+        pipeline_type.return_value.run_planning_analysis.assert_called_once()
+        generate.assert_not_called()
+        assert "Selected: 3" in capsys.readouterr().out
+        assert not output.exists()
+
+    def test_dry_run_reports_all_selected_month_dividers(
+        self, tmp_path, fixture_mp4, capsys
+    ) -> None:
+        """Dry-run reports the complete post-selection month-divider decision."""
+        from immich_memories.analysis.smart_pipeline import ClipWithSegment, PipelineResult
+        from immich_memories.cli._pipeline_runner import run_pipeline_and_generate
+        from immich_memories.config_loader import Config
+        from immich_memories.timeperiod import DateRange
+
+        config = Config(
+            cache={"database": str(tmp_path / "analysis.db"), "directory": str(tmp_path / "cache")},
+            title_screens={"ending_duration": 4.0},
+        )
+        clips = [
+            _make_fake_clip(f"asset-{month}", tmp_path, fixture_mp4, duration=8.0)
+            for month in range(2, 8)
+        ]
+        for month, clip in zip(range(2, 8), clips, strict=True):
+            clip.asset.file_created_at = datetime(2026, month, 5, tzinfo=UTC)
+        analyzed = [
+            ClipWithSegment(clip=clip, start_time=0.0, end_time=8.0, score=0.5) for clip in clips
+        ]
+        result = PipelineResult(
+            selected_clips=clips,
+            clip_segments={clip.asset.id: (0.0, 8.0) for clip in clips},
+            errors=[],
+        )
+        output_path = tmp_path / "emile-preview.mp4"
+
+        with (
+            patch("immich_memories.generate.assets_to_clips", return_value=clips),
+            patch("immich_memories.analysis.smart_pipeline.SmartPipeline") as pipeline_type,
+            patch("immich_memories.generate.generate_memory") as generate,
+        ):
+            pipeline_type.return_value.run_planning_analysis.return_value = analyzed
+            pipeline_type.return_value.run_selection.return_value = result
+            run_pipeline_and_generate(
+                assets=[clip.asset for clip in clips],
+                client=MagicMock(),
+                config=config,
+                progress=MagicMock(),
+                duration=60.0,
+                transition="crossfade",
+                music=None,
+                no_music=True,
+                output_path=output_path,
+                memory_type="person_spotlight",
+                person_names=["Emile"],
+                date_range=DateRange(
+                    start=datetime(2026, 1, 1), end=datetime(2026, 12, 31, 23, 59, 59)
+                ),
+                upload_to_immich=False,
+                album=None,
+                dry_run=True,
+            )
+
+        output = capsys.readouterr().out
+        assert "Month dividers: all 5 selected month changes" in output
+        assert "Title cards: 7 (17.5s)" in output
+        assert "Estimated final duration: 59.5s" in output
+        assert "Music: disabled" in output
+        assert not output_path.exists()
+        generate.assert_not_called()
 
 
 class TestTripGenerationFlow:
@@ -845,6 +1283,8 @@ class TestTripGenerationFlow:
         mock_config = MagicMock()
         mock_config.defaults.transition = "crossfade"
         mock_config.defaults.scale_mode = "blur"
+        mock_config.output.codec = "h264"
+        mock_config.output.format = "mp4"
         mock_config.trips.homebase_latitude = 48.8
         mock_config.trips.homebase_longitude = 2.3
 
@@ -898,7 +1338,7 @@ class TestTripGenerationFlow:
                 no_music=True,
                 resolution="auto",
                 scale_mode=None,
-                output_format=None,
+                output_format="prores",
                 add_date=False,
                 keep_intermediates=False,
                 privacy_mode=False,
@@ -912,6 +1352,293 @@ class TestTripGenerationFlow:
         call_kwargs = mock_pipeline.call_args[1]
         assert call_kwargs["memory_type"] == "trip"
         assert call_kwargs["no_music"] is True
+        assert call_kwargs["output_path"].suffix == ".mov"
+
+    def test_exact_trip_range_selects_only_matching_trip(self, tmp_path):
+        """Automation dates select the detected trip, not the nearest or first trip."""
+        from immich_memories.analysis.trip_detection import DetectedTrip
+        from immich_memories.cli._trip_generation import handle_trip_generation
+
+        mock_client = MagicMock()
+        mock_progress = MagicMock()
+        mock_config = MagicMock()
+        mock_config.defaults.transition = "crossfade"
+        mock_config.defaults.scale_mode = "blur"
+        mock_config.output.codec = "h264"
+        mock_config.output.format = "mp4"
+        mock_config.trips.homebase_latitude = 48.8
+        mock_config.trips.homebase_longitude = 2.3
+        trips = [
+            DetectedTrip(
+                start_date=date(2025, 5, 1),
+                end_date=date(2025, 5, 4),
+                location_name="Wrong",
+                asset_count=12,
+                centroid_lat=50.0,
+                centroid_lon=4.0,
+            ),
+            DetectedTrip(
+                start_date=date(2025, 7, 10),
+                end_date=date(2025, 7, 17),
+                location_name="Exact",
+                asset_count=20,
+                centroid_lat=43.7,
+                centroid_lon=7.2,
+            ),
+        ]
+        output = tmp_path / "trip_exact_2025-07-10.mp4"
+
+        with (
+            patch("immich_memories.cli._trip_display.run_trip_detection", return_value=trips),
+            patch(
+                "immich_memories.cli._trip_generation.fetch_videos_and_live_photos",
+                return_value=([MagicMock()], []),
+            ) as mock_fetch,
+            patch(
+                "immich_memories.cli._trip_generation.run_pipeline_and_generate",
+                return_value=(output, False, None),
+            ) as mock_pipeline,
+        ):
+            handle_trip_generation(
+                client=mock_client,
+                config=mock_config,
+                progress=mock_progress,
+                year=2025,
+                month=None,
+                trip_index=None,
+                all_trips=False,
+                near_date=None,
+                person_names=[],
+                output_path=tmp_path / "trip.mp4",
+                use_live_photos=False,
+                use_photos=False,
+                effective_analysis_depth="fast",
+                transition="smart",
+                music=None,
+                music_volume=0.5,
+                no_music=True,
+                resolution="auto",
+                scale_mode=None,
+                output_format=None,
+                add_date=False,
+                keep_intermediates=False,
+                privacy_mode=False,
+                title_override=None,
+                subtitle_override=None,
+                upload_to_immich=False,
+                album=None,
+                requested_start=date(2025, 7, 10),
+                requested_end=date(2025, 7, 17),
+                source="auto",
+                memory_key="trip:exact:key",
+                memory_category="trip",
+            )
+
+        fetched_range = mock_fetch.call_args.kwargs["date_ranges"][0]
+        assert fetched_range.start.date() == date(2025, 7, 10)
+        assert fetched_range.end.date() == date(2025, 7, 17)
+        assert mock_pipeline.call_args.kwargs["source"] == "auto"
+        assert mock_pipeline.call_args.kwargs["memory_key"] == "trip:exact:key"
+        assert mock_pipeline.call_args.kwargs["memory_category"] == "trip"
+
+    def test_exact_trip_range_without_match_fails(self, tmp_path):
+        """A stale automation candidate cannot silently generate another trip."""
+        from immich_memories.analysis.trip_detection import DetectedTrip
+        from immich_memories.cli._trip_generation import handle_trip_generation
+
+        trip = DetectedTrip(
+            start_date=date(2025, 5, 1),
+            end_date=date(2025, 5, 4),
+            location_name="Different",
+            asset_count=12,
+            centroid_lat=50.0,
+            centroid_lon=4.0,
+        )
+
+        with (
+            patch("immich_memories.cli._trip_display.run_trip_detection", return_value=[trip]),
+            patch("immich_memories.cli._trip_generation.run_pipeline_and_generate") as pipeline,
+            pytest.raises(click.ClickException, match="No detected trip exactly matches"),
+        ):
+            handle_trip_generation(
+                client=MagicMock(),
+                config=MagicMock(),
+                progress=MagicMock(),
+                year=2025,
+                month=None,
+                trip_index=None,
+                all_trips=False,
+                near_date=None,
+                person_names=[],
+                output_path=tmp_path / "trip.mp4",
+                use_live_photos=False,
+                use_photos=False,
+                effective_analysis_depth="fast",
+                transition="smart",
+                music=None,
+                music_volume=0.5,
+                no_music=True,
+                resolution="auto",
+                scale_mode=None,
+                output_format=None,
+                add_date=False,
+                keep_intermediates=False,
+                privacy_mode=False,
+                title_override=None,
+                subtitle_override=None,
+                upload_to_immich=False,
+                album=None,
+                requested_start=date(2025, 7, 10),
+                requested_end=date(2025, 7, 17),
+                source="auto",
+                memory_key="trip:missing:key",
+                memory_category="trip",
+            )
+
+        pipeline.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("selector_args", "expected_starts"),
+        [
+            (["--trip-index", "2"], (date(2025, 8, 10),)),
+            (["--month", "8"], (date(2025, 8, 10),)),
+            (["--near-date", "2025-08-12"], (date(2025, 8, 10),)),
+            (["--all-trips"], (date(2025, 1, 2), date(2025, 8, 10))),
+        ],
+    )
+    def test_manual_custom_range_preserves_trip_selector_precedence(
+        self,
+        tmp_path,
+        selector_args: list[str],
+        expected_starts: tuple[date, ...],
+    ) -> None:
+        """Manual custom dates must not replace the established trip selectors."""
+        from click.testing import CliRunner
+
+        from immich_memories.analysis.trip_detection import DetectedTrip
+        from immich_memories.cli import main
+        from immich_memories.config_loader import Config
+
+        trips = [
+            DetectedTrip(
+                start_date=date(2025, 1, 2),
+                end_date=date(2025, 1, 5),
+                location_name="Exact Range",
+                asset_count=12,
+                centroid_lat=50.0,
+                centroid_lon=4.0,
+            ),
+            DetectedTrip(
+                start_date=date(2025, 8, 10),
+                end_date=date(2025, 8, 15),
+                location_name="Selected Trip",
+                asset_count=20,
+                centroid_lat=43.7,
+                centroid_lon=7.2,
+            ),
+        ]
+        config = Config(immich={"url": "http://immich.test", "api_key": "test-key"})
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        output = tmp_path / "trip.mp4"
+
+        with (
+            patch("immich_memories.cli.get_config", return_value=config),
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=mock_client),
+            patch("immich_memories.cli._trip_display.run_trip_detection", return_value=trips),
+            patch(
+                "immich_memories.cli._trip_generation.fetch_videos_and_live_photos",
+                return_value=([MagicMock()], []),
+            ),
+            patch(
+                "immich_memories.cli._trip_generation.run_pipeline_and_generate",
+                return_value=(output, False, None),
+            ) as mock_pipeline,
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "generate",
+                    "--memory-type",
+                    "trip",
+                    "--year",
+                    "2025",
+                    "--start",
+                    "2025-01-02",
+                    "--end",
+                    "2025-01-05",
+                    *selector_args,
+                    "--no-music",
+                    "--output",
+                    str(output),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        selected_starts = tuple(
+            call.kwargs["date_range"].start.date() for call in mock_pipeline.call_args_list
+        )
+        assert selected_starts == expected_starts
+
+    def test_exact_trip_range_with_duplicate_matches_fails(self, tmp_path) -> None:
+        """Ambiguous detector output cannot pick an arbitrary trip."""
+        from immich_memories.analysis.trip_detection import DetectedTrip
+        from immich_memories.cli._trip_generation import handle_trip_generation
+
+        duplicates = [
+            DetectedTrip(
+                start_date=date(2025, 7, 10),
+                end_date=date(2025, 7, 17),
+                location_name=location,
+                asset_count=20,
+                centroid_lat=43.7,
+                centroid_lon=7.2,
+            )
+            for location in ("Duplicate A", "Duplicate B")
+        ]
+
+        with (
+            patch("immich_memories.cli._trip_display.run_trip_detection", return_value=duplicates),
+            patch("immich_memories.cli._trip_generation.run_pipeline_and_generate") as pipeline,
+            pytest.raises(click.ClickException, match="found 2"),
+        ):
+            handle_trip_generation(
+                client=MagicMock(),
+                config=MagicMock(),
+                progress=MagicMock(),
+                year=2025,
+                month=None,
+                trip_index=None,
+                all_trips=False,
+                near_date=None,
+                person_names=[],
+                output_path=tmp_path / "trip.mp4",
+                use_live_photos=False,
+                use_photos=False,
+                effective_analysis_depth="fast",
+                transition="smart",
+                music=None,
+                music_volume=0.5,
+                no_music=True,
+                resolution="auto",
+                scale_mode=None,
+                output_format=None,
+                add_date=False,
+                keep_intermediates=False,
+                privacy_mode=False,
+                title_override=None,
+                subtitle_override=None,
+                upload_to_immich=False,
+                album=None,
+                requested_start=date(2025, 7, 10),
+                requested_end=date(2025, 7, 17),
+                source="auto",
+                memory_key="trip:duplicate:key",
+                memory_category="trip",
+            )
+
+        pipeline.assert_not_called()
 
 
 def _combined_mock(tmp_path, mock_client=None):

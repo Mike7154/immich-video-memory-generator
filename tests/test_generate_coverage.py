@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import subprocess
 from datetime import UTC, date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -33,6 +35,21 @@ from immich_memories.generate import (
 )
 from immich_memories.processing.assembly_config import AssemblyClip
 from tests.conftest import make_asset, make_clip
+
+
+def _h264_output_plan():
+    from immich_memories.processing.encoding_plan import EncodingPlan, HdrTransfer, OutputCodec
+
+    return EncodingPlan(
+        codec=OutputCodec.H264,
+        encoder="libx264",
+        encoder_args=("-c:v", "libx264"),
+        target_transfer=HdrTransfer.NONE,
+        tone_map_to_sdr=False,
+        pixel_format="yuv420p",
+        container="mp4",
+    )
+
 
 # ---------------------------------------------------------------------------
 # _parse_clip_date
@@ -863,13 +880,15 @@ class TestBuildAssemblySettingsExtraBranches:
         assert settings.transition == TransitionType.CROSSFADE
 
     def test_prores_format(self):
+        from immich_memories.processing.encoding_plan import OutputCodec
+
         params = GenerationParams(
             clips=[], output_path=Path("/out/o.mp4"), config=Config(), output_format="prores"
         )
         settings = _build_assembly_settings(params, [])
-        assert settings.output_codec == "prores"
+        assert settings.encoding_plan.codec is OutputCodec.PRORES
 
-    def test_unknown_format_uses_config_codec(self):
+    def test_unknown_explicit_format_is_rejected(self):
         config = Config()
         config.output.codec = "h265"
         params = GenerationParams(
@@ -878,8 +897,8 @@ class TestBuildAssemblySettingsExtraBranches:
             config=config,
             output_format="webm",
         )
-        settings = _build_assembly_settings(params, [])
-        assert settings.output_codec == "h265"
+        with pytest.raises(ValueError, match="Unsupported format override"):
+            _build_assembly_settings(params, [])
 
     def test_scale_mode_from_params(self):
         params = GenerationParams(
@@ -932,14 +951,17 @@ class TestBuildAssemblySettingsExtraBranches:
         assert settings.debug_preserve_intermediates is True
 
     def test_crf_from_params(self):
+        config = Config()
+        config.hardware.enabled = False
         params = GenerationParams(
             clips=[],
             output_path=Path("/out/o.mp4"),
-            config=Config(),
+            config=config,
             output_crf=18,
         )
         settings = _build_assembly_settings(params, [])
-        assert settings.output_crf == 18
+        args = settings.encoding_plan.encoder_args
+        assert args[args.index("-crf") + 1] == "18"
 
 
 # ---------------------------------------------------------------------------
@@ -1039,15 +1061,39 @@ class TestGenerateMemoryInner:
 
     def _patch_inner_deps(self, tmp_path):
         """Return a context manager that patches all external boundaries in _generate_memory_inner."""
-        result_path = tmp_path / "result.mp4"
-        result_path.write_bytes(b"fake video")
+        source_path = tmp_path / "result.mp4"
+        source_path.write_bytes(b"fake video")
+        result_path = tmp_path / "output" / "memory_20250715_120000_abcd" / "memory.mp4"
 
         assembly_clip = AssemblyClip(
-            path=result_path, duration=5.0, asset_id="clip-1", date="2025-07-15"
+            path=source_path, duration=5.0, asset_id="clip-1", date="2025-07-15"
         )
 
+        def assemble_to_staged(_clips, output_path: Path, _callback, **_kwargs) -> Path:
+            output_path.write_bytes(b"fake video")
+            return output_path
+
         mock_assembler = MagicMock()
-        mock_assembler.assemble_with_titles.return_value = result_path
+        mock_assembler.assemble_with_titles.side_effect = assemble_to_staged
+        probe_payload = {
+            "streams": [
+                {
+                    "codec_name": "h264",
+                    "pix_fmt": "yuv420p",
+                    "color_transfer": "bt709",
+                    "color_primaries": "bt709",
+                    "width": 1920,
+                    "height": 1080,
+                    "nb_read_frames": "150",
+                }
+            ],
+            "format": {
+                "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+                "duration": "5.0",
+                "size": "10",
+                "tags": {"major_brand": "isom"},
+            },
+        }
 
         patches = {
             # WHY: VideoDownloadCache hits filesystem for video caching
@@ -1091,6 +1137,13 @@ class TestGenerateMemoryInner:
             ),
             # WHY: _run_music_phase calls external music generation APIs
             "music": patch("immich_memories.generate._run_music_phase"),
+            # WHY: ffprobe is the external validation process; keep the real validation contract.
+            "probe": patch(
+                "immich_memories.processing.output_contract.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    ["ffprobe"], 0, json.dumps(probe_payload), ""
+                ),
+            ),
             # WHY: sanitize_filename is a security utility
             "sanitize": patch(
                 "immich_memories.security.sanitize_filename",
@@ -1124,13 +1177,59 @@ class TestGenerateMemoryInner:
                 call_order.append("extract"),
                 [AssemblyClip(path=result_path, duration=5.0, asset_id="c1", date="2025-07-15")],
             )[1]
-            mocks["assembler"].return_value.assemble_with_titles.side_effect = lambda *_a, **_kw: (  # noqa: ARG005
-                call_order.append("assemble"),
-                result_path,
-            )[1]
+
+            def assemble_in_order(_clips, output_path: Path, _callback, **_kwargs) -> Path:
+                call_order.append("assemble")
+                output_path.write_bytes(b"fake video")
+                return output_path
+
+            mocks["assembler"].return_value.assemble_with_titles.side_effect = assemble_in_order
             _generate_memory_inner(params)
 
         assert call_order == ["extract", "assemble"]
+
+    def test_disabled_video_cache_never_constructs_or_mutates_persistent_cache(self, tmp_path):
+        """Disabled caching uses disposable downloads, not the configured cache root."""
+        from immich_memories.generate import _generate_memory_inner
+
+        persistent_root = tmp_path / "persistent-cache"
+        params = self._make_params(
+            tmp_path,
+            config=Config(
+                cache={
+                    "directory": str(persistent_root),
+                    "database": str(tmp_path / "runs.db"),
+                    "video_cache_enabled": False,
+                }
+            ),
+        )
+        patches, _, _ = self._patch_inner_deps(tmp_path)
+
+        with contextlib.ExitStack() as stack:
+            mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
+            _generate_memory_inner(params)
+
+        mocks["cache"].assert_not_called()
+        assert not params.config.cache.video_cache_path.exists()
+        assert mocks["extract"].call_args.args[1] is None
+
+    def test_enabled_video_cache_passes_one_batch_to_extraction(self, tmp_path):
+        """Enabled generation owns exactly one batch for all extraction downloads."""
+        from immich_memories.generate import _generate_memory_inner
+
+        params = self._make_params(tmp_path)
+        patches, _, _ = self._patch_inner_deps(tmp_path)
+        cache = MagicMock()
+        batch = MagicMock()
+        cache.begin_batch.return_value.__enter__.return_value = batch
+
+        with contextlib.ExitStack() as stack:
+            mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
+            mocks["cache"].return_value = cache
+            _generate_memory_inner(params)
+
+        cache.begin_batch.assert_called_once()
+        assert mocks["extract"].call_args.args[1] is batch
 
     def test_no_clips_after_extraction_raises(self, tmp_path):
         from immich_memories.generate import _generate_memory_inner
@@ -1182,11 +1281,13 @@ class TestGenerateMemoryInner:
         patches, result_path, _ = self._patch_inner_deps(tmp_path)
 
         with contextlib.ExitStack() as stack:
-            {name: stack.enter_context(p) for name, p in patches.items()}
+            mocks = {name: stack.enter_context(p) for name, p in patches.items()}
             upload_mock = stack.enter_context(patch("immich_memories.generate._upload_to_immich"))
+            upload_mock.return_value = {"asset_id": "uploaded-asset"}
             _generate_memory_inner(params)
 
         upload_mock.assert_called_once_with(mock_client, result_path, "test-album")
+        mocks["tracker"].return_value.mark_delivered.assert_called_once_with("uploaded-asset")
 
     def test_upload_not_called_when_disabled(self, tmp_path):
         from immich_memories.generate import _generate_memory_inner
@@ -1314,6 +1415,7 @@ class TestGenerateMemoryInner:
         with contextlib.ExitStack() as stack:
             mocks = {name: stack.enter_context(p) for name, p in patches.items()}
             mocks["extract"].side_effect = GenerationError("intentional")
+            mocks["tracker"].return_value.db.get_run.return_value.status = "running"
 
             with pytest.raises(GenerationError):
                 _generate_memory_inner(params)
@@ -1330,6 +1432,7 @@ class TestGenerateMemoryInner:
         with contextlib.ExitStack() as stack:
             mocks = {name: stack.enter_context(p) for name, p in patches.items()}
             mocks["extract"].side_effect = RuntimeError("surprise")
+            mocks["tracker"].return_value.db.get_run.return_value.status = "running"
 
             with pytest.raises(GenerationError):
                 _generate_memory_inner(params)
@@ -1394,6 +1497,54 @@ class TestCreateAssembler:
 
 
 class TestRunMusicPhase:
+    def test_music_phase_requested_for_explicit_music_path(self, tmp_path):
+        from immich_memories.generate_settings import _music_phase_requested
+
+        params = GenerationParams(
+            clips=[],
+            output_path=Path("/tmp/o.mp4"),
+            config=Config(),
+            music_path=tmp_path / "music.wav",
+        )
+
+        assert _music_phase_requested(params)
+
+    def test_music_phase_not_requested_when_music_is_disabled(self, tmp_path):
+        from immich_memories.generate_settings import _music_phase_requested
+
+        config = Config()
+        config.ace_step.enabled = True
+        params = GenerationParams(
+            clips=[],
+            output_path=Path("/tmp/o.mp4"),
+            config=config,
+            music_path=tmp_path / "music.wav",
+            no_music=True,
+        )
+
+        assert not _music_phase_requested(params)
+
+    def test_complete_music_failure_tracks_sanitized_optional_warning(self):
+        from immich_memories.generate_settings import _complete_music_failure
+
+        config = Config()
+        tracker = MagicMock()
+
+        result = _complete_music_failure(
+            RuntimeError("backend unavailable"),
+            config=config,
+            run_tracker=tracker,
+            phase_started=False,
+        )
+
+        assert result.applied is False
+        assert result.warning == "Optional music failed: backend unavailable"
+        tracker.start_phase.assert_called_once_with("music", 1)
+        tracker.complete_phase.assert_called_once_with(
+            items_processed=0,
+            errors=[{"error": "Optional music failed: backend unavailable"}],
+        )
+
     def test_skips_when_no_music_resolved(self, tmp_path):
         from immich_memories.generate import _run_music_phase
 
@@ -1406,7 +1557,14 @@ class TestRunMusicPhase:
         with patch(
             "immich_memories.generate_music.resolve_music_file", return_value=None
         ) as mock_resolve:
-            _run_music_phase(params, [], tmp_path / "result.mp4", tmp_path, mock_tracker)
+            _run_music_phase(
+                params,
+                [],
+                tmp_path / "result.mp4",
+                tmp_path,
+                mock_tracker,
+                encoding_plan=_h264_output_plan(),
+            )
 
         mock_resolve.assert_called_once()
         mock_tracker.start_phase.assert_not_called()
@@ -1423,17 +1581,61 @@ class TestRunMusicPhase:
             clips=[], output_path=Path("/tmp/o.mp4"), config=Config(), music_volume=0.7
         )
         mock_tracker = MagicMock()
+        encoding_plan = _h264_output_plan()
 
         # WHY: resolve_music_file and apply_music_file touch filesystem + FFmpeg
         with (
             patch("immich_memories.generate_music.resolve_music_file", return_value=music_file),
             patch("immich_memories.generate_music.apply_music_file") as mock_apply,
         ):
-            _run_music_phase(params, [], result_path, tmp_path, mock_tracker)
+            _run_music_phase(
+                params,
+                [],
+                result_path,
+                tmp_path,
+                mock_tracker,
+                encoding_plan=encoding_plan,
+            )
 
-        mock_apply.assert_called_once_with(result_path, music_file, 0.7)
+        mock_apply.assert_called_once_with(result_path, music_file, 0.7, encoding_plan)
         mock_tracker.start_phase.assert_called_once_with("music", 1)
         mock_tracker.complete_phase.assert_called_once_with(items_processed=1)
+
+    def test_starts_music_phase_before_resolving_generated_music(self, tmp_path):
+        from immich_memories.generate import _run_music_phase
+
+        music_file = tmp_path / "music.wav"
+        music_file.write_bytes(b"music")
+        result_path = tmp_path / "result.mp4"
+        result_path.write_bytes(b"video")
+        config = Config()
+        config.ace_step.enabled = True
+        params = GenerationParams(clips=[], output_path=Path("/tmp/o.mp4"), config=config)
+        events: list[str] = []
+        mock_tracker = MagicMock()
+        mock_tracker.start_phase.side_effect = lambda *_args: events.append("phase-start")
+
+        def resolve_music(**_kwargs):
+            events.append("resolve")
+            return music_file
+
+        with (
+            patch(
+                "immich_memories.generate_music.resolve_music_file",
+                side_effect=resolve_music,
+            ),
+            patch("immich_memories.generate_music.apply_music_file"),
+        ):
+            _run_music_phase(
+                params,
+                [],
+                result_path,
+                tmp_path,
+                mock_tracker,
+                encoding_plan=_h264_output_plan(),
+            )
+
+        assert events[:2] == ["phase-start", "resolve"]
 
     def test_report_fn_delegates_to_progress_callback(self, tmp_path):
         from immich_memories.generate import _run_music_phase
@@ -1451,7 +1653,14 @@ class TestRunMusicPhase:
         with patch(
             "immich_memories.generate_music.resolve_music_file", return_value=None
         ) as mock_resolve:
-            _run_music_phase(params, [], tmp_path / "r.mp4", tmp_path, mock_tracker)
+            _run_music_phase(
+                params,
+                [],
+                tmp_path / "r.mp4",
+                tmp_path,
+                mock_tracker,
+                encoding_plan=_h264_output_plan(),
+            )
 
         # Verify resolve_music_file received a report_fn callback
         call_kwargs = mock_resolve.call_args
@@ -2144,7 +2353,7 @@ class TestAutoGenerateMusic:
             result = auto_generate_music(config, [], tmp_path, None)
         assert result is None
 
-    def test_generation_exception_returns_none(self, tmp_path):
+    def test_generation_exception_reaches_optional_phase_boundary(self, tmp_path):
         from immich_memories.generate_music import auto_generate_music
 
         config = Config()
@@ -2155,9 +2364,9 @@ class TestAutoGenerateMusic:
                 "immich_memories.audio.music_generator.generate_music_for_video",
                 side_effect=RuntimeError("API down"),
             ),
+            pytest.raises(RuntimeError, match="API down"),
         ):
-            result = auto_generate_music(config, [], tmp_path, "month")
-        assert result is None
+            auto_generate_music(config, [], tmp_path, "month")
 
 
 class TestMusicConfigAvailable:

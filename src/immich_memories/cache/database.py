@@ -17,6 +17,15 @@ from immich_memories.cache.database_models import (  # noqa: F401
     SimilarVideo,
     _hamming_distance,
 )
+from immich_memories.cache.database_rows import row_to_analysis, row_to_segment
+from immich_memories.cache.migration_sql import execute_migration_script
+from immich_memories.cache.migration_v11 import migrate_automation_history
+from immich_memories.cache.migration_v12 import migrate_automation_attempt_identity
+from immich_memories.cache.migration_v13 import migrate_delivery_state
+from immich_memories.cache.migration_v14 import migrate_operational_phases
+from immich_memories.cache.migration_v15 import migrate_notification_health
+from immich_memories.cache.migration_v16 import migrate_video_analysis_model_version
+from immich_memories.cache.versions import ANALYSIS_VERSION, SCHEMA_VERSION, SCORING_VERSION
 
 if TYPE_CHECKING:
     from immich_memories.analysis.scenes import Scene
@@ -24,13 +33,6 @@ if TYPE_CHECKING:
     from immich_memories.api.models import Asset, VideoClipInfo
 
 logger = logging.getLogger(__name__)
-
-# Current schema version - increment when schema changes
-SCHEMA_VERSION = 9
-
-# Scoring algorithm version — bump when score computation changes
-# so cached scores from the old algorithm get re-analyzed
-SCORING_VERSION = 2
 
 
 class VideoAnalysisCache:
@@ -65,20 +67,25 @@ class VideoAnalysisCache:
 
     def _run_migrations(self) -> None:
         with self._get_connection() as conn:
-            # Check current version
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    description TEXT
-                )
-            """)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        description TEXT
+                    )
+                """)
 
-            result = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-            current_version = result[0] or 0
+                result = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+                current_version = result[0] or 0
 
-            if current_version < SCHEMA_VERSION:
-                self._apply_migrations(conn, current_version)
+                if current_version < SCHEMA_VERSION:
+                    self._apply_migrations(conn, current_version)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def _apply_migrations(self, conn: sqlite3.Connection, from_version: int) -> None:
         migrations = {
@@ -91,6 +98,13 @@ class VideoAnalysisCache:
             7: self._migration_v7_asset_scores,
             8: self._migration_v8_scoring_version,
             9: self._migration_v9_automation,
+            10: self._migration_v10_automation_state,
+            11: self._migration_v11_automation_history,
+            12: migrate_automation_attempt_identity,
+            13: migrate_delivery_state,
+            14: migrate_operational_phases,
+            15: migrate_notification_health,
+            16: migrate_video_analysis_model_version,
         }
 
         for version in range(from_version + 1, SCHEMA_VERSION + 1):
@@ -101,10 +115,11 @@ class VideoAnalysisCache:
                     "INSERT INTO schema_migrations (version, description) VALUES (?, ?)",
                     (version, f"Migration to v{version}"),
                 )
-                conn.commit()
 
     def _migration_v1_initial(self, conn: sqlite3.Connection) -> None:
-        conn.executescript("""
+        execute_migration_script(
+            conn,
+            """
             CREATE TABLE IF NOT EXISTS video_analysis (
                 asset_id TEXT PRIMARY KEY,
                 checksum TEXT,
@@ -185,10 +200,13 @@ class VideoAnalysisCache:
                 ON hash_index(hash_chunk_2);
             CREATE INDEX IF NOT EXISTS idx_hash_chunk_3
                 ON hash_index(hash_chunk_3);
-        """)
+        """,
+        )
 
     def _migration_v2_thumbnails(self, conn: sqlite3.Connection) -> None:
-        conn.executescript("""
+        execute_migration_script(
+            conn,
+            """
             CREATE TABLE IF NOT EXISTS thumbnails (
                 asset_id TEXT NOT NULL,
                 size TEXT NOT NULL,  -- 'preview', 'thumbnail', etc.
@@ -219,7 +237,8 @@ class VideoAnalysisCache:
 
             CREATE INDEX IF NOT EXISTS idx_video_metadata_checksum
                 ON video_metadata(checksum);
-        """)
+        """,
+        )
 
     def _migration_v3_remove_thumbnail_blobs(self, conn: sqlite3.Connection) -> None:
         """Remove thumbnail BLOBs from database.
@@ -232,7 +251,9 @@ class VideoAnalysisCache:
         logger.info("Dropped thumbnails table - thumbnails now stored in file cache")
 
     def _migration_v4_run_tracking(self, conn: sqlite3.Connection) -> None:
-        conn.executescript("""
+        execute_migration_script(
+            conn,
+            """
             -- Pipeline runs table
             CREATE TABLE IF NOT EXISTS pipeline_runs (
                 run_id TEXT PRIMARY KEY,
@@ -279,7 +300,8 @@ class VideoAnalysisCache:
             CREATE INDEX IF NOT EXISTS idx_phase_run ON phase_stats(run_id);
             CREATE INDEX IF NOT EXISTS idx_phase_name
                 ON phase_stats(phase_name);
-        """)
+        """,
+        )
         logger.info("Created pipeline_runs and phase_stats tables for run tracking")
 
     def _migration_v5_add_rotation(self, conn: sqlite3.Connection) -> None:
@@ -309,7 +331,9 @@ class VideoAnalysisCache:
 
     def _migration_v7_asset_scores(self, conn: sqlite3.Connection) -> None:
         """Add asset_scores table for cache-first LLM scoring."""
-        conn.executescript("""
+        execute_migration_script(
+            conn,
+            """
             CREATE TABLE IF NOT EXISTS asset_scores (
                 asset_id TEXT PRIMARY KEY,
                 asset_type TEXT NOT NULL,
@@ -327,7 +351,8 @@ class VideoAnalysisCache:
                 ON asset_scores(asset_type);
             CREATE INDEX IF NOT EXISTS idx_asset_scores_combined
                 ON asset_scores(combined_score DESC);
-        """)
+        """,
+        )
         logger.info("Created asset_scores table for cache-first scoring")
 
     def _migration_v8_scoring_version(self, conn: sqlite3.Connection) -> None:
@@ -349,6 +374,44 @@ class VideoAnalysisCache:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_source ON pipeline_runs(source)")
         logger.info("Added memory_type, memory_key, source columns for automation")
+
+    def _migration_v10_automation_state(self, conn: sqlite3.Connection) -> None:
+        """Add durable automation state and exact run identity fields."""
+        conn.execute("ALTER TABLE pipeline_runs ADD COLUMN memory_category TEXT")
+        conn.execute(
+            """
+            ALTER TABLE pipeline_runs
+            ADD COLUMN memory_people_json TEXT NOT NULL DEFAULT '[]'
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE automation_attempts (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                outcome TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                candidate_category TEXT,
+                memory_type TEXT,
+                memory_key TEXT,
+                run_id TEXT,
+                error TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX idx_auto_attempts_started
+            ON automation_attempts(started_at DESC)
+            """
+        )
+        logger.info("Added automation attempt state and exact run identity columns")
+
+    def _migration_v11_automation_history(self, conn: sqlite3.Connection) -> None:
+        """Normalize legacy local timestamps and restore conservative run identity."""
+        migrate_automation_history(conn)
+        logger.info("Normalized automation history timestamps and identity")
 
     # =========================================================================
     # Quick Video Metadata Methods
@@ -460,6 +523,7 @@ class VideoAnalysisCache:
         scenes: list[Scene] | None = None,
         motion_summary: dict | None = None,
         audio_levels: dict | None = None,
+        model_version: str | None = None,
     ) -> None:
         now = datetime.now().isoformat()
 
@@ -486,7 +550,7 @@ class VideoAnalysisCache:
                     asset.checksum,
                     (asset.file_modified_at.isoformat() if asset.file_modified_at else None),
                     now,
-                    SCHEMA_VERSION,
+                    ANALYSIS_VERSION,
                     SCORING_VERSION,
                     perceptual_hash,
                     thumbnail_hash,
@@ -510,6 +574,12 @@ class VideoAnalysisCache:
                     (asset.file_created_at.isoformat() if asset.file_created_at else None),
                 ),
             )
+
+            if model_version is not None:
+                conn.execute(
+                    "UPDATE video_analysis SET model_version = ? WHERE asset_id = ?",
+                    (model_version, asset.id),
+                )
 
             # Delete existing segments
             conn.execute("DELETE FROM video_segments WHERE asset_id = ?", (asset.id,))
@@ -666,53 +736,12 @@ class VideoAnalysisCache:
             if not row:
                 return None
 
-            analysis = self._row_to_analysis(row)
+            analysis = row_to_analysis(row)
 
             if include_segments:
                 analysis.segments = self._load_segments(conn, asset_id)
 
             return analysis
-
-    @staticmethod
-    def _get_row_value(row: sqlite3.Row, key: str, default: int) -> int:
-        """Safely get a value from a sqlite3.Row, with fallback for missing columns."""
-        try:
-            return row[key]
-        except (IndexError, KeyError):
-            return default
-
-    def _row_to_analysis(self, row: sqlite3.Row) -> CachedVideoAnalysis:
-        return CachedVideoAnalysis(
-            asset_id=row["asset_id"],
-            checksum=row["checksum"],
-            file_modified_at=(
-                datetime.fromisoformat(row["file_modified_at"]) if row["file_modified_at"] else None
-            ),
-            analysis_timestamp=datetime.fromisoformat(row["analysis_timestamp"]),
-            scoring_version=self._get_row_value(row, "scoring_version", 1),
-            perceptual_hash=row["perceptual_hash"],
-            thumbnail_hash=row["thumbnail_hash"],
-            duration_seconds=row["duration_seconds"],
-            width=row["width"],
-            height=row["height"],
-            bitrate=row["bitrate"],
-            fps=row["fps"],
-            codec=row["codec"],
-            color_space=row["color_space"],
-            color_transfer=row["color_transfer"],
-            color_primaries=row["color_primaries"],
-            bit_depth=row["bit_depth"],
-            best_face_score=row["best_face_score"],
-            best_motion_score=row["best_motion_score"],
-            best_stability_score=row["best_stability_score"],
-            best_audio_score=row["best_audio_score"],
-            best_total_score=row["best_total_score"],
-            motion_summary=(json.loads(row["motion_summary"]) if row["motion_summary"] else None),
-            audio_levels=(json.loads(row["audio_levels"]) if row["audio_levels"] else None),
-            file_created_at=(
-                datetime.fromisoformat(row["file_created_at"]) if row["file_created_at"] else None
-            ),
-        )
 
     def _load_segments(self, conn: sqlite3.Connection, asset_id: str) -> list[CachedSegment]:
         rows = conn.execute(
@@ -724,52 +753,7 @@ class VideoAnalysisCache:
             (asset_id,),
         ).fetchall()
 
-        return [self._row_to_segment(row) for row in rows]
-
-    def _row_to_segment(self, row: sqlite3.Row) -> CachedSegment:
-        """Convert database row to CachedSegment (including LLM + audio data)."""
-        face_positions = None
-        if row["face_positions"]:
-            positions = json.loads(row["face_positions"])
-            face_positions = [tuple(p) for p in positions]
-
-        # Safely access v6+ columns (absent in pre-migration databases)
-        keys = row.keys()
-
-        def _str(name: str) -> str | None:
-            return str(row[name]) if name in keys and row[name] is not None else None
-
-        def _float(name: str) -> float | None:
-            val = row[name] if name in keys else None
-            return float(val) if val is not None else None
-
-        activities_raw = _str("llm_activities")
-        subjects_raw = _str("llm_subjects")
-        audio_cats_raw = _str("audio_categories")
-
-        return CachedSegment(
-            segment_index=row["segment_index"],
-            start_time=row["start_time"],
-            end_time=row["end_time"],
-            start_frame=row["start_frame"],
-            end_frame=row["end_frame"],
-            face_score=row["face_score"],
-            motion_score=row["motion_score"],
-            stability_score=row["stability_score"],
-            audio_score=row["audio_score"],
-            total_score=row["total_score"],
-            face_positions=face_positions,
-            motion_vectors=(json.loads(row["motion_vectors"]) if row["motion_vectors"] else None),
-            keyframe_path=row["keyframe_path"],
-            llm_description=_str("llm_description"),
-            llm_emotion=_str("llm_emotion"),
-            llm_setting=_str("llm_setting"),
-            llm_activities=(json.loads(activities_raw) if activities_raw else None),
-            llm_subjects=(json.loads(subjects_raw) if subjects_raw else None),
-            llm_interestingness=_float("llm_interestingness"),
-            llm_quality=_float("llm_quality"),
-            audio_categories=(json.loads(audio_cats_raw) if audio_cats_raw else None),
-        )
+        return [row_to_segment(row) for row in rows]
 
     @staticmethod
     def _row_is_stale(row: sqlite3.Row, asset: Asset) -> bool:
@@ -799,7 +783,7 @@ class VideoAnalysisCache:
 
             if not row:
                 return True
-            if row["analysis_version"] != SCHEMA_VERSION:
+            if row["analysis_version"] != ANALYSIS_VERSION:
                 return True
             if row["scoring_version"] != SCORING_VERSION:
                 return True

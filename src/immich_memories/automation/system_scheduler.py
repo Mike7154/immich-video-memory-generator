@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import plistlib
+import shlex
 import shutil
+import subprocess
 import sys
 import textwrap
 from dataclasses import dataclass, field
@@ -18,6 +21,16 @@ class SchedulerInstallResult:
     files_written: list[Path] = field(default_factory=list)
     activate_command: str = ""
     deactivate_command: str = ""
+
+
+@dataclass(frozen=True)
+class SchedulerStatus:
+    """Read-only facts about the external scheduler."""
+
+    platform: str
+    installed: bool | None
+    active: bool | None
+    paths: tuple[Path, ...] = ()
 
 
 _LAUNCHD_LABEL = "com.immich-memories.auto"
@@ -46,61 +59,47 @@ def _default_log_dir() -> Path:
     return Path.home() / ".immich-memories" / "logs"
 
 
+def _auto_command(binary_path: str, cooldown_hours: int, config_path: Path | None) -> list[str]:
+    """Build the exact root-option-aware command shared by scheduler backends."""
+    command = [binary_path]
+    if config_path is not None:
+        command.extend(["--config", str(config_path)])
+    command.extend(["auto", "run", "--quiet", "--cooldown", str(cooldown_hours)])
+    return command
+
+
+def _systemd_quote_arg(value: str) -> str:
+    """Encode one argv element for systemd's ExecStart grammar."""
+    safe = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:@+-")
+    if value and all(char in safe for char in value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$").replace("%", "%%")
+    return f'"{escaped}"'
+
+
 def generate_launchd_plist(
     binary_path: str,
     schedule_hour: int = 9,
     schedule_minute: int = 0,
     cooldown_hours: int = 24,
     log_dir: Path | None = None,
+    config_path: Path | None = None,
 ) -> str:
     """Generate a macOS launchd plist XML string for scheduled auto-generation."""
     log_dir = log_dir or _default_log_dir()
     # PATH from current env so FFmpeg, etc. are discoverable
     env_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
 
-    return textwrap.dedent(f"""\
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-          "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>Label</key>
-            <string>{_LAUNCHD_LABEL}</string>
-
-            <key>ProgramArguments</key>
-            <array>
-                <string>{binary_path}</string>
-                <string>auto</string>
-                <string>run</string>
-                <string>--quiet</string>
-                <string>--cooldown</string>
-                <string>{cooldown_hours}</string>
-            </array>
-
-            <key>StartCalendarInterval</key>
-            <dict>
-                <key>Hour</key>
-                <integer>{schedule_hour}</integer>
-                <key>Minute</key>
-                <integer>{schedule_minute}</integer>
-            </dict>
-
-            <key>StandardOutPath</key>
-            <string>{log_dir}/auto.log</string>
-            <key>StandardErrorPath</key>
-            <string>{log_dir}/auto-error.log</string>
-
-            <key>WorkingDirectory</key>
-            <string>{Path.home()}</string>
-
-            <key>EnvironmentVariables</key>
-            <dict>
-                <key>PATH</key>
-                <string>{env_path}</string>
-            </dict>
-        </dict>
-        </plist>
-    """)
+    payload = {
+        "Label": _LAUNCHD_LABEL,
+        "ProgramArguments": _auto_command(binary_path, cooldown_hours, config_path),
+        "StartCalendarInterval": {"Hour": schedule_hour, "Minute": schedule_minute},
+        "StandardOutPath": str(log_dir / "auto.log"),
+        "StandardErrorPath": str(log_dir / "auto-error.log"),
+        "WorkingDirectory": str(Path.home()),
+        "EnvironmentVariables": {"PATH": env_path},
+    }
+    return plistlib.dumps(payload, sort_keys=False).decode()
 
 
 def generate_systemd_units(
@@ -108,8 +107,12 @@ def generate_systemd_units(
     schedule_hour: int = 9,
     schedule_minute: int = 0,
     cooldown_hours: int = 24,
+    config_path: Path | None = None,
 ) -> tuple[str, str]:
     """Generate systemd service and timer unit file contents."""
+    command = " ".join(
+        _systemd_quote_arg(arg) for arg in _auto_command(binary_path, cooldown_hours, config_path)
+    )
     service = textwrap.dedent(f"""\
         [Unit]
         Description=Immich Memories auto-generation
@@ -118,7 +121,7 @@ def generate_systemd_units(
 
         [Service]
         Type=oneshot
-        ExecStart={binary_path} auto run --quiet --cooldown {cooldown_hours}
+        ExecStart={command}
 
         [Install]
         WantedBy=default.target
@@ -144,9 +147,13 @@ def generate_crontab_entry(
     schedule_hour: int = 9,
     schedule_minute: int = 0,
     cooldown_hours: int = 24,
+    config_path: Path | None = None,
 ) -> str:
     """Generate a single crontab line for daily auto-generation."""
-    return f"{schedule_minute} {schedule_hour} * * * {binary_path} auto run --quiet --cooldown {cooldown_hours}"
+    command = shlex.join(_auto_command(binary_path, cooldown_hours, config_path)).replace(
+        "%", r"\%"
+    )
+    return f"{schedule_minute} {schedule_hour} * * * {command}"
 
 
 def _launchd_plist_path() -> Path:
@@ -157,24 +164,130 @@ def _systemd_user_dir() -> Path:
     return Path.home() / ".config" / "systemd" / "user"
 
 
+def _probe_active(command: list[str], inactive_codes: set[int]) -> bool | None:
+    """Return active/inactive only for conclusive read-only command results."""
+    try:
+        result = subprocess.run(  # noqa: S603
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode in inactive_codes:
+        return False
+    return None
+
+
+def _has_crontab_entry(contents: str) -> bool:
+    """Match the generated command only on active crontab lines."""
+    for raw_line in contents.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            command = shlex.split(line.split(maxsplit=5)[5])
+        except (IndexError, ValueError):
+            continue
+        if not command or Path(command[0]).name != "immich-memories":
+            continue
+        index = 1
+        if command[index : index + 1] in (["--config"], ["-c"]):
+            index += 2
+        if command[index : index + 2] == ["auto", "run"]:
+            return True
+    return False
+
+
+def get_scheduler_status() -> SchedulerStatus:
+    """Inspect scheduler installation and activation without changing either."""
+    platform = detect_platform()
+    if platform == "launchd":
+        plist = _launchd_plist_path()
+        active = _probe_active(
+            ["launchctl", "print", f"gui/{os.getuid()}/{_LAUNCHD_LABEL}"],
+            inactive_codes={113},
+        )
+        return SchedulerStatus(
+            platform=platform,
+            installed=plist.is_file(),
+            active=active,
+            paths=(plist,),
+        )
+
+    if platform == "systemd":
+        user_dir = _systemd_user_dir()
+        paths = (
+            user_dir / _SYSTEMD_SERVICE,
+            user_dir / _SYSTEMD_TIMER,
+        )
+        active = _probe_active(
+            ["systemctl", "--user", "is-active", "--quiet", _SYSTEMD_TIMER],
+            inactive_codes={3},
+        )
+        return SchedulerStatus(
+            platform=platform,
+            installed=all(path.is_file() for path in paths),
+            active=active,
+            paths=paths,
+        )
+
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["crontab", "-l"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        installed = None
+    else:
+        if result.returncode == 0:
+            installed = _has_crontab_entry(result.stdout)
+        elif result.returncode == 1 and "no crontab for " in result.stderr.casefold():
+            installed = False
+        else:
+            installed = None
+    return SchedulerStatus(platform=platform, installed=installed, active=None)
+
+
 def install_scheduler(
     schedule_hour: int = 9,
     schedule_minute: int = 0,
     cooldown_hours: int = 24,
+    config_path: Path | None = None,
 ) -> SchedulerInstallResult:
     """Detect platform, generate scheduler files, write them, and return result."""
     platform = detect_platform()
     binary = _resolve_binary()
 
     if platform == "launchd":
-        return _install_launchd(binary, schedule_hour, schedule_minute, cooldown_hours)
+        return _install_launchd(
+            binary, schedule_hour, schedule_minute, cooldown_hours, config_path=config_path
+        )
     if platform == "systemd":
-        return _install_systemd(binary, schedule_hour, schedule_minute, cooldown_hours)
-    return _install_crontab(binary, schedule_hour, schedule_minute, cooldown_hours)
+        return _install_systemd(
+            binary, schedule_hour, schedule_minute, cooldown_hours, config_path=config_path
+        )
+    return _install_crontab(
+        binary, schedule_hour, schedule_minute, cooldown_hours, config_path=config_path
+    )
 
 
-def _install_launchd(binary: str, hour: int, minute: int, cooldown: int) -> SchedulerInstallResult:
-    content = generate_launchd_plist(binary, hour, minute, cooldown)
+def _install_launchd(
+    binary: str,
+    hour: int,
+    minute: int,
+    cooldown: int,
+    *,
+    config_path: Path | None,
+) -> SchedulerInstallResult:
+    content = generate_launchd_plist(binary, hour, minute, cooldown, config_path=config_path)
     plist_path = _launchd_plist_path()
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     _default_log_dir().mkdir(parents=True, exist_ok=True)
@@ -188,8 +301,17 @@ def _install_launchd(binary: str, hour: int, minute: int, cooldown: int) -> Sche
     )
 
 
-def _install_systemd(binary: str, hour: int, minute: int, cooldown: int) -> SchedulerInstallResult:
-    service_content, timer_content = generate_systemd_units(binary, hour, minute, cooldown)
+def _install_systemd(
+    binary: str,
+    hour: int,
+    minute: int,
+    cooldown: int,
+    *,
+    config_path: Path | None,
+) -> SchedulerInstallResult:
+    service_content, timer_content = generate_systemd_units(
+        binary, hour, minute, cooldown, config_path=config_path
+    )
     user_dir = _systemd_user_dir()
     user_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,13 +328,22 @@ def _install_systemd(binary: str, hour: int, minute: int, cooldown: int) -> Sche
     )
 
 
-def _install_crontab(binary: str, hour: int, minute: int, cooldown: int) -> SchedulerInstallResult:
-    entry = generate_crontab_entry(binary, hour, minute, cooldown)
+def _install_crontab(
+    binary: str,
+    hour: int,
+    minute: int,
+    cooldown: int,
+    *,
+    config_path: Path | None,
+) -> SchedulerInstallResult:
+    entry = generate_crontab_entry(binary, hour, minute, cooldown, config_path=config_path)
     return SchedulerInstallResult(
         platform="crontab",
         files_written=[],
-        activate_command=f'(crontab -l 2>/dev/null; echo "{entry}") | crontab -',
-        deactivate_command="crontab -l | grep -v 'immich-memories auto run' | crontab -",
+        activate_command=(
+            f"(crontab -l 2>/dev/null; printf '%s\\n' {shlex.quote(entry)}) | crontab -"
+        ),
+        deactivate_command=(f"crontab -l | grep -Fv -- {shlex.quote(entry)} | crontab -"),
     )
 
 
@@ -245,6 +376,7 @@ def show_scheduler_config(
     schedule_hour: int = 9,
     schedule_minute: int = 0,
     cooldown_hours: int = 24,
+    config_path: Path | None = None,
 ) -> str | None:
     """Generate scheduler config for current platform without writing files."""
     binary = shutil.which("immich-memories")
@@ -254,10 +386,18 @@ def show_scheduler_config(
     platform = detect_platform()
 
     if platform == "launchd":
-        return generate_launchd_plist(binary, schedule_hour, schedule_minute, cooldown_hours)
+        return generate_launchd_plist(
+            binary,
+            schedule_hour,
+            schedule_minute,
+            cooldown_hours,
+            config_path=config_path,
+        )
     if platform == "systemd":
         service, timer = generate_systemd_units(
-            binary, schedule_hour, schedule_minute, cooldown_hours
+            binary, schedule_hour, schedule_minute, cooldown_hours, config_path=config_path
         )
         return f"# {_SYSTEMD_SERVICE}\n{service}\n# {_SYSTEMD_TIMER}\n{timer}"
-    return generate_crontab_entry(binary, schedule_hour, schedule_minute, cooldown_hours)
+    return generate_crontab_entry(
+        binary, schedule_hour, schedule_minute, cooldown_hours, config_path=config_path
+    )

@@ -7,7 +7,6 @@ scene detection with audio analysis to find natural cut points.
 
 from __future__ import annotations
 
-import gc
 import logging
 import operator
 import subprocess
@@ -143,6 +142,11 @@ class UnifiedSegmentAnalyzer:
             if hasattr(self._audio_analyzer, "cleanup"):
                 self._audio_analyzer.cleanup()
             self._audio_analyzer = None
+
+    def reset_for_video(self) -> None:
+        """Release current-video state while retaining reusable configuration and models."""
+        self._audio_analysis_cache.clear()
+        self.scorer.release_capture()
 
     def _get_max_segment_for_source(
         self, source_duration: float, has_good_scene: bool = False
@@ -325,6 +329,9 @@ class UnifiedSegmentAnalyzer:
         video_path: Path,
         video_duration: float | None = None,
         audio_video_path: Path | None = None,
+        *,
+        enable_content_analysis: bool = True,
+        enable_audio_content_analysis: bool = True,
     ) -> list[ScoredSegment]:
         """Analyze a video and return scored segments.
 
@@ -383,7 +390,11 @@ class UnifiedSegmentAnalyzer:
         )
         logger.info(f"  -> Found {len(audio_boundaries)} audio boundaries (silence gaps)")
 
-        audio_content_result = self._run_audio_content_analysis(audio_video, video_duration)
+        audio_content_enabled, audio_content_result = self._get_audio_content_result(
+            audio_video,
+            video_duration,
+            enable_audio_content_analysis,
+        )
 
         # Step 2: Merge boundaries
         logger.info("Step 2: Merging visual + audio boundaries into cut points")
@@ -421,11 +432,22 @@ class UnifiedSegmentAnalyzer:
             f"Step 4a: Visual scoring {len(candidates)} candidates (faces, motion, stability, duration)"
         )
         scored_segments = self._score_segments_visual_only(
-            visual_video, candidates, cut_points, audio_content_result, video_duration
+            visual_video,
+            candidates,
+            cut_points,
+            audio_content_result,
+            video_duration,
+            enable_content_analysis=enable_content_analysis,
+            enable_audio_content_analysis=audio_content_enabled,
         )
         scored_segments.sort(key=lambda s: s.total_score, reverse=True)
 
-        self._run_llm_scoring(scored_segments, audio_video)
+        if enable_content_analysis:
+            self._run_llm_scoring(
+                scored_segments,
+                audio_video,
+                enable_audio_content_analysis=audio_content_enabled,
+            )
 
         if scored_segments:
             log_top_segments(scored_segments, top_n=min(5, len(scored_segments)))
@@ -441,6 +463,18 @@ class UnifiedSegmentAnalyzer:
                 self._fix_best_segment_boundaries(best, audio_content_result, video_duration)
 
         return scored_segments
+
+    def _get_audio_content_result(
+        self,
+        audio_video: Path,
+        video_duration: float,
+        enable_audio_content_analysis: bool,
+    ) -> tuple[bool, AudioAnalysisResult | None]:
+        """Return this call's effective audio mode and its optional analysis result."""
+        audio_content_enabled = enable_audio_content_analysis and self.audio_content_enabled
+        if not audio_content_enabled:
+            return False, None
+        return True, self._run_audio_content_analysis(audio_video, video_duration)
 
     def _step3b_adjust_for_audio(
         self,
@@ -632,6 +666,18 @@ class UnifiedSegmentAnalyzer:
         try:
             analysis = self.content_analyzer.analyze_segment(video_path, start_time, end_time)
 
+            raw_confidence = getattr(analysis, "confidence", 0.0)
+            confidence = float(raw_confidence) if isinstance(raw_confidence, (int, float)) else 0.0
+            if segment is not None:
+                segment.llm_confidence = confidence
+
+            raw_min_confidence = getattr(self.scorer, "content_min_confidence", 0.5)
+            min_confidence = (
+                float(raw_min_confidence) if isinstance(raw_min_confidence, (int, float)) else 0.5
+            )
+            if confidence < min_confidence:
+                return 0.5
+
             # If segment provided, store full LLM analysis results
             if segment is not None:
                 segment.llm_description = analysis.description
@@ -647,7 +693,13 @@ class UnifiedSegmentAnalyzer:
             logger.debug(f"Content analysis failed: {e}")
             return 0.5
 
-    def _compute_total_score(self, segment) -> float:
+    def _compute_total_score(
+        self,
+        segment,
+        *,
+        enable_content_analysis: bool = True,
+        enable_audio_content_analysis: bool | None = None,
+    ) -> float:
         """Compute the total score for a segment.
 
         LLM content analysis is additive: it can only boost the base score,
@@ -662,7 +714,12 @@ class UnifiedSegmentAnalyzer:
         """
         # Base score: visual + audio + duration always get the full 1.0 budget
         # LLM content does NOT compete for weight — it's a bonus on top
-        audio_w = self.audio_content_weight if self.audio_content_enabled else 0.0
+        audio_enabled = (
+            self.audio_content_enabled
+            if enable_audio_content_analysis is None
+            else enable_audio_content_analysis
+        )
+        audio_w = self.audio_content_weight if audio_enabled else 0.0
         duration_w = self.duration_weight
         visual_w = 1.0 - audio_w - duration_w
 
@@ -684,7 +741,7 @@ class UnifiedSegmentAnalyzer:
         # content_score=0.5 → +0.0, content_score=1.0 → +content_weight
         # content_score<0.5 → +0.0 (never penalizes)
         llm_bonus = 0.0
-        if self.content_weight > 0:
+        if enable_content_analysis and self.content_weight > 0:
             llm_bonus = max(0.0, (segment.content_score - 0.5)) * self.content_weight * 2
 
         # Significant bonus for high-quality cut points (max 0.15)
@@ -702,6 +759,9 @@ class UnifiedSegmentAnalyzer:
         _all_cut_points: list,
         audio_content_result: AudioAnalysisResult | None = None,
         video_duration: float | None = None,
+        *,
+        enable_content_analysis: bool = True,
+        enable_audio_content_analysis: bool = True,
     ) -> list:
         """Score candidate segments using visual analysis only (fast).
 
@@ -719,7 +779,7 @@ class UnifiedSegmentAnalyzer:
         """
         scored = []
 
-        for i, (start_cp, end_cp) in enumerate(candidates):
+        for start_cp, end_cp in candidates:
             segment = ScoredSegment(
                 start_time=start_cp.time,
                 end_time=end_cp.time,
@@ -739,7 +799,7 @@ class UnifiedSegmentAnalyzer:
                 segment.visual_score = 0.5  # Neutral fallback
 
             # Score using audio content analysis (if available)
-            if audio_content_result and self.audio_content_enabled:
+            if audio_content_result and enable_audio_content_analysis:
                 audio_score_info = score_segment_audio(
                     segment.start_time, segment.end_time, audio_content_result
                 )
@@ -756,24 +816,23 @@ class UnifiedSegmentAnalyzer:
                 )
 
             # Compute total score (visual + audio + duration at this stage)
-            segment.total_score = self._compute_total_score(segment)
+            segment.total_score = self._compute_total_score(
+                segment,
+                enable_content_analysis=enable_content_analysis,
+                enable_audio_content_analysis=enable_audio_content_analysis,
+            )
             scored.append(segment)
 
-            # Memory cleanup every 5 candidates to prevent OOM on long videos
-            if (i + 1) % 5 == 0:
-                gc.collect()
-                logger.debug(f"Memory cleanup after {i + 1}/{len(candidates)} candidates")
-
-        # Final cleanup after all candidates
-        # Release cached video capture to free memory
+        # Direct UnifiedSegmentAnalyzer callers have no ClipAnalyzer lifecycle.
         self.scorer.release_capture()
-        gc.collect()
         return scored
 
     def _run_llm_scoring(
         self,
         scored_segments: list,
         audio_video: Path,
+        *,
+        enable_audio_content_analysis: bool = True,
     ) -> None:
         """Run LLM content analysis on top candidates (in-place).
 
@@ -795,7 +854,10 @@ class UnifiedSegmentAnalyzer:
                 segment.content_score = self._score_content(
                     audio_video, segment.start_time, segment.end_time, segment=segment
                 )
-                segment.total_score = self._compute_total_score(segment)
+                segment.total_score = self._compute_total_score(
+                    segment,
+                    enable_audio_content_analysis=enable_audio_content_analysis,
+                )
             except (RuntimeError, ValueError, OSError) as e:
                 logger.warning(f"  -> LLM analysis failed: {e}")
                 segment.content_score = 0.5

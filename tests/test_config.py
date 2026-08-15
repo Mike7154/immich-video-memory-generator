@@ -5,7 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
+from immich_memories.api.compatibility import ApiVersionPolicy
 from immich_memories.config import (
     AnalysisConfig,
     Config,
@@ -15,6 +17,7 @@ from immich_memories.config import (
     expand_env_vars,
 )
 from immich_memories.config_models import ServerConfig
+from immich_memories.processing.encoding_plan import HdrMode
 
 
 class TestExpandEnvVars:
@@ -68,6 +71,27 @@ class TestImmichConfig:
         config = ImmichConfig(url="${TEST_IMMICH_URL}", api_key="direct_key")
         assert config.url == "https://test.example.com"
         assert config.api_key == "direct_key"
+
+    def test_api_version_defaults_to_auto(self):
+        """API compatibility is detected automatically unless configured."""
+        assert ImmichConfig().api_version is ApiVersionPolicy.AUTO
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            pytest.param("auto", ApiVersionPolicy.AUTO, id="auto"),
+            pytest.param("v2", ApiVersionPolicy.V2, id="v2"),
+            pytest.param("v3", ApiVersionPolicy.V3, id="v3"),
+        ],
+    )
+    def test_api_version_policy_is_explicit(self, raw: str, expected: ApiVersionPolicy) -> None:
+        """Supported strings parse to their exact compatibility policy."""
+        assert ImmichConfig(api_version=raw).api_version is expected
+
+    def test_arbitrary_api_version_is_rejected(self):
+        """Unknown compatibility policies fail configuration validation."""
+        with pytest.raises(ValidationError, match="api_version"):
+            ImmichConfig(api_version="latest")
 
 
 class TestDefaultsConfig:
@@ -172,6 +196,15 @@ class TestClipStyle:
         assert config.optimal_clip_duration == 5.0
         assert config.max_optimal_duration == 15.0  # original default, not balanced's 10.0
 
+    def test_download_workers_defaults_and_is_bounded(self):
+        assert AnalysisConfig().download_workers == 3
+        assert AnalysisConfig(download_workers=1).download_workers == 1
+        assert AnalysisConfig(download_workers=8).download_workers == 8
+        with pytest.raises(ValueError):
+            AnalysisConfig(download_workers=0)
+        with pytest.raises(ValueError):
+            AnalysisConfig(download_workers=9)
+
     def test_invalid_clip_style_rejected(self):
         """Invalid clip_style value is rejected."""
         with pytest.raises(ValueError):
@@ -185,6 +218,26 @@ class TestOutputConfig:
         """Test output path expansion."""
         config = OutputConfig(directory="~/Videos/Test")
         assert config.output_path == Path.home() / "Videos" / "Test"
+
+    def test_hdr_mode_defaults_to_auto(self):
+        config = OutputConfig()
+        assert config.hdr_mode is HdrMode.AUTO
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            pytest.param("auto", HdrMode.AUTO, id="auto"),
+            pytest.param("sdr", HdrMode.SDR, id="sdr"),
+            pytest.param("hdr", HdrMode.HDR, id="hdr"),
+        ],
+    )
+    def test_hdr_mode_strings_parse_to_enum(self, raw: str, expected: HdrMode) -> None:
+        config = OutputConfig(hdr_mode=raw)
+        assert config.hdr_mode is expected
+
+    def test_unknown_hdr_mode_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="hdr_mode"):
+            OutputConfig(hdr_mode="preserve")
 
     @pytest.mark.parametrize(
         "resolution,expected",
@@ -268,6 +321,18 @@ class TestConfig:
         assert loaded.immich.url == "https://test.com"
         assert loaded.immich.api_key == "test_key"
         assert loaded.defaults.target_duration_seconds == 900
+
+    def test_api_version_yaml_roundtrip(self, tmp_path):
+        """The API-version override is stored as plain YAML and restored as an enum."""
+        config_path = tmp_path / "config.yaml"
+        Config(immich=ImmichConfig(api_version="v3")).save_yaml(config_path)
+
+        import yaml
+
+        with config_path.open() as f:
+            raw = yaml.safe_load(f)
+        assert raw["immich"]["api_version"] == "v3"
+        assert Config.from_yaml(config_path).immich.api_version is ApiVersionPolicy.V3
 
     def test_missing_yaml_returns_defaults(self):
         """Missing YAML file returns default config."""

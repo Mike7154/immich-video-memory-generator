@@ -4,7 +4,18 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from immich_memories.ui.state import AppState, _sessions, get_app_state, reset_app_state
+import pytest
+
+from immich_memories.api.compatibility import ApiVersionPolicy
+from immich_memories.config_loader import Config
+from immich_memories.tracking import DeliveryStatus
+from immich_memories.ui.state import (
+    AppState,
+    _sessions,
+    ensure_config,
+    get_app_state,
+    reset_app_state,
+)
 from tests.conftest import make_clip
 
 
@@ -45,6 +56,43 @@ class TestAppStateDefaults:
         """Default time period mode is 'year'."""
         state = AppState()
         assert state.time_period_mode == "year"
+
+    def test_default_immich_api_version_is_auto(self):
+        """UI clients default to automatic Immich compatibility detection."""
+        state = AppState()
+        assert state.immich_api_version is ApiVersionPolicy.AUTO
+
+    def test_default_generation_outcome_is_typed_and_empty(self):
+        """A new UI session cannot imply a delivery request or stale warning."""
+        state = AppState()
+        assert state.generation_warning is None
+        assert state.delivery_status is DeliveryStatus.NOT_REQUESTED
+
+    def test_duration_defaults_to_auto(self):
+        state = AppState()
+
+        assert state.duration_mode == "auto"
+
+    def test_fractional_minutes_preserve_exact_target_seconds(self):
+        state = AppState(target_duration=2.5)
+
+        assert state.target_duration_seconds == 150.0
+
+    def test_ensure_config_loads_explicit_immich_api_version(self):
+        """UI clients retain an explicit compatibility policy from configuration."""
+        state = AppState()
+        config = Config(
+            immich={
+                "url": "https://immich.example.com",
+                "api_key": "test-key",
+                "api_version": "v2",
+            }
+        )
+
+        with patch("immich_memories.config_loader.get_config", return_value=config):
+            ensure_config(state)
+
+        assert state.immich_api_version is ApiVersionPolicy.V2
 
 
 class TestAppStateResetClips:
@@ -115,6 +163,14 @@ class TestAppStateIncludePhotos:
         state.selected_photo_ids = {"p1", "p2"}
         state.reset_clips()
         assert state.selected_photo_ids == set()
+
+    def test_reset_clips_clears_the_preliminary_timeline_plan(self):
+        state = AppState()
+        state.timeline_plan = MagicMock()
+
+        state.reset_clips()
+
+        assert state.timeline_plan is None
 
 
 class TestAppStateGetSelectedClips:
@@ -193,6 +249,174 @@ class TestScaleModeMap:
         assert len(_SCALE_MODE_MAP) == 4
 
 
+def test_ui_output_options_include_h265() -> None:
+    from immich_memories.ui.pages.step3_options import OUTPUT_FORMAT_OPTIONS
+
+    assert "MP4 (H.265)" in OUTPUT_FORMAT_OPTIONS
+
+
+def test_ui_output_label_is_initialized_from_config() -> None:
+    from immich_memories.ui.pages.step3_options import configured_output_format_label
+
+    config = Config()
+    config.output.codec = "h265"
+
+    assert configured_output_format_label(config) == "MP4 (H.265)"
+
+
+@pytest.mark.parametrize(
+    ("codec", "expected_label"),
+    [("h264", "MOV (H.264)"), ("h265", "MOV (H.265)")],
+)
+def test_ui_output_label_includes_the_configured_mov_container(
+    codec: str, expected_label: str
+) -> None:
+    from immich_memories.ui.pages.step3_options import (
+        OUTPUT_FORMAT_OPTIONS,
+        configured_output_format_label,
+    )
+
+    config = Config()
+    config.output.codec = codec
+    config.output.format = "mov"
+
+    assert configured_output_format_label(config) == expected_label
+    assert expected_label in OUTPUT_FORMAT_OPTIONS
+
+
+def test_ui_explicit_h265_mov_choice_preserves_both_dimensions() -> None:
+    from immich_memories.processing.encoding_plan import OutputCodec
+    from immich_memories.ui.pages._step4_generate import resolve_ui_output_selection
+
+    state = AppState(
+        config=Config(),
+        generation_options={"format_override": "MOV (H.265)"},
+    )
+
+    selection = resolve_ui_output_selection(state)
+
+    assert selection.codec is OutputCodec.H265
+    assert selection.container == "mov"
+
+
+def test_step2_status_consumes_shared_phase_event_message() -> None:
+    from immich_memories.operations.phases import OperationalPhase, PhaseEvent
+    from immich_memories.ui.pages.step2_loading import _set_phase_status
+
+    label = MagicMock()
+    event = PhaseEvent(OperationalPhase.DOWNLOAD, 2, 5, "Loading thumbnails 2/5", 1.0)
+
+    _set_phase_status(label, event)
+
+    label.set_text.assert_called_once_with("Loading thumbnails 2/5")
+
+
+def test_generation_factory_passes_state_api_version_to_client(tmp_path) -> None:
+    from immich_memories.ui.pages._step4_generate import _build_generation_params
+
+    state = AppState(
+        config=Config(),
+        immich_url="https://immich.example.com",
+        immich_api_key="test-api-key",
+        immich_api_version=ApiVersionPolicy.V2,
+    )
+
+    with patch("immich_memories.api.immich.SyncImmichClient") as client_factory:
+        _build_generation_params(state, [], tmp_path / "memory.mp4")
+
+    client_factory.assert_called_once_with(
+        base_url="https://immich.example.com",
+        api_key="test-api-key",
+        api_version=ApiVersionPolicy.V2,
+    )
+
+
+def test_generation_factory_preserves_configured_h265_when_ui_untouched(tmp_path) -> None:
+    from immich_memories.ui.pages._step4_generate import _build_generation_params
+
+    config = Config()
+    config.output.codec = "h265"
+    state = AppState(
+        config=config,
+        generation_options={},
+        immich_url="https://immich.example.com",
+        immich_api_key="test-api-key",
+    )
+
+    with patch("immich_memories.api.immich.SyncImmichClient"):
+        params = _build_generation_params(state, [], tmp_path / "memory.mp4")
+
+    assert params.output_format is None
+
+
+def test_generation_factory_maps_explicit_ui_h265_override(tmp_path) -> None:
+    from immich_memories.ui.pages._step4_generate import _build_generation_params
+
+    state = AppState(
+        config=Config(),
+        generation_options={"format_override": "MP4 (H.265)"},
+        immich_url="https://immich.example.com",
+        immich_api_key="test-api-key",
+    )
+
+    with patch("immich_memories.api.immich.SyncImmichClient"):
+        params = _build_generation_params(state, [], tmp_path / "memory.mp4")
+
+    assert params.output_format == "h265"
+
+
+def test_generation_factory_preserves_ui_music_and_delivery_boundaries(
+    tmp_path,
+) -> None:
+    """UI keeps music deferred while preserving the requested delivery intent."""
+    from immich_memories.ui.pages._step4_generate import _build_generation_params
+
+    state = AppState(
+        config=Config(),
+        generation_options={},
+        immich_url="https://immich.example.com",
+        immich_api_key="test-api-key",
+        upload_enabled=True,
+        upload_album_name="Album At Click Time",
+    )
+
+    with patch("immich_memories.api.immich.SyncImmichClient"):
+        params = _build_generation_params(state, [], tmp_path / "memory.mp4")
+
+    assert params.no_music is True
+    assert params.upload_enabled is True
+    assert params.upload_album == "Album At Click Time"
+
+
+def test_config_initialized_ui_label_is_not_an_explicit_override(tmp_path) -> None:
+    from immich_memories.ui.pages._step4_generate import _build_generation_params
+
+    config = Config()
+    config.output.codec = "h265"
+    state = AppState(
+        config=config,
+        generation_options={"format": "MP4 (H.265)"},
+        immich_url="https://immich.example.com",
+        immich_api_key="test-api-key",
+    )
+
+    with patch("immich_memories.api.immich.SyncImmichClient"):
+        params = _build_generation_params(state, [], tmp_path / "memory.mp4")
+
+    assert params.output_format is None
+
+
+def test_ui_prores_output_path_uses_resolved_mov_container(tmp_path) -> None:
+    from immich_memories.ui.pages._step4_generate import normalize_ui_output_path
+
+    config = Config()
+    config.output.codec = "prores"
+    config.output.format = "mov"
+    state = AppState(config=config, generation_options={})
+
+    assert normalize_ui_output_path(state, tmp_path / "memory.mp4").suffix == ".mov"
+
+
 class TestFormatDuration:
     """Test format_duration() helper."""
 
@@ -237,9 +461,9 @@ class TestAppStatePhotoDuration:
 class TestAppStateAnalysisDepth:
     """Test analysis_depth state field."""
 
-    def test_default_analysis_depth_is_fast(self):
+    def test_default_analysis_depth_is_auto(self):
         state = AppState()
-        assert state.analysis_depth == "fast"
+        assert state.analysis_depth == "auto"
 
     def test_analysis_depth_can_be_set(self):
         state = AppState()

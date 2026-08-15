@@ -38,6 +38,248 @@ def _make_clip(
     )
 
 
+def test_strict_scaler_never_keeps_more_than_content_budget() -> None:
+    from immich_memories.analysis.clip_scaler import ClipScaler
+
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    clips = [
+        _make_clip(f"clip-{i}", base + timedelta(days=i), score=i / 10, duration=5.0)
+        for i in range(10)
+    ]
+
+    selected = ClipScaler().scale_to_target_duration(
+        clips,
+        48.0,
+        max_overrun_seconds=0.0,
+    )
+
+    assert sum(c.end_time - c.start_time for c in selected) <= 48.0
+
+
+def test_strict_budget_outweighs_protection_preference() -> None:
+    from immich_memories.analysis.clip_scaler import ClipScaler
+
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    clips = [
+        _make_clip(f"protected-{i}", base + timedelta(days=i), score=i / 10, duration=5.0)
+        for i in range(4)
+    ]
+
+    selected = ClipScaler().scale_to_target_duration(
+        clips,
+        10.0,
+        protected_ids={c.clip.asset.id for c in clips},
+        max_overrun_seconds=0.0,
+    )
+
+    assert len(selected) == 2
+    assert sum(c.end_time - c.start_time for c in selected) <= 10.0
+
+
+class TestBackfillPolicyHelpers:
+    def test_backfill_policy_rejects_an_occupied_temporal_bucket(self) -> None:
+        from immich_memories.analysis.clip_refiner import (
+            _BackfillContext,
+            _is_backfill_candidate_admissible,
+        )
+        from immich_memories.analysis.clip_scaler import temporal_cluster_key
+        from immich_memories.analysis.smart_pipeline import PipelineConfig
+
+        base = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+        candidate = _make_clip("duplicate", base + timedelta(minutes=2))
+        context = _BackfillContext(
+            config=PipelineConfig(temporal_dedup_window_minutes=10.0),
+            selected_count=1,
+            photo_count=0,
+            non_favorite_count=0,
+            temporal_window=10.0,
+            occupied_temporal_buckets={temporal_cluster_key(candidate, 10.0)},
+        )
+
+        assert not _is_backfill_candidate_admissible(
+            candidate,
+            context=context,
+            photo_limit=1.0,
+            remaining_budget=5.0,
+        )
+
+    def test_backfill_policy_rejects_a_photo_above_the_active_cap(self) -> None:
+        from immich_memories.analysis.clip_refiner import (
+            _BackfillContext,
+            _is_backfill_candidate_admissible,
+        )
+        from immich_memories.analysis.smart_pipeline import PipelineConfig
+
+        candidate = _make_clip(
+            "photo",
+            datetime(2026, 7, 2, tzinfo=UTC),
+            asset_type=AssetType.IMAGE,
+        )
+        context = _BackfillContext(
+            config=PipelineConfig(photo_max_ratio=0.4),
+            selected_count=2,
+            photo_count=1,
+            non_favorite_count=0,
+            temporal_window=0.0,
+            occupied_temporal_buckets=set(),
+        )
+
+        assert not _is_backfill_candidate_admissible(
+            candidate,
+            context=context,
+            photo_limit=0.4,
+            remaining_budget=5.0,
+        )
+
+    def test_backfill_choice_keeps_favorite_priority_over_temporal_distance(self) -> None:
+        from immich_memories.analysis.clip_refiner import _choose_backfill_candidate
+
+        base = datetime(2026, 7, 1, tzinfo=UTC)
+        favorite = _make_clip(
+            "favorite",
+            base + timedelta(hours=1),
+            score=0.4,
+            is_favorite=True,
+        )
+        distant = _make_clip("distant", base + timedelta(days=10), score=0.9)
+
+        chosen = _choose_backfill_candidate(
+            [distant, favorite],
+            selected_dates=[base],
+            photo_cap_bypassed=False,
+        )
+
+        assert chosen is favorite
+
+    def test_backfill_relaxes_favorite_ratio_before_leaving_a_duration_hole(self) -> None:
+        from immich_memories.analysis.clip_refiner import (
+            _BackfillContext,
+            _resolve_backfill_candidates,
+        )
+        from immich_memories.analysis.smart_pipeline import PipelineConfig
+
+        candidate = _make_clip(
+            "non-favorite-leftover",
+            datetime(2026, 7, 2, tzinfo=UTC),
+        )
+        context = _BackfillContext(
+            config=PipelineConfig(
+                target_clips=2,
+                prioritize_favorites=True,
+                max_non_favorite_ratio=0.0,
+            ),
+            selected_count=2,
+            photo_count=0,
+            non_favorite_count=0,
+            temporal_window=0.0,
+            occupied_temporal_buckets=set(),
+        )
+
+        resolved = _resolve_backfill_candidates(
+            [candidate],
+            context=context,
+            active_photo_limit=0.5,
+            remaining_budget=5.0,
+        )
+
+        assert resolved.items == [candidate]
+        assert resolved.tier == "favorite_ratio"
+
+    def test_backfill_relaxes_temporal_spacing_after_favorite_ratio(self) -> None:
+        from immich_memories.analysis.clip_refiner import (
+            _BackfillContext,
+            _resolve_backfill_candidates,
+        )
+        from immich_memories.analysis.clip_scaler import temporal_cluster_key
+        from immich_memories.analysis.smart_pipeline import PipelineConfig
+
+        candidate = _make_clip("nearby-leftover", datetime(2026, 7, 2, 12, 2, tzinfo=UTC))
+        context = _BackfillContext(
+            config=PipelineConfig(temporal_dedup_window_minutes=10.0),
+            selected_count=1,
+            photo_count=0,
+            non_favorite_count=0,
+            temporal_window=10.0,
+            occupied_temporal_buckets={temporal_cluster_key(candidate, 10.0)},
+        )
+
+        resolved = _resolve_backfill_candidates(
+            [candidate],
+            context=context,
+            active_photo_limit=0.5,
+            remaining_budget=5.0,
+        )
+
+        assert resolved.items == [candidate]
+        assert resolved.tier == "temporal_spacing"
+
+    def test_backfill_can_remove_photo_ratio_as_last_content_constraint(self) -> None:
+        from immich_memories.analysis.clip_refiner import (
+            _BackfillContext,
+            _resolve_backfill_candidates,
+        )
+        from immich_memories.analysis.smart_pipeline import PipelineConfig
+
+        candidate = _make_clip(
+            "only-photo-leftover",
+            datetime(2026, 7, 2, tzinfo=UTC),
+            is_favorite=True,
+            asset_type=AssetType.IMAGE,
+        )
+        context = _BackfillContext(
+            config=PipelineConfig(photo_max_ratio=0.4),
+            selected_count=1,
+            photo_count=1,
+            non_favorite_count=0,
+            temporal_window=0.0,
+            occupied_temporal_buckets=set(),
+        )
+
+        resolved = _resolve_backfill_candidates(
+            [candidate],
+            context=context,
+            active_photo_limit=0.4,
+            remaining_budget=5.0,
+        )
+
+        assert resolved.items == [candidate]
+        assert resolved.photo_limit is None
+        assert resolved.tier == "photo_ratio_unlimited"
+
+    def test_backfill_uses_two_second_overrun_only_after_content_relaxations(self) -> None:
+        from immich_memories.analysis.clip_refiner import (
+            _BackfillContext,
+            _resolve_backfill_candidates,
+        )
+        from immich_memories.analysis.smart_pipeline import PipelineConfig
+
+        candidate = _make_clip(
+            "slightly-long",
+            datetime(2026, 7, 2, tzinfo=UTC),
+            duration=6.0,
+            is_favorite=True,
+        )
+        context = _BackfillContext(
+            config=PipelineConfig(),
+            selected_count=1,
+            photo_count=0,
+            non_favorite_count=0,
+            temporal_window=0.0,
+            occupied_temporal_buckets=set(),
+        )
+
+        resolved = _resolve_backfill_candidates(
+            [candidate],
+            context=context,
+            active_photo_limit=0.5,
+            remaining_budget=5.0,
+        )
+
+        assert resolved.items == [candidate]
+        assert resolved.tier == "bounded_overrun"
+        assert resolved.used_overrun
+
+
 class TestPhotoCapScarcity:
     """Photo cap should respect video scarcity — let photos fill when needed."""
 
@@ -86,12 +328,33 @@ class TestPhotoCapScarcity:
         result = enforce_photo_cap(clips, max_ratio=0.40, videos_scarce=False)
         assert len(result) == 5
 
+    def test_cap_is_calculated_against_final_not_prefilter_total(self):
+        """One video at a 50% cap can retain one photo, regardless of input size."""
+        from immich_memories.analysis.clip_refiner import enforce_photo_cap
+
+        base = datetime(2021, 7, 22, tzinfo=UTC)
+        clips = [_make_clip("video", base, asset_type=AssetType.VIDEO, score=0.5)] + [
+            _make_clip(
+                f"photo-{i}",
+                base + timedelta(hours=i + 1),
+                asset_type=AssetType.IMAGE,
+                score=0.9 - i * 0.01,
+            )
+            for i in range(9)
+        ]
+
+        result = enforce_photo_cap(clips, max_ratio=0.50, videos_scarce=False)
+
+        photos = [c for c in result if c.clip.asset.type == AssetType.IMAGE]
+        assert len(photos) == 1
+        assert len(photos) / len(result) <= 0.50
+
 
 class TestSameDayPhotoLimit:
     """Photos from the same day should be limited to avoid one event dominating."""
 
-    def test_six_race_photos_capped_to_two(self):
-        """Brussels 20K: 6 photos from race day → at most 2 survive phase_refine."""
+    def test_six_race_photos_use_one_overflow_when_needed_to_fill_duration(self):
+        """Brussels 20K: prefer two race photos, then use one leftover to avoid a hole."""
         from unittest.mock import MagicMock
 
         from immich_memories.analysis.clip_refiner import ClipRefiner
@@ -118,7 +381,11 @@ class TestSameDayPhotoLimit:
             _make_clip("swim", datetime(2023, 8, 5, tzinfo=UTC), score=0.60, duration=5.0),
         ]
 
-        config = PipelineConfig(target_clips=8, avg_clip_duration=4.0)
+        config = PipelineConfig(
+            target_clips=8,
+            avg_clip_duration=4.0,
+            target_duration_seconds=32.0,
+        )
         refiner = ClipRefiner(config, ClipScaler())
 
         tracker = MagicMock()
@@ -128,10 +395,45 @@ class TestSameDayPhotoLimit:
         result = refiner.phase_refine(clips, tracker)
 
         race_photos = [c for c in result.selected_clips if c.asset.id.startswith("race")]
-        assert len(race_photos) <= 2, (
-            f"Too many race photos ({len(race_photos)}): "
-            f"{[c.asset.id for c in race_photos]}. Expected ≤2."
+        assert len(race_photos) == 3
+
+    def test_same_day_photo_overflow_stays_unused_when_preferred_pool_fills_target(self):
+        """The soft cap should remain visibly diverse when no duration hole exists."""
+        from unittest.mock import MagicMock
+
+        from immich_memories.analysis.clip_refiner import ClipRefiner
+        from immich_memories.analysis.clip_scaler import ClipScaler
+        from immich_memories.analysis.smart_pipeline import PipelineConfig
+
+        race_day = datetime(2023, 5, 28, tzinfo=UTC)
+        photos = [
+            _make_clip(
+                f"race{i}",
+                race_day + timedelta(minutes=i * 15),
+                score=0.90 - i * 0.02,
+                duration=4.0,
+                is_favorite=True,
+                asset_type=AssetType.IMAGE,
+            )
+            for i in range(6)
+        ]
+        videos = [
+            _make_clip(f"video{i}", race_day + timedelta(days=i + 1), duration=5.0)
+            for i in range(4)
+        ]
+        config = PipelineConfig(
+            target_clips=7,
+            avg_clip_duration=4.0,
+            target_duration_seconds=28.0,
         )
+        refiner = ClipRefiner(config, ClipScaler())
+        tracker = MagicMock()
+        tracker.progress.errors = []
+
+        result = refiner.phase_refine([*photos, *videos], tracker)
+
+        race_photos = [clip for clip in result.selected_clips if clip.asset.id.startswith("race")]
+        assert len(race_photos) == 2
 
     def test_photos_from_different_days_not_limited(self):
         """Photos spread across days should all survive (no false positives)."""

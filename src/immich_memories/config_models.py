@@ -11,7 +11,10 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
+
+from immich_memories.api.compatibility import ApiVersionPolicy
+from immich_memories.processing.encoding_plan import HdrMode
 
 
 def expand_env_vars(value: str) -> str:
@@ -30,6 +33,12 @@ class ImmichConfig(BaseModel):
 
     url: str = Field(default="", description="Immich server URL")
     api_key: str = Field(default="", description="Immich API key")
+    api_version: ApiVersionPolicy = ApiVersionPolicy.AUTO
+
+    @field_serializer("api_version")
+    def serialize_api_version(self, value: ApiVersionPolicy) -> str:
+        """Serialize the policy as a portable YAML/JSON string."""
+        return value.value
 
     @field_validator("url", "api_key", mode="before")
     @classmethod
@@ -84,6 +93,12 @@ _CLIP_STYLE_PRESETS: dict[str, dict[str, float]] = {
 class AnalysisConfig(BaseModel):
     """Settings for video analysis."""
 
+    download_workers: int = Field(
+        default=3,
+        ge=1,
+        le=8,
+        description="Concurrent isolated clients used for video download prefetching",
+    )
     scene_threshold: float = Field(default=27.0, ge=1.0, le=100.0)
     min_scene_duration: float = Field(default=1.0, ge=0.5, le=10.0)
     duplicate_hash_threshold: int = Field(default=8, ge=0, le=64)
@@ -267,8 +282,14 @@ class OutputConfig(BaseModel):
     format: Literal["mp4", "mov"] = "mp4"
     resolution: Literal["720p", "1080p", "4k"] = "1080p"
     codec: Literal["h264", "h265", "prores"] = "h264"
+    hdr_mode: HdrMode = HdrMode.AUTO
     quality: Literal["high", "medium", "low"] = "high"
     crf: int | None = Field(default=None, ge=0, le=51)
+
+    @field_serializer("hdr_mode")
+    def serialize_hdr_mode(self, value: HdrMode) -> str:
+        """Serialize the HDR policy as a portable YAML/JSON string."""
+        return value.value
 
     @property
     def effective_crf(self) -> int:
@@ -508,7 +529,10 @@ class ACEStepConfig(BaseModel):
     )
     model_variant: str = Field(
         default="turbo",
-        description="Model variant: 'turbo' (8 steps, fast) or 'base' (50 steps, quality)",
+        description=(
+            "ACE-Step DiT model: 'turbo'/'base' use the 2B family; "
+            "'acestep-v15-xl-turbo' is the recommended 4B XL production model"
+        ),
     )
     lm_model_size: str = Field(
         default="1.7B",
@@ -810,6 +834,16 @@ class NotificationConfig(BaseModel):
     urls: list[str] = Field(default_factory=list, description="Apprise notification URLs")
     on_success: bool = Field(default=True)
     on_failure: bool = Field(default=True)
+    attach_thumbnail: bool = Field(
+        default=False,
+        description="Attach a generated video thumbnail to successful notifications",
+    )
+    cooldown_hours: int = Field(
+        default=24,
+        ge=1,
+        le=168,
+        description="Suppress normal delivery attempts after a notification failure",
+    )
 
 
 class UploadConfig(BaseModel):

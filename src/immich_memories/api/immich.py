@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import ValidationError
@@ -15,6 +16,11 @@ from pydantic import ValidationError
 from immich_memories.api.album_service import AlbumService
 from immich_memories.api.all_assets_service import AllAssetsService
 from immich_memories.api.asset_service import AssetService
+from immich_memories.api.compatibility import (
+    ApiVersionPolicy,
+    ResolvedApiVersion,
+    resolve_api_version,
+)
 from immich_memories.api.models import (
     Asset,
     AssetType,
@@ -26,6 +32,7 @@ from immich_memories.api.models import (
 )
 from immich_memories.api.person_service import PersonService
 from immich_memories.api.search_service import SearchService
+from immich_memories.security import sanitize_error_message
 
 if TYPE_CHECKING:
     from immich_memories.timeperiod import DateRange
@@ -38,12 +45,57 @@ _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0
 
 
+@dataclass(frozen=True)
+class ApiErrorDetails:
+    """Normalized diagnostics from an unsuccessful Immich response."""
+
+    message: str
+    status_code: int
+    correlation_id: str | None
+    body: dict[str, Any] | list[Any] | str | None
+
+
+def _message_from_body(body: Any) -> str | None:
+    if isinstance(body, str):
+        return body.strip() or None
+    if isinstance(body, list):
+        parts = [part for item in body if (part := _message_from_body(item))]
+        return "; ".join(parts) or None
+    if isinstance(body, dict):
+        for key in ("message", "error"):
+            if key in body and (message := _message_from_body(body[key])):
+                return message
+    return None
+
+
+def parse_error_response(response: httpx.Response) -> ApiErrorDetails:
+    """Normalize supported Immich error bodies without copying request metadata."""
+    try:
+        body: dict[str, Any] | list[Any] | str | None = response.json()
+    except (ValueError, TypeError):
+        body = response.text.strip() or None
+    return ApiErrorDetails(
+        message=sanitize_error_message(_message_from_body(body) or f"HTTP {response.status_code}"),
+        status_code=response.status_code,
+        correlation_id=response.headers.get("X-Correlation-ID"),
+        body=body,
+    )
+
+
 class ImmichAPIError(Exception):
     """Base exception for Immich API errors."""
 
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        correlation_id: str | None = None,
+        details: dict[str, Any] | list[Any] | str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.correlation_id = correlation_id
+        self.details = details
 
 
 class ImmichAuthError(ImmichAPIError):
@@ -70,10 +122,17 @@ class ImmichClient:
         base_url: str,
         api_key: str,
         timeout: float = 30.0,
+        api_version: ApiVersionPolicy | str = "auto",
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        try:
+            self._api_version_policy = ApiVersionPolicy(api_version)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"api_version must be one of 'auto', 'v2', or 'v3'; got {api_version!r}"
+            ) from e
 
         if not self.base_url:
             raise ValueError("Immich URL not configured")
@@ -81,13 +140,19 @@ class ImmichClient:
             raise ValueError("Immich API key not configured")
 
         self._client: httpx.AsyncClient | None = None
+        self._resolved_api_version: ResolvedApiVersion | None = (
+            None
+            if self._api_version_policy is ApiVersionPolicy.AUTO
+            else resolve_api_version(self._api_version_policy, None)
+        )
+        self._api_version_lock = asyncio.Lock()
 
         # Wire composed services
         self.search = SearchService(self._request)
         self.all_assets = AllAssetsService(self.search)
         self.assets = AssetService(self._request, self.base_url, lambda: self.client)
         self.people = PersonService(self._request)
-        self.albums = AlbumService(self._request)
+        self.albums = AlbumService(self._request, self.get_api_version)
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -120,25 +185,42 @@ class ImmichClient:
     ) -> None:
         await self.close()
 
-    @staticmethod
-    def _check_response(response: httpx.Response) -> dict | list | bytes:
+    def _check_response(self, response: httpx.Response) -> dict | list | bytes:
         """Check response status and return parsed body, or raise on error."""
         if response.status_code == 401:
-            raise ImmichAuthError("Invalid API key", status_code=401)
+            error = parse_error_response(response)
+            raise ImmichAuthError(
+                "Invalid API key",
+                status_code=error.status_code,
+                correlation_id=error.correlation_id,
+                details=error.body,
+            )
         if response.status_code == 404:
-            raise ImmichNotFoundError("Resource not found", status_code=404)
+            error = parse_error_response(response)
+            raise ImmichNotFoundError(
+                "Resource not found",
+                status_code=error.status_code,
+                correlation_id=error.correlation_id,
+                details=error.body,
+            )
         if response.status_code in _RETRYABLE_STATUS:
+            error = parse_error_response(response)
             raise ImmichAPIError(
-                f"Server error: {response.status_code}",
-                status_code=response.status_code,
+                error.message.replace(self.api_key, "***")
+                if error.body is not None
+                else f"Server error: {response.status_code}",
+                status_code=error.status_code,
+                correlation_id=error.correlation_id,
+                details=error.body,
             )
         if response.status_code >= 400:
-            try:
-                error_data = response.json()
-                message = error_data.get("message", response.text)
-            except (ValueError, TypeError):
-                message = response.text
-            raise ImmichAPIError(message, status_code=response.status_code)
+            error = parse_error_response(response)
+            raise ImmichAPIError(
+                error.message.replace(self.api_key, "***"),
+                status_code=error.status_code,
+                correlation_id=error.correlation_id,
+                details=error.body,
+            )
 
         content_type = response.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -151,6 +233,11 @@ class ImmichClient:
         if isinstance(exc, (ImmichAuthError, ImmichNotFoundError)):
             return False
         return isinstance(exc, ImmichAPIError) and exc.status_code in _RETRYABLE_STATUS
+
+    def _request_error(self, exc: httpx.RequestError) -> ImmichAPIError:
+        """Build a client-aware sanitized transport diagnostic."""
+        safe_message = sanitize_error_message(str(exc)).replace(self.api_key, "***")
+        return ImmichAPIError(f"Request failed: {safe_message}")
 
     async def _request(
         self,
@@ -174,14 +261,14 @@ class ImmichClient:
                 response = await self.client.request(method, url, **kwargs)
                 return self._check_response(response)
             except (httpx.TimeoutException, httpx.NetworkError) as e:
-                last_exception = ImmichAPIError(f"Request failed: {e}")
-                last_exception.__cause__ = e
+                last_exception = self._request_error(e)
             except ImmichAPIError as e:
                 if not self._is_retryable(e):
                     raise
                 last_exception = e
             except httpx.RequestError as e:
-                raise ImmichAPIError(f"Request failed: {e}") from e
+                last_exception = self._request_error(e)
+                break
 
             if attempt < _MAX_RETRIES - 1:
                 backoff = _BACKOFF_BASE * (2**attempt)
@@ -197,9 +284,30 @@ class ImmichClient:
         """Get server version information."""
         data = await self._request("GET", "/server/version")
         try:
-            return ServerInfo(**data)
+            return ServerInfo.model_validate(data)
         except ValidationError as e:
-            raise ImmichAPIError(f"Unexpected API response format: {e}") from e
+            raise ImmichAPIError(
+                "Malformed Immich server version response from /api/server/version: "
+                "expected numeric major, minor, and patch fields"
+            ) from e
+
+    async def get_api_version(self) -> ResolvedApiVersion:
+        """Resolve the Immich API major version used by this client."""
+        if self._resolved_api_version is not None:
+            return self._resolved_api_version
+        async with self._api_version_lock:
+            if self._resolved_api_version is None:
+                server_info = await self.get_server_info()
+                self._resolved_api_version = resolve_api_version(
+                    self._api_version_policy, server_info.major
+                )
+                logger.info(
+                    "Immich API compatibility: server=%s mode=%s resolved=%s",
+                    server_info.version_string,
+                    self._api_version_policy.value,
+                    self._resolved_api_version.value,
+                )
+            return self._resolved_api_version
 
     async def get_current_user(self) -> UserInfo:
         """Get current user information."""
@@ -430,9 +538,11 @@ class ImmichClient:
 from immich_memories.api.sync_client import SyncImmichClient  # noqa: E402
 
 __all__ = [
+    "ApiErrorDetails",
     "ImmichAPIError",
     "ImmichAuthError",
     "ImmichClient",
     "ImmichNotFoundError",
     "SyncImmichClient",
+    "parse_error_response",
 ]

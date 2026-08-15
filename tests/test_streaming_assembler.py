@@ -5,9 +5,209 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
+
+from immich_memories.processing.encoding_plan import EncodingPlan, HdrTransfer, OutputCodec
+
+
+def _prores_plan() -> EncodingPlan:
+    return EncodingPlan(
+        codec=OutputCodec.PRORES,
+        encoder="prores_ks",
+        encoder_args=("-profile:v", "3"),
+        target_transfer=HdrTransfer.NONE,
+        tone_map_to_sdr=False,
+        pixel_format="yuv422p10le",
+        container="mov",
+    )
+
+
+def _h264_plan() -> EncodingPlan:
+    return EncodingPlan(
+        codec=OutputCodec.H264,
+        encoder="libx264",
+        encoder_args=("-preset", "ultrafast", "-crf", "28"),
+        target_transfer=HdrTransfer.NONE,
+        tone_map_to_sdr=False,
+        pixel_format="yuv420p",
+        container="mp4",
+    )
+
+
+def _hardware_h265_plan() -> EncodingPlan:
+    return EncodingPlan(
+        codec=OutputCodec.H265,
+        encoder="hevc_videotoolbox",
+        encoder_args=("-q:v", "50"),
+        target_transfer=HdrTransfer.NONE,
+        tone_map_to_sdr=False,
+        pixel_format="yuv420p",
+        container="mp4",
+    )
+
+
+def test_streaming_hardware_encoder_failure_retries_same_codec_in_software(tmp_path: Path) -> None:
+    """A failed H.265 streaming encoder retries once with libx265, never H.264."""
+    from immich_memories.processing.streaming_assembler import assemble_streaming
+
+    plans: list[EncodingPlan] = []
+    effective_plans: list[EncodingPlan] = []
+
+    class FailingHardwareEncoder:
+        def __init__(self, *_args: object, encoding_plan: EncodingPlan, **_kwargs: object) -> None:
+            self.plan = encoding_plan
+            plans.append(encoding_plan)
+
+        def start(self) -> None:
+            pass
+
+        def finish(self) -> None:
+            if self.plan.encoder == "hevc_videotoolbox":
+                raise RuntimeError("Unknown encoder 'hevc_videotoolbox'")
+
+    clip = SimpleNamespace(duration=1.0, path=tmp_path / "input.mp4")
+    with (
+        patch(
+            "immich_memories.processing.streaming_assembler.StreamingEncoder",
+            FailingHardwareEncoder,
+        ),
+        patch("immich_memories.processing.streaming_assembler._encode_clip_sequence"),
+    ):
+        assemble_streaming(
+            clips=[clip],
+            transitions=[],
+            output_path=tmp_path / "output.mp4",
+            width=16,
+            height=16,
+            fps=1,
+            encoding_plan=_hardware_h265_plan(),
+            effective_plan_callback=effective_plans.append,
+        )
+
+    assert [plan.encoder for plan in plans] == ["hevc_videotoolbox", "libx265"]
+    assert len(plans) == 2
+    assert all(plan.codec is OutputCodec.H265 for plan in plans)
+    assert [plan.encoder for plan in effective_plans] == ["libx265"]
+
+
+def test_streaming_broken_pipe_retries_same_codec_in_software(tmp_path: Path) -> None:
+    """Early hardware FFmpeg death during frame writing retries once in software."""
+    from immich_memories.processing.streaming_assembler import (
+        StreamingEncoderWriteError,
+        assemble_streaming,
+    )
+
+    plans: list[EncodingPlan] = []
+
+    class EarlyFailingHardwareEncoder:
+        def __init__(self, *_args: object, encoding_plan: EncodingPlan, **_kwargs: object) -> None:
+            self.plan = encoding_plan
+            plans.append(encoding_plan)
+
+        def start(self) -> None:
+            pass
+
+        def write_frame(self, _frame: np.ndarray) -> None:
+            if self.plan.encoder == "hevc_videotoolbox":
+                raise StreamingEncoderWriteError("hardware ffmpeg exited before accepting frames")
+
+        def finish(self) -> None:
+            pass
+
+    clip = SimpleNamespace(duration=1.0, path=tmp_path / "input.mp4")
+    frame = np.zeros((16, 16, 3), dtype=np.uint8)
+    with (
+        patch(
+            "immich_memories.processing.streaming_assembler.StreamingEncoder",
+            EarlyFailingHardwareEncoder,
+        ),
+        patch(
+            "immich_memories.processing.streaming_assembler._make_decoder",
+            side_effect=lambda *_args, **_kwargs: iter([frame]),
+        ),
+    ):
+        assemble_streaming(
+            clips=[clip],
+            transitions=[],
+            output_path=tmp_path / "output.mp4",
+            width=16,
+            height=16,
+            fps=1,
+            encoding_plan=_hardware_h265_plan(),
+        )
+
+    assert [plan.encoder for plan in plans] == ["hevc_videotoolbox", "libx265"]
+    assert len(plans) == 2
+    assert all(plan.codec is OutputCodec.H265 for plan in plans)
+
+
+def test_streaming_encoder_write_translates_broken_pipe_to_encoder_failure(tmp_path: Path) -> None:
+    """Only the encoder write boundary may classify a broken pipe as retryable."""
+    from immich_memories.processing.streaming_assembler import StreamingEncoder
+
+    class ClosedEncoderStdin:
+        def write(self, _frame: memoryview) -> None:
+            raise BrokenPipeError("hardware ffmpeg exited before accepting frames")
+
+    encoder = StreamingEncoder(
+        tmp_path / "output.mp4", width=16, height=16, fps=1, encoding_plan=_hardware_h265_plan()
+    )
+    encoder._proc = SimpleNamespace(stdin=ClosedEncoderStdin())
+
+    with pytest.raises(RuntimeError) as raised:
+        encoder.write_frame(np.zeros((16, 16, 3), dtype=np.uint8))
+
+    assert isinstance(raised.value.__cause__, BrokenPipeError)
+
+
+def test_streaming_callback_broken_pipe_does_not_retry_software(tmp_path: Path) -> None:
+    """A preview-consumer pipe error must escape without an encoder fallback."""
+    from immich_memories.processing.streaming_assembler import assemble_streaming
+
+    plans: list[EncodingPlan] = []
+
+    class WorkingEncoder:
+        def __init__(self, *_args: object, encoding_plan: EncodingPlan, **_kwargs: object) -> None:
+            plans.append(encoding_plan)
+
+        def start(self) -> None:
+            pass
+
+        def write_frame(self, _frame: np.ndarray) -> None:
+            pass
+
+        def finish(self) -> None:
+            pass
+
+    def disconnected_preview(_jpeg: bytes) -> None:
+        raise BrokenPipeError("preview consumer disconnected")
+
+    clip = SimpleNamespace(duration=1.0, path=tmp_path / "input.mp4")
+    frame = np.zeros((16, 16, 3), dtype=np.uint8)
+    with (
+        patch("immich_memories.processing.streaming_assembler.StreamingEncoder", WorkingEncoder),
+        patch(
+            "immich_memories.processing.streaming_assembler._make_decoder",
+            side_effect=lambda *_args, **_kwargs: iter([frame]),
+        ),
+        pytest.raises(BrokenPipeError, match="preview consumer"),
+    ):
+        assemble_streaming(
+            clips=[clip],
+            transitions=[],
+            output_path=tmp_path / "output.mp4",
+            width=16,
+            height=16,
+            fps=1,
+            encoding_plan=_hardware_h265_plan(),
+            frame_preview_callback=disconnected_preview,
+        )
+
+    assert [plan.encoder for plan in plans] == ["hevc_videotoolbox"]
 
 
 def _has_ffmpeg() -> bool:
@@ -79,16 +279,7 @@ class TestStreamingEncoder:
             width,
             height,
             fps,
-            encoder_args=[
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "28",
-                "-pix_fmt",
-                "yuv420p",
-            ],
+            encoding_plan=_h264_plan(),
         )
         encoder.start()
         for i in range(n_frames):
@@ -163,6 +354,127 @@ class TestFrameBlender:
         assert np.all(out == 200)
 
 
+def test_full_streaming_prores_threads_plan_and_uses_mov_work_video(tmp_path) -> None:
+    from unittest.mock import patch
+
+    from immich_memories.processing.streaming_assembler import streaming_assemble_full
+
+    clip = type("Clip", (), {"path": tmp_path / "clip.mp4", "duration": 1.0})()
+    plan = _prores_plan()
+    with (
+        patch(
+            "immich_memories.processing.streaming_assembler.assemble_streaming",
+            return_value=[],
+        ) as assemble,
+        patch("immich_memories.processing.streaming_assembler._probe_duration", return_value=1.0),
+        patch("immich_memories.processing.streaming_assembler.extract_and_mix_audio"),
+        patch("immich_memories.processing.streaming_assembler.mux_video_audio"),
+    ):
+        streaming_assemble_full(
+            clips=[clip],
+            transitions=[],
+            output_path=tmp_path / "memory.mov",
+            width=320,
+            height=240,
+            fps=30,
+            encoding_plan=plan,
+        )
+
+    assert assemble.call_args.kwargs["encoding_plan"] is plan
+    assert assemble.call_args.kwargs["output_path"].name == "video.mov"
+
+
+def test_frame_decoder_applies_hdr_to_sdr_color_chain() -> None:
+    """Streaming decode must consume conversion, output tags, and pixel format."""
+    from immich_memories.processing.streaming_assembler import FrameDecoder
+
+    decoder = FrameDecoder(
+        Path("hlg.mp4"),
+        width=320,
+        height=240,
+        fps=30,
+        hdr_conversion=(
+            ",zscale=t=linear:tin=arib-std-b67:pin=bt2020:min=bt2020nc:rin=tv:npl=100"
+            ",format=gbrpf32le,tonemap=tonemap=hable:desat=0"
+            ",zscale=t=bt709:p=bt709:m=bt709:r=tv"
+        ),
+        colorspace_filter=(",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"),
+        output_pix_fmt=",format=yuv420p",
+    )
+
+    vf = decoder._build_vf()
+
+    assert "zscale=t=linear" in vf
+    assert "tonemap=tonemap=hable" in vf
+    assert "zscale=t=bt709" in vf
+    assert "setparams=colorspace=bt709" in vf
+    assert vf.endswith("setsar=1")
+
+
+def test_streaming_decoder_builds_plan_targeted_hlg_to_sdr_chain() -> None:
+    from unittest.mock import MagicMock, patch
+
+    from immich_memories.processing.streaming_assembler import _make_decoder
+
+    clip = MagicMock(path=Path("hlg.mp4"), is_title_screen=False, rotation_override=None)
+    ctx = MagicMock(
+        hdr_type="sdr",
+        pix_fmt="yuv420p",
+        clip_hdr_types=["hlg"],
+        clip_primaries=["bt2020"],
+        colorspace_filter=(",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"),
+    )
+
+    with patch(
+        "immich_memories.processing.hdr_utilities._check_zscale_available",
+        return_value=True,
+    ):
+        decoder = _make_decoder(clip, 0, 320, 240, 30, ctx=ctx, hdr_type=None)
+
+    vf = decoder._build_vf()
+    assert "zscale=t=linear" in vf
+    assert "tonemap=tonemap=hable" in vf
+    assert "zscale=t=bt709" in vf
+    assert "setparams=colorspace=bt709" in vf
+    assert ",format=yuv420p,setsar=1" in vf
+
+
+@pytest.mark.parametrize(
+    ("source_transfer", "target_transfer"),
+    [("hlg", "pq"), ("pq", "hlg")],
+)
+def test_streaming_decoder_fails_when_required_hdr_conversion_is_unavailable(
+    source_transfer: str,
+    target_transfer: str,
+) -> None:
+    """Streaming must not relabel HLG as PQ, or PQ as HLG, without conversion."""
+    from unittest.mock import MagicMock, patch
+
+    from immich_memories.processing.hdr_utilities import RequiredColorConversionUnavailable
+    from immich_memories.processing.streaming_assembler import _make_decoder
+
+    clip = MagicMock(path=Path("hdr.mp4"), is_title_screen=False, rotation_override=None)
+    ctx = MagicMock(
+        hdr_type=target_transfer,
+        pix_fmt="yuv420p10le",
+        clip_hdr_types=[source_transfer],
+        clip_primaries=["bt2020"],
+        colorspace_filter=(
+            ",setparams=colorspace=bt2020nc:color_primaries=bt2020:"
+            f"color_trc={'smpte2084' if target_transfer == 'pq' else 'arib-std-b67'}"
+        ),
+    )
+
+    with (
+        patch(
+            "immich_memories.processing.hdr_utilities._check_zscale_available",
+            return_value=False,
+        ),
+        pytest.raises(RequiredColorConversionUnavailable),
+    ):
+        _make_decoder(clip, 0, 320, 240, 30, ctx=ctx, hdr_type=target_transfer)
+
+
 @requires_ffmpeg
 class TestStreamingAssemble:
     def test_assembles_two_clips_with_crossfade(self, tmp_path: object) -> None:
@@ -218,16 +530,7 @@ class TestStreamingAssemble:
             height=240,
             fps=10,
             fade_duration=0.3,
-            encoder_args=[
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "28",
-                "-pix_fmt",
-                "yuv420p",
-            ],
+            encoding_plan=_h264_plan(),
         )
 
         assert output.exists()
@@ -292,16 +595,7 @@ class TestStreamingAssemble:
             height=240,
             fps=10,
             fade_duration=0.3,
-            encoder_args=[
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "28",
-                "-pix_fmt",
-                "yuv420p",
-            ],
+            encoding_plan=_h264_plan(),
         )
 
         assert output.exists()
@@ -399,6 +693,76 @@ class TestAudioHandling:
         audio_streams = [s for s in probe["streams"] if s["codec_type"] == "audio"]
         assert len(audio_streams) >= 1
 
+    def test_short_silent_clip_survives_loudness_normalization(self, tmp_path: object) -> None:
+        """Short silence must not let loudnorm feed NaNs to the AAC encoder."""
+        from pathlib import Path
+
+        from immich_memories.processing.assembly_config import AssemblyClip
+        from immich_memories.processing.streaming_audio import extract_and_mix_audio
+
+        tmp = Path(str(tmp_path))
+        silent = tmp / "silent.wav"
+        tone = tmp / "tone.wav"
+        for output, source in (
+            (silent, "anullsrc=r=48000:cl=stereo:d=2"),
+            (tone, "sine=frequency=440:sample_rate=48000:duration=2"),
+        ):
+            subprocess.run(  # noqa: S603, S607
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    source,
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+
+        clips = [
+            AssemblyClip(path=silent, duration=2.0, asset_id="silent"),
+            AssemblyClip(path=tone, duration=2.0, asset_id="tone"),
+        ]
+        output = tmp / "normalized.m4a"
+
+        extract_and_mix_audio(
+            clips=clips,
+            transitions=["cut"],
+            output_path=output,
+            fps=30,
+            normalize_audio=True,
+            pre_extracted_audio=[silent, tone],
+            video_duration=4.0,
+        )
+
+        probe = subprocess.run(  # noqa: S603, S607
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name,sample_rate",
+                "-of",
+                "default=noprint_wrappers=1",
+                str(output),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert "codec_name=aac" in probe.stdout
+        assert "sample_rate=48000" in probe.stdout
+
 
 @requires_ffmpeg
 class TestFullStreamingPipeline:
@@ -454,16 +818,7 @@ class TestFullStreamingPipeline:
             height=240,
             fps=10,
             fade_duration=0.3,
-            encoder_args=[
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "28",
-                "-pix_fmt",
-                "yuv420p",
-            ],
+            encoding_plan=_h264_plan(),
         )
 
         assert output.exists()
@@ -558,12 +913,8 @@ class TestFrameDecoderFilterChain:
         assert "gblur=sigma=37" in vf
         assert "noise=alls=15" in vf
 
-    def test_hdr_not_in_decoder(self) -> None:
-        """HDR conversion must NOT be in the decoder — it happens on the encoder side.
-
-        Applying format=p010le in the decoder would do HLG→p010le→rgb24
-        (lossy tone-map), then the encoder tags SDR data as HLG = yellow tint.
-        """
+    def test_exact_transfer_conversion_is_applied_before_rawvideo_pipe(self) -> None:
+        """Per-source transfer normalization must happen before frame blending."""
         from pathlib import Path
 
         from immich_memories.processing.streaming_assembler import FrameDecoder
@@ -575,14 +926,13 @@ class TestFrameDecoderFilterChain:
             fps=30,
             hdr_conversion="zscale=t=arib-std-b67:tin=smpte2084",
             colorspace_filter=",setparams=colorspace=bt2020nc",
-            output_pix_fmt="p010le",
+            output_pix_fmt=",format=p010le",
         )
         vf = decoder._build_vf()
 
-        # HDR filters must NOT be in the decoder filter chain
-        assert "format=p010le" not in vf
-        assert "zscale" not in vf
-        assert "setparams" not in vf
+        assert "format=p010le" in vf
+        assert "zscale" in vf
+        assert "setparams" in vf
 
     def test_no_rotation_when_zero(self) -> None:
         """rotation=0 should NOT add any transpose filter."""
@@ -944,16 +1294,7 @@ class TestStreamingProgressCallback:
             width=320,
             height=240,
             fps=10,
-            encoder_args=[
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "28",
-                "-pix_fmt",
-                "yuv420p",
-            ],
+            encoding_plan=_h264_plan(),
             progress_callback=lambda f, t: progress_calls.append((f, t)),
         )
         assert output.exists()
@@ -1008,16 +1349,7 @@ class TestStreamingProgressCallback:
             height=240,
             fps=10,
             fade_duration=0.3,
-            encoder_args=[
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-crf",
-                "28",
-                "-pix_fmt",
-                "yuv420p",
-            ],
+            encoding_plan=_h264_plan(),
             progress_callback=lambda p, m: progress_calls.append((p, m)),
         )
         assert output.exists()

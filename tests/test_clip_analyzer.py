@@ -95,6 +95,39 @@ def _make_tracker() -> MagicMock:
     return tracker
 
 
+def test_planning_analysis_uses_metadata_without_downloading() -> None:
+    analyzer, mock_client, mock_cache, _ = _make_analyzer(avg_clip_duration=5.0)
+    mock_cache.get_analysis.return_value = None
+    clip = make_clip("asset-plan", duration=12.0)
+    tracker = _make_tracker()
+
+    with patch.object(analyzer, "_init_content_analyzer", return_value=(None, 0.0)):
+        result = analyzer.phase_plan_cached([clip], tracker)
+
+    assert len(result) == 1
+    assert result[0].start_time == 0.0
+    assert result[0].end_time == 5.0
+    mock_client.download_asset.assert_not_called()
+
+
+def test_metadata_fallback_planning_does_not_probe_optional_model_provider() -> None:
+    analyzer, mock_client, mock_cache, _ = _make_analyzer(avg_clip_duration=5.0)
+    mock_cache.get_analysis.return_value = None
+    clip = make_clip("asset-leftover", duration=12.0)
+
+    with patch.object(
+        analyzer,
+        "_init_content_analyzer",
+        side_effect=AssertionError("fallback planning must stay local"),
+    ):
+        result = analyzer.plan_cached_or_metadata([clip])
+
+    assert len(result) == 1
+    assert result[0].start_time == 0.0
+    assert result[0].end_time == 5.0
+    mock_client.download_asset.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # _check_analysis_cache
 # ---------------------------------------------------------------------------
@@ -118,6 +151,81 @@ class TestCheckAnalysisCache:
         result = analyzer._check_analysis_cache(clip)
 
         assert result is None
+
+    def test_semantic_cache_from_different_model_is_a_miss(self) -> None:
+        app_config = Config(
+            llm={"model": "qwen-3.6"},
+            content_analysis={"enabled": True},
+        )
+        analyzer, _, mock_cache, _ = _make_analyzer(app_config=app_config)
+        cached = _make_cached_analysis(_make_cached_segment(score=0.95))
+        cached.model_version = "qwen-3.5"
+        mock_cache.get_analysis.return_value = cached
+
+        result = analyzer._check_analysis_cache(make_clip("asset-stale", duration=10.0))
+
+        assert result is None
+
+    def test_semantic_cache_from_configured_model_is_reused(self) -> None:
+        app_config = Config(
+            llm={"model": "qwen-3.6"},
+            content_analysis={"enabled": True},
+        )
+        analyzer, _, mock_cache, _ = _make_analyzer(app_config=app_config)
+        cached = _make_cached_analysis(
+            _make_cached_segment(
+                score=0.91,
+                llm_description="A family playing outdoors",
+                llm_emotion="joy",
+            )
+        )
+        cached.model_version = "qwen-3.6"
+        mock_cache.get_analysis.return_value = cached
+
+        result = analyzer._check_analysis_cache(make_clip("asset-current", duration=10.0))
+
+        assert result is not None
+        assert result[2] == 0.91
+        assert result[4] is not None
+        assert result[4]["emotion"] == "joy"
+
+    def test_metadata_fallback_surfaces_compatible_cached_semantics(self) -> None:
+        app_config = Config(
+            llm={"model": "qwen-3.6"},
+            content_analysis={"enabled": True},
+        )
+        analyzer, _, mock_cache, _ = _make_analyzer(app_config=app_config)
+        cached = _make_cached_analysis(
+            _make_cached_segment(
+                start=2.0,
+                end=7.0,
+                score=0.94,
+                llm_description="Emile building a sandcastle",
+                llm_emotion="delighted",
+                llm_setting="beach",
+                llm_activities=["playing"],
+                llm_subjects=["Emile"],
+                llm_interestingness=0.91,
+                llm_quality=0.88,
+                audio_categories=["laughter", "waves"],
+            )
+        )
+        cached.model_version = "qwen-3.6"
+        mock_cache.get_analysis.return_value = cached
+        clip = make_clip("asset-cached-leftover", duration=10.0)
+
+        result = analyzer.plan_cached_or_metadata([clip])
+
+        assert len(result) == 1
+        assert (result[0].start_time, result[0].end_time, result[0].score) == (2.0, 7.0, 0.94)
+        assert clip.llm_description == "Emile building a sandcastle"
+        assert clip.llm_emotion == "delighted"
+        assert clip.llm_setting == "beach"
+        assert clip.llm_activities == ["playing"]
+        assert clip.llm_subjects == ["Emile"]
+        assert clip.llm_interestingness == 0.91
+        assert clip.llm_quality == 0.88
+        assert clip.audio_categories == ["laughter", "waves"]
 
     def test_cached_analysis_returns_segment_data(self):
         analyzer, _, mock_cache, mock_preview = _make_analyzer()
@@ -618,6 +726,289 @@ class TestRunAnalysisWithFallback:
         assert result == (0.0, 3.0, 0.2, None)
 
 
+class TestReusableAnalysisServices:
+    def test_successful_semantic_analysis_records_the_exact_model(self, tmp_path) -> None:
+        from immich_memories.analysis.analyzer_models import ScoredSegment
+        from immich_memories.cache.database import VideoAnalysisCache
+
+        app_config = Config(
+            llm={"model": "qwen-3.6"},
+            content_analysis={"enabled": True},
+        )
+        cache = VideoAnalysisCache(tmp_path / "cache.db")
+        analyzer = ClipAnalyzer(
+            PipelineConfig(),
+            MagicMock(),
+            cache,
+            MagicMock(),
+            app_config=app_config,
+        )
+        segment = ScoredSegment(
+            start_time=1.0,
+            end_time=5.0,
+            total_score=0.8,
+            face_score=0.4,
+            motion_score=0.5,
+            stability_score=0.7,
+            audio_score=0.6,
+            llm_description="A child laughing outdoors",
+            llm_emotion="joy",
+            llm_confidence=0.8,
+        )
+        unified = MagicMock()
+        unified.analyze.return_value = [segment]
+        analyzer._cached_unified_analyzer = unified
+        clip = make_clip("semantic-video", duration=10.0)
+
+        analyzer._run_unified_analysis(clip, MagicMock(), MagicMock(), 10.0)
+
+        cached = cache.get_analysis("semantic-video")
+        assert cached is not None
+        assert cached.model_version == "qwen-3.6"
+
+    def test_failed_semantic_analysis_does_not_claim_the_configured_model(self, tmp_path) -> None:
+        from immich_memories.analysis.analyzer_models import ScoredSegment
+        from immich_memories.cache.database import VideoAnalysisCache
+
+        app_config = Config(
+            llm={"model": "qwen-3.6"},
+            content_analysis={"enabled": True},
+        )
+        cache = VideoAnalysisCache(tmp_path / "cache.db")
+        analyzer = ClipAnalyzer(
+            PipelineConfig(),
+            MagicMock(),
+            cache,
+            MagicMock(),
+            app_config=app_config,
+        )
+        segment = ScoredSegment(
+            start_time=1.0,
+            end_time=5.0,
+            total_score=0.7,
+            face_score=0.4,
+            motion_score=0.5,
+            stability_score=0.7,
+            audio_score=0.6,
+            llm_description="(analysis unavailable)",
+            llm_interestingness=0.5,
+            llm_quality=0.5,
+            llm_confidence=0.0,
+        )
+        unified = MagicMock()
+        unified.analyze.return_value = [segment]
+        analyzer._cached_unified_analyzer = unified
+
+        analyzer._run_unified_analysis(
+            make_clip("failed-semantic-video", duration=10.0),
+            MagicMock(),
+            MagicMock(),
+            10.0,
+        )
+
+        cached = cache.get_analysis("failed-semantic-video")
+        assert cached is not None
+        assert cached.model_version is None
+
+    def test_metadata_only_analysis_does_not_claim_the_configured_model(self, tmp_path) -> None:
+        from immich_memories.analysis.analyzer_models import ScoredSegment
+        from immich_memories.cache.database import VideoAnalysisCache
+
+        app_config = Config(
+            llm={"model": "qwen-3.6"},
+            content_analysis={"enabled": True},
+        )
+        cache = VideoAnalysisCache(tmp_path / "cache.db")
+        analyzer = ClipAnalyzer(
+            PipelineConfig(),
+            MagicMock(),
+            cache,
+            MagicMock(),
+            app_config=app_config,
+        )
+        unified = MagicMock()
+        unified.analyze.return_value = [
+            ScoredSegment(
+                start_time=1.0,
+                end_time=5.0,
+                total_score=0.7,
+                face_score=0.4,
+                motion_score=0.5,
+                stability_score=0.7,
+                audio_score=0.6,
+            )
+        ]
+        analyzer._cached_unified_analyzer = unified
+
+        analyzer._run_unified_analysis(
+            make_clip("metadata-video", duration=10.0), MagicMock(), MagicMock(), 10.0
+        )
+
+        cached = cache.get_analysis("metadata-video")
+        assert cached is not None
+        assert cached.model_version is None
+
+    def test_mixed_legacy_first_batch_uses_one_shared_service_stack(self):
+        from immich_memories.analysis.preview_builder import PreviewBuilder
+
+        config = Config()
+        preview_builder = PreviewBuilder(
+            MagicMock(),
+            cache_config=config.cache,
+            analysis_config=config.analysis,
+            content_analysis_config=config.content_analysis,
+        )
+        analyzer = ClipAnalyzer(
+            PipelineConfig(analysis_depth="fast"),
+            MagicMock(),
+            MagicMock(),
+            preview_builder,
+            app_config=config,
+        )
+        segment = MagicMock(
+            start_time=1.0,
+            end_time=5.0,
+            total_score=0.8,
+            audio_categories=None,
+            llm_description=None,
+            llm_emotion=None,
+            cut_quality=1.0,
+        )
+        segment.to_moment_score.return_value = MagicMock()
+        clips = [make_clip(f"mixed-{index}", duration=10.0) for index in range(10)]
+        pipeline_config = MagicMock(avg_clip_duration=5.0)
+
+        with (
+            patch("immich_memories.analysis.scoring.SceneScorer") as scorer_cls,
+            patch(
+                "immich_memories.analysis.unified_analyzer.UnifiedSegmentAnalyzer"
+            ) as unified_cls,
+            patch.object(analyzer, "_init_content_analyzer", return_value=(MagicMock(), 0.3)),
+            patch.object(analyzer, "_get_cached_audio_analyzer", return_value=MagicMock()),
+        ):
+            unified_cls.return_value.analyze.return_value = [segment]
+            for clip in clips[:5]:
+                preview_builder.run_legacy_analysis(
+                    clip, MagicMock(), None, 10.0, pipeline_config, MagicMock()
+                )
+            for clip in clips[5:]:
+                analyzer._run_unified_analysis(clip, MagicMock(), MagicMock(), 10.0)
+
+        scorer_cls.assert_called_once()
+        unified_cls.assert_called_once()
+        legacy_calls = unified_cls.return_value.analyze.call_args_list[:5]
+        assert all(call.kwargs["enable_content_analysis"] is False for call in legacy_calls)
+        assert all(call.kwargs["enable_audio_content_analysis"] is False for call in legacy_calls)
+        assert all(
+            "enable_content_analysis" not in call.kwargs
+            for call in unified_cls.return_value.analyze.call_args_list[5:]
+        )
+
+    def test_unified_zero_score_fallback_reuses_service_in_legacy_mode(self):
+        from immich_memories.analysis.preview_builder import PreviewBuilder
+
+        config = Config()
+        preview_builder = PreviewBuilder(
+            MagicMock(),
+            cache_config=config.cache,
+            analysis_config=config.analysis,
+            content_analysis_config=config.content_analysis,
+        )
+        analyzer = ClipAnalyzer(
+            PipelineConfig(), MagicMock(), MagicMock(), preview_builder, app_config=config
+        )
+        legacy_segment = MagicMock(
+            start_time=1.0,
+            end_time=5.0,
+            total_score=0.8,
+            audio_categories=None,
+            llm_description=None,
+            llm_emotion=None,
+            cut_quality=1.0,
+        )
+        legacy_segment.to_moment_score.return_value = MagicMock()
+        clip = make_clip("fallback", duration=10.0)
+
+        with (
+            patch("immich_memories.analysis.scoring.SceneScorer"),
+            patch(
+                "immich_memories.analysis.unified_analyzer.UnifiedSegmentAnalyzer"
+            ) as unified_cls,
+            patch.object(analyzer, "_init_content_analyzer", return_value=(MagicMock(), 0.3)),
+            patch.object(analyzer, "_get_cached_audio_analyzer", return_value=MagicMock()),
+        ):
+            unified_cls.return_value.analyze.side_effect = [[], [legacy_segment]]
+            analyzer._run_analysis_with_fallback(
+                clip, MagicMock(), MagicMock(), 10.0, use_unified=True
+            )
+
+        assert unified_cls.return_value.analyze.call_count == 2
+        assert (
+            "enable_content_analysis"
+            not in unified_cls.return_value.analyze.call_args_list[0].kwargs
+        )
+        assert unified_cls.return_value.analyze.call_args_list[1].kwargs == {
+            "video_duration": 10.0,
+            "enable_content_analysis": False,
+            "enable_audio_content_analysis": False,
+        }
+
+    def test_unified_services_are_constructed_once_for_a_clip_batch(self):
+        """Ten clips reuse one scorer and unified analyzer rather than rebuilding models."""
+        analyzer, _, _, _ = _make_analyzer()
+        clips = [make_clip(f"reused-{index}", duration=10.0) for index in range(10)]
+        segment = MagicMock(
+            start_time=1.0,
+            end_time=5.0,
+            total_score=0.8,
+            audio_categories=None,
+            llm_description=None,
+            llm_emotion=None,
+            cut_quality=1.0,
+        )
+
+        with (
+            patch("immich_memories.analysis.scoring.SceneScorer") as scorer_cls,
+            patch(
+                "immich_memories.analysis.unified_analyzer.UnifiedSegmentAnalyzer"
+            ) as unified_cls,
+            patch("immich_memories.analysis.clip_analyzer.gc.collect") as collect,
+            patch.object(
+                analyzer, "_init_content_analyzer", return_value=(MagicMock(), 0.3)
+            ) as content,
+            patch.object(analyzer, "_get_cached_audio_analyzer", return_value=MagicMock()) as audio,
+        ):
+            unified_cls.return_value.analyze.return_value = [segment]
+            for clip in clips:
+                analyzer._run_unified_analysis(clip, MagicMock(), MagicMock(), 10.0)
+            analyzer.close()
+
+        scorer_cls.assert_called_once()
+        unified_cls.assert_called_once()
+        content.assert_called_once()
+        audio.assert_called_once()
+        assert unified_cls.return_value.reset_for_video.call_count == 11
+        collect.assert_called_once()
+
+    def test_close_continues_cleanup_and_collects_once_after_resource_failure(self):
+        analyzer, _, _, _ = _make_analyzer()
+        unified = MagicMock()
+        unified.reset_for_video.side_effect = RuntimeError("capture release failed")
+        content = MagicMock()
+        audio = MagicMock()
+        analyzer._cached_unified_analyzer = unified
+        analyzer._cached_content_analyzer = content
+        analyzer._cached_audio_analyzer = audio
+
+        with patch("immich_memories.analysis.clip_analyzer.gc.collect") as collect:
+            analyzer.close()
+
+        unified.clear_cache.assert_called_once()
+        content.close.assert_called_once()
+        audio.cleanup.assert_called_once()
+        collect.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # phase_analyze — end-to-end orchestration
 # ---------------------------------------------------------------------------
@@ -683,11 +1074,11 @@ class TestPhaseAnalyzeOrchestration:
         tracker.complete_phase.assert_called_once()
 
     @patch("immich_memories.analysis.content_analyzer.ContentAnalyzer")
-    def test_cleanup_runs_after_phase(self, mock_ca_cls):
+    def test_resources_survive_phase_until_explicit_close(self, mock_ca_cls):
         analyzer, _, _, _ = _make_analyzer()
         tracker = _make_tracker()
 
-        # Pre-seed cached analyzers to verify cleanup clears them
+        # Pre-seed reusable analyzers; SmartPipeline owns their final teardown.
         mock_content = MagicMock()
         mock_audio = MagicMock()
         analyzer._cached_content_analyzer = mock_content
@@ -697,6 +1088,10 @@ class TestPhaseAnalyzeOrchestration:
 
         analyzer.phase_analyze([make_clip("y", duration=5.0)], tracker)
 
-        # Verify cleanup actually cleared the cached analyzers
+        assert analyzer._cached_content_analyzer is mock_content
+        assert analyzer._cached_audio_analyzer is mock_audio
+
+        analyzer.close()
+
         assert analyzer._cached_content_analyzer is None
         assert analyzer._cached_audio_analyzer is None

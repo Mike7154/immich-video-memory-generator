@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import plistlib
+import shlex
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +17,7 @@ from immich_memories.automation.system_scheduler import (
     generate_crontab_entry,
     generate_launchd_plist,
     generate_systemd_units,
+    get_scheduler_status,
     install_scheduler,
     show_scheduler_config,
     uninstall_scheduler,
@@ -88,6 +92,22 @@ class TestGenerateLaunchdPlist:
         plist = generate_launchd_plist("/bin/im")
         assert "PATH" in plist
 
+    def test_custom_config_is_exact_xml_safe_program_argument(self) -> None:
+        config_path = Path('/tmp/Config & family/one <two> "three".yaml')
+
+        parsed = plistlib.loads(generate_launchd_plist("/bin/im", config_path=config_path).encode())
+
+        assert parsed["ProgramArguments"] == [
+            "/bin/im",
+            "--config",
+            str(config_path),
+            "auto",
+            "run",
+            "--quiet",
+            "--cooldown",
+            "24",
+        ]
+
 
 class TestGenerateSystemdUnits:
     def test_service_has_oneshot_type(self) -> None:
@@ -114,6 +134,17 @@ class TestGenerateSystemdUnits:
         _, timer = generate_systemd_units("/bin/im")
         assert "Persistent=true" in timer
 
+    def test_custom_config_is_quoted_before_subcommand(self) -> None:
+        config_path = Path('/tmp/Config dir/family $HOME 50% "best".yaml')
+
+        service, _ = generate_systemd_units("/bin/im", config_path=config_path)
+
+        assert (
+            "ExecStart=/bin/im --config "
+            '"/tmp/Config dir/family $$HOME 50%% \\"best\\".yaml" auto run '
+            "--quiet --cooldown 24"
+        ) in service
+
 
 class TestGenerateCrontabEntry:
     def test_valid_cron_format(self) -> None:
@@ -138,6 +169,34 @@ class TestGenerateCrontabEntry:
     def test_cooldown_in_entry(self) -> None:
         entry = generate_crontab_entry("/bin/im", cooldown_hours=6)
         assert "--cooldown 6" in entry
+
+    def test_custom_config_round_trips_through_shell_parser(self) -> None:
+        config_path = Path("/tmp/Config dir/family's & photos.yaml")
+
+        entry = generate_crontab_entry("/bin/im", config_path=config_path)
+        command = entry.split(maxsplit=5)[5]
+
+        assert shlex.split(command) == [
+            "/bin/im",
+            "--config",
+            str(config_path),
+            "auto",
+            "run",
+            "--quiet",
+            "--cooldown",
+            "24",
+        ]
+
+    def test_custom_config_escapes_cron_percent_before_command_dispatch(self) -> None:
+        """Cron must not turn a percent in the config path into stdin."""
+        entry = generate_crontab_entry(
+            "/bin/im",
+            config_path=Path("/tmp/Config dir/family%archive.yaml"),
+        )
+        command = entry.split(maxsplit=5)[5]
+
+        assert r"family\%archive.yaml" in command
+        assert "family%archive.yaml" not in command
 
 
 class TestInstallScheduler:
@@ -258,3 +317,146 @@ class TestSchedulerInstallResult:
         assert result.files_written == []
         assert result.activate_command == ""
         assert result.deactivate_command == ""
+
+
+class TestSchedulerStatus:
+    @patch("immich_memories.automation.system_scheduler.detect_platform", return_value="launchd")
+    def test_launchd_detection_is_read_only_and_distinguishes_active(
+        self, _platform: object, tmp_path: Path
+    ) -> None:
+        plist = tmp_path / "com.immich-memories.auto.plist"
+        plist.write_text("<plist/>")
+
+        with (
+            patch(
+                "immich_memories.automation.system_scheduler._launchd_plist_path",
+                return_value=plist,
+            ),
+            patch("immich_memories.automation.system_scheduler.subprocess.run") as run,
+        ):
+            run.return_value.returncode = 0
+            status = get_scheduler_status()
+
+        assert status.platform == "launchd"
+        assert status.installed is True
+        assert status.active is True
+        assert status.paths == (plist,)
+        command = run.call_args.args[0]
+        assert command[:2] == ["launchctl", "print"]
+        assert not {"load", "unload", "bootstrap", "bootout"} & set(command)
+
+    @patch("immich_memories.automation.system_scheduler.detect_platform", return_value="launchd")
+    def test_launchd_installed_file_does_not_imply_active(
+        self, _platform: object, tmp_path: Path
+    ) -> None:
+        plist = tmp_path / "com.immich-memories.auto.plist"
+        plist.write_text("<plist/>")
+
+        with (
+            patch(
+                "immich_memories.automation.system_scheduler._launchd_plist_path",
+                return_value=plist,
+            ),
+            patch("immich_memories.automation.system_scheduler.subprocess.run") as run,
+        ):
+            run.return_value.returncode = 113
+            status = get_scheduler_status()
+
+        assert status.installed is True
+        assert status.active is False
+
+    @patch("immich_memories.automation.system_scheduler.detect_platform", return_value="systemd")
+    def test_systemd_checks_timer_file_and_active_state(
+        self, _platform: object, tmp_path: Path
+    ) -> None:
+        (tmp_path / "immich-memories-auto.service").write_text("[Service]")
+        (tmp_path / "immich-memories-auto.timer").write_text("[Timer]")
+
+        with (
+            patch(
+                "immich_memories.automation.system_scheduler._systemd_user_dir",
+                return_value=tmp_path,
+            ),
+            patch("immich_memories.automation.system_scheduler.subprocess.run") as run,
+        ):
+            run.return_value.returncode = 3
+            status = get_scheduler_status()
+
+        assert status.installed is True
+        assert status.active is False
+        assert status.paths == (
+            tmp_path / "immich-memories-auto.service",
+            tmp_path / "immich-memories-auto.timer",
+        )
+        assert run.call_args.args[0] == [
+            "systemctl",
+            "--user",
+            "is-active",
+            "--quiet",
+            "immich-memories-auto.timer",
+        ]
+
+    @patch("immich_memories.automation.system_scheduler.detect_platform", return_value="crontab")
+    def test_crontab_detection_reads_but_does_not_edit_entries(self, _platform: object) -> None:
+        with patch("immich_memories.automation.system_scheduler.subprocess.run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = (
+                "0 9 * * * /usr/bin/immich-memories auto run --quiet --cooldown 24\n"
+            )
+            status = get_scheduler_status()
+
+        assert status.platform == "crontab"
+        assert status.installed is True
+        assert status.active is None
+        assert status.paths == ()
+        assert run.call_args.args[0] == ["crontab", "-l"]
+
+    @patch("immich_memories.automation.system_scheduler.detect_platform", return_value="crontab")
+    def test_commented_crontab_entry_is_not_installed(self, _platform: object) -> None:
+        with patch("immich_memories.automation.system_scheduler.subprocess.run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = "\n  # 0 9 * * * /usr/bin/immich-memories auto run --quiet\n"
+            status = get_scheduler_status()
+
+        assert status.installed is False
+
+    @patch("immich_memories.automation.system_scheduler.detect_platform", return_value="crontab")
+    def test_known_missing_crontab_is_not_installed(self, _platform: object) -> None:
+        with patch("immich_memories.automation.system_scheduler.subprocess.run") as run:
+            run.return_value.returncode = 1
+            run.return_value.stdout = ""
+            run.return_value.stderr = "no crontab for test-user\n"
+            status = get_scheduler_status()
+
+        assert status.installed is False
+
+    @patch("immich_memories.automation.system_scheduler.detect_platform", return_value="crontab")
+    def test_crontab_unreadable_installation_is_unknown(self, _platform: object) -> None:
+        with patch(
+            "immich_memories.automation.system_scheduler.subprocess.run",
+            side_effect=PermissionError,
+        ):
+            status = get_scheduler_status()
+
+        assert status.installed is None
+        assert status.active is None
+
+    @patch("immich_memories.automation.system_scheduler.detect_platform", return_value="crontab")
+    def test_crontab_timeout_is_unknown(self, _platform: object) -> None:
+        with patch(
+            "immich_memories.automation.system_scheduler.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["crontab", "-l"], 5),
+        ):
+            status = get_scheduler_status()
+
+        assert status.installed is None
+
+    @patch("immich_memories.automation.system_scheduler.detect_platform", return_value="crontab")
+    def test_crontab_unrecognized_error_is_unknown(self, _platform: object) -> None:
+        with patch("immich_memories.automation.system_scheduler.subprocess.run") as run:
+            run.return_value.returncode = 2
+            run.return_value.stdout = ""
+            run.return_value.stderr = "permission denied"
+            status = get_scheduler_status()
+
+        assert status.installed is None

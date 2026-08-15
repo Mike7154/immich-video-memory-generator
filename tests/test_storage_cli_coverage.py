@@ -100,6 +100,32 @@ def _invoke(args: list[str], config: Config | None = None) -> object:
         return runner.invoke(main, args, catch_exceptions=False)
 
 
+def _invoke_planned_generation(args: list[str], config: Config) -> object:
+    """Exercise generate argument resolution without a live personal library."""
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    client.get_photos_for_date_range.return_value = []
+    client.get_person_by_name.return_value = MagicMock(
+        id="person-id",
+        name="Test Person",
+        birth_date=None,
+    )
+    asset = MagicMock(duration_seconds=10.0)
+    with (
+        patch("immich_memories.api.immich.SyncImmichClient", return_value=client),
+        patch(
+            "immich_memories.cli.generate.fetch_videos_and_live_photos",
+            return_value=([asset], []),
+        ),
+        patch(
+            "immich_memories.cli.generate.run_pipeline_and_generate",
+            return_value=(Path("dry-run-plan.mp4"), False, None),
+        ),
+    ):
+        return _invoke(args, config=config)
+
+
 # =========================================================================
 # Module 1: VideoAnalysisCache — uncovered behaviors
 # =========================================================================
@@ -725,6 +751,7 @@ class TestRunTrackerCompleteRun:
     def test_complete_run_no_output(self, mock_db_cls):
         """complete_run without output_path still finalizes the run."""
         tracker = RunTracker(db_path=Path("/tmp/t.db"))
+        tracker.start_run()
         tracker.db.get_run.return_value = _make_run(status="completed")
         result = tracker.complete_run(clips_analyzed=10, clips_selected=5)
         tracker.db.update_run_status.assert_called_once()
@@ -735,6 +762,7 @@ class TestRunTrackerCompleteRun:
     def test_complete_run_closes_active_phase(self, mock_db_cls):
         """complete_run completes any active phase before finalizing."""
         tracker = RunTracker(db_path=Path("/tmp/t.db"))
+        tracker.start_run()
         tracker.db.get_run.return_value = _make_run(status="completed")
         tracker.start_phase("encoding", total_items=5)
         tracker.complete_run()
@@ -746,6 +774,7 @@ class TestRunTrackerCompleteRun:
     def test_complete_run_with_output_file(self, mock_db_cls, tmp_path):
         """complete_run reads output file size when path exists."""
         tracker = RunTracker(db_path=Path("/tmp/t.db"))
+        tracker.start_run()
         tracker.db.get_run.return_value = _make_run(status="completed")
         output = tmp_path / "video.mp4"
         output.write_bytes(b"x" * 1000)
@@ -762,6 +791,7 @@ class TestRunTrackerCompleteRun:
         """complete_run writes run_metadata.json alongside the output."""
         run = _make_run(status="completed")
         tracker = RunTracker(db_path=Path("/tmp/t.db"))
+        tracker.start_run()
         tracker.db.get_run.return_value = run
         output = tmp_path / "out" / "video.mp4"
         output.parent.mkdir(parents=True)
@@ -782,6 +812,7 @@ class TestRunTrackerUpdatePhaseProgress:
     def test_update_phase_progress_no_crash(self, mock_db_cls):
         """update_phase_progress logs but does not crash."""
         tracker = RunTracker(db_path=Path("/tmp/t.db"))
+        tracker.start_run()
         tracker.start_phase("analysis", total_items=10)
         tracker.update_phase_progress(5)  # should not raise
 
@@ -790,6 +821,7 @@ class TestRunTrackerUpdatePhaseProgress:
     def test_update_phase_progress_noop_without_phase(self, mock_db_cls):
         """update_phase_progress is a no-op when no phase is active."""
         tracker = RunTracker(db_path=Path("/tmp/t.db"))
+        tracker.start_run()
         tracker.update_phase_progress(5)  # should not raise
 
 
@@ -801,6 +833,7 @@ class TestRunTrackerCancelWithPhase:
     def test_cancel_completes_active_phase(self, mock_db_cls):
         """cancel_run completes any active phase before cancelling."""
         tracker = RunTracker(db_path=Path("/tmp/t.db"))
+        tracker.start_run()
         tracker.start_phase("export", total_items=3)
         tracker.cancel_run()
         tracker.db.save_phase_stats.assert_called_once()
@@ -979,6 +1012,50 @@ class TestConfigShowCommand:
         result = _invoke(["config", "--show"], config=config)
         assert result.exit_code == 0
         assert "(not set)" in result.output
+
+    def test_config_test_reports_resolved_immich_version(self) -> None:
+        """`config test` is a read-only compatibility and authentication check."""
+        from immich_memories.preflight import CheckResult, CheckStatus
+
+        config = Config(
+            immich={
+                "url": "http://photos.test:2283",
+                "api_key": "test-key",
+                "api_version": "auto",
+            }
+        )
+        check_result = CheckResult(
+            name="Immich",
+            status=CheckStatus.OK,
+            message="Connected as Sam",
+            details="Server: http://photos.test:2283; API: v3",
+        )
+
+        with patch("immich_memories.preflight.check_immich", return_value=check_result) as check:
+            result = _invoke(["config", "test"], config=config)
+
+        assert result.exit_code == 0
+        assert "Connected as Sam" in result.output
+        assert "API: v3" in result.output
+        check.assert_called_once_with(config)
+
+    def test_config_test_exits_nonzero_for_unsupported_immich(self) -> None:
+        from immich_memories.preflight import CheckResult, CheckStatus
+
+        config = Config(immich={"url": "http://photos.test:2283", "api_key": "test-key"})
+        check_result = CheckResult(
+            name="Immich",
+            status=CheckStatus.ERROR,
+            message="Unsupported Immich version",
+            details="Unsupported Immich major version 4",
+        )
+
+        with patch("immich_memories.preflight.check_immich", return_value=check_result):
+            result = _invoke(["config", "test"], config=config)
+
+        assert result.exit_code == 1
+        assert "Unsupported Immich version" in result.output
+        assert "major version 4" in result.output
 
 
 class TestConfigUrlUpdate:
@@ -1240,9 +1317,9 @@ class TestGenerateInfersMemoryType:
         config = Config()
         config.immich.url = "http://immich:2283"
         config.immich.api_key = "test-key"
-        result = _invoke(
+        result = _invoke_planned_generation(
             ["generate", "--year", "2024", "--person", "Alice", "--dry-run"],
-            config=config,
+            config,
         )
         assert result.exit_code == 0
 
@@ -1251,7 +1328,7 @@ class TestGenerateInfersMemoryType:
         config = Config()
         config.immich.url = "http://immich:2283"
         config.immich.api_key = "test-key"
-        result = _invoke(
+        result = _invoke_planned_generation(
             [
                 "generate",
                 "--year",
@@ -1262,7 +1339,7 @@ class TestGenerateInfersMemoryType:
                 "Bob",
                 "--dry-run",
             ],
-            config=config,
+            config,
         )
         assert result.exit_code == 0
 

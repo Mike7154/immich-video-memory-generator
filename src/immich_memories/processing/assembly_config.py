@@ -12,6 +12,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from immich_memories.processing.clips import ClipSegment
+from immich_memories.processing.encoding_plan import EncodingPlan, HdrTransfer, OutputCodec
 
 __all__ = [
     "AssemblyClip",
@@ -20,10 +21,25 @@ __all__ = [
     "TitleScreenSettings",
     "TransitionType",
     "_get_rotation_filter",
+    "standalone_assembly_encoding_plan",
 ]
 
 
 MAX_FACE_CACHE_SIZE = 50  # Max entries in face detection cache to prevent unbounded growth
+
+
+def standalone_assembly_encoding_plan(crf: int = 23) -> EncodingPlan:
+    """Return the explicit software H.264/SDR contract for standalone assembly."""
+    return EncodingPlan(
+        codec=OutputCodec.H264,
+        encoder="libx264",
+        encoder_args=("-preset", "medium", "-crf", str(crf)),
+        target_transfer=HdrTransfer.NONE,
+        tone_map_to_sdr=False,
+        pixel_format="yuv420p",
+        container="mp4",
+        crf=crf,
+    )
 
 
 class TransitionType(StrEnum):
@@ -64,6 +80,7 @@ class TitleScreenSettings:
     show_month_dividers: bool = True
     month_divider_threshold: int = 2  # Minimum clips in a month to show divider
     divider_mode: str = "month"  # "none", "month", or "year"
+    max_dividers: int | None = None  # Timeline-plan cap; None preserves standalone behavior
     show_ending_screen: bool = True
     use_first_name_only: bool = True  # Use only first name for titles
     # Title background style: "content_backed" (slow-mo blur from clip) or
@@ -87,6 +104,7 @@ class TitleScreenSettings:
 class AssemblySettings:
     """Settings for video assembly."""
 
+    encoding_plan: EncodingPlan
     transition: TransitionType = TransitionType.CROSSFADE
     transition_duration: float | None = None
     music_path: Path | None = None
@@ -101,11 +119,6 @@ class AssemblySettings:
     music_other_path: Path | None = None  # Other instruments stem
     add_date_overlay: bool = False
     date_format: str = "%B %d, %Y"
-    output_format: str = "mp4"
-    output_codec: str = "h264"
-    output_crf: int | None = None
-    # HDR and quality preservation
-    preserve_hdr: bool = True  # Use HEVC with HDR metadata
     preserve_framerate: bool = True  # Keep original frame rate (e.g., 60fps)
     target_framerate: int | None = None  # Force specific frame rate (None = auto)
     # Resolution settings

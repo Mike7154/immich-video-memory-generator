@@ -15,7 +15,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 from staticmap import CircleMarker, StaticMap
 
-from .encoding import _get_gpu_encoder_args
+from immich_memories.processing.encoding_plan import EncodingPlan
+
+from .encoding import standalone_title_encoding_plan, title_color_filter, title_encoder_args
 from .map_renderer import _draw_gradient_band, _overlay_composite, _wrap_text
 
 logger = logging.getLogger(__name__)
@@ -281,7 +283,7 @@ def create_map_fly_video(
     fps: float = 30.0,
     hold_start: float = 0.5,
     hold_end: float = 1.0,
-    hdr: bool = False,
+    encoding_plan: EncodingPlan | None = None,
     departure_name: str | None = None,
     destination_names: list[str] | None = None,
 ) -> Path:
@@ -319,7 +321,7 @@ def create_map_fly_video(
     )
 
     _tile_cache.clear()
-    _pipe_frames(cfg, output_path, duration, fps, hold_start, hold_end, hdr)
+    _pipe_frames(cfg, output_path, duration, fps, hold_start, hold_end, encoding_plan)
 
     logger.info("Map fly done: %s (%d tiles cached)", output_path, len(_tile_cache))
     return output_path
@@ -383,9 +385,10 @@ def _pipe_frames(
     fps: float,
     hold_start: float,
     hold_end: float,
-    hdr: bool,
+    encoding_plan: EncodingPlan | None,
 ) -> None:
     """Render animation frames and pipe raw RGB to FFmpeg."""
+    plan = encoding_plan or standalone_title_encoding_plan()
     total = int(duration * fps)
     hold_s = int(hold_start * fps)
     hold_e = int(hold_end * fps)
@@ -412,7 +415,9 @@ def _pipe_frames(
         "lavfi",
         "-i",
         "anullsrc=r=48000:cl=stereo",
-        *_get_gpu_encoder_args(hdr=hdr),
+        "-vf",
+        title_color_filter(plan),
+        *title_encoder_args(plan),
         "-c:a",
         "aac",
         "-b:a",

@@ -7,7 +7,7 @@ from collections.abc import Callable
 from datetime import date
 from typing import TYPE_CHECKING
 
-from nicegui import run, ui
+from nicegui import ui
 
 from immich_memories.api.immich import ImmichAPIError, SyncImmichClient
 from immich_memories.config import Config, set_config
@@ -25,6 +25,7 @@ from immich_memories.ui.components import (
     im_section_header,
     im_separator,
 )
+from immich_memories.ui.nicegui_compat import io_bound_result
 from immich_memories.ui.pages.step1_presets import render_preset_selector
 from immich_memories.ui.pages.step1_tabs import (
     _render_custom_tab,
@@ -92,6 +93,7 @@ def _render_immich_config_section(state) -> None:
                     with SyncImmichClient(
                         base_url=state.immich_url,
                         api_key=state.immich_api_key,
+                        api_version=state.immich_api_version,
                     ) as client:
                         user = client.get_current_user()
                         people = client.get_all_people()
@@ -99,7 +101,7 @@ def _render_immich_config_section(state) -> None:
                         return user, people, years
 
                 try:
-                    user, people, years = await run.io_bound(do_connect)
+                    user, people, years = await io_bound_result(do_connect)
                     state.connected_user = user.name or user.email
                     state.people = people
                     state.years = years
@@ -314,13 +316,15 @@ def _render_options_section(state) -> None:
             c4.classes("p-3")
             ui.select(
                 options={
-                    "fast": "Fast (LLM top clips only)",
-                    "thorough": "Thorough (LLM all clips)",
+                    "auto": "Auto (recommended)",
+                    "fast": "Fast (favorites first)",
+                    "thorough": "Thorough (every eligible clip)",
                 },
                 label="Analysis Depth",
                 value=state.analysis_depth,
             ).classes("w-full").bind_value(state, "analysis_depth").tooltip(
-                "Fast analyzes only top-ranked clips; Thorough scores all clips with LLM"
+                "Auto fully analyzes manageable pools and shortlists large libraries; "
+                "Fast reserves LLM analysis for favorites; Thorough analyzes every eligible clip"
             )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -49,6 +50,14 @@ def mock_client(tmp_path):
     client = MagicMock()
     client.download_asset = MagicMock(side_effect=fake_download)
     return client
+
+
+def _download_in_thread(batch, client, asset, errors: list[BaseException]) -> None:
+    """Collect worker errors without letting a thread hide a failed assertion."""
+    try:
+        batch.download_or_get(client, asset)
+    except BaseException as exc:  # pragma: no cover - assertion safety in worker threads
+        errors.append(exc)
 
 
 class TestVideoDownloadCacheInit:
@@ -103,6 +112,241 @@ class TestDownloadOrGet:
 
         path = cache.download_or_get(client, mock_asset)
         assert path is None
+
+    def test_http_failure_removes_partial_file_before_retry(self, cache, mock_asset):
+        """A streamed HTTP failure cannot poison a later cache lookup."""
+        import httpx
+
+        attempts = 0
+
+        def partial_then_success(_asset_id: str, output_path: Path) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                output_path.write_bytes(b"partial")
+                request = httpx.Request("GET", "https://immich.example/download")
+                response = httpx.Response(503, request=request)
+                raise httpx.HTTPStatusError(
+                    "download interrupted", request=request, response=response
+                )
+            output_path.write_bytes(b"complete")
+
+        client = MagicMock()
+        client.download_asset.side_effect = partial_then_success
+
+        assert cache.download_or_get(client, mock_asset) is None
+        assert cache._find_cached(mock_asset.id) is None
+        path = cache.download_or_get(client, mock_asset)
+
+        assert path is not None
+        assert path.read_bytes() == b"complete"
+        assert client.download_asset.call_count == 2
+
+
+class TestCacheBatch:
+    """Batch cache maintenance must scan once regardless of item count."""
+
+    def test_batch_of_twenty_downloads_scans_cache_once(self, cache, mock_client, monkeypatch):
+        scans = 0
+        original_scan = cache._scan_manifest
+
+        def count_scan():
+            nonlocal scans
+            scans += 1
+            return original_scan()
+
+        monkeypatch.setattr(cache, "_scan_manifest", count_scan)
+        assets = []
+        for index in range(20):
+            asset = MagicMock()
+            asset.id = f"{index:02d}asset-6789-0abc-def0-123456789abc"
+            asset.original_file_name = "clip.MOV"
+            asset.live_photo_video_id = None
+            assets.append(asset)
+
+        with cache.begin_batch() as batch:
+            for asset in assets:
+                assert batch.download_or_get(mock_client, asset) is not None
+
+        assert scans == 1
+
+    def test_batch_scans_once_and_finishes_after_download_failure(
+        self, cache, mock_client, mock_asset, monkeypatch
+    ):
+        scans = 0
+        original_scan = cache._scan_manifest
+
+        def count_scan():
+            nonlocal scans
+            scans += 1
+            return original_scan()
+
+        monkeypatch.setattr(cache, "_scan_manifest", count_scan)
+        failing_asset = MagicMock()
+        failing_asset.id = "def12345-6789-0abc-def0-123456789abc"
+        failing_asset.original_file_name = "failure.MOV"
+        failing_asset.live_photo_video_id = None
+        calls = 0
+
+        def fail_once_then_download(_asset_id: str, output_path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("network error")
+            output_path.write_bytes(b"cached-video")
+
+        mock_client.download_asset.side_effect = fail_once_then_download
+
+        with cache.begin_batch() as batch:
+            assert batch.download_or_get(mock_client, failing_asset) is None
+            assert batch.download_or_get(mock_client, mock_asset) is not None
+
+        assert scans == 1
+        assert batch.finished
+
+    def test_download_or_get_does_not_call_legacy_global_eviction(
+        self, cache, mock_client, mock_asset, monkeypatch
+    ):
+        evict = MagicMock()
+        monkeypatch.setattr(cache, "evict_if_over_limit", evict)
+
+        cache.download_or_get(mock_client, mock_asset)
+
+        evict.assert_not_called()
+
+    def test_nested_batches_are_rejected_and_finished_batches_cannot_download(
+        self, cache, mock_client, mock_asset
+    ):
+        with cache.begin_batch() as batch, pytest.raises(RuntimeError, match="already active"):
+            cache.begin_batch()
+
+        with pytest.raises(RuntimeError, match="finished"):
+            batch.download_or_get(mock_client, mock_asset)
+
+    def test_invalidated_manifest_scans_once_more_at_finish(self, cache, monkeypatch):
+        scans = 0
+        original_scan = cache._scan_manifest
+
+        def count_scan():
+            nonlocal scans
+            scans += 1
+            return original_scan()
+
+        monkeypatch.setattr(cache, "_scan_manifest", count_scan)
+        with cache.begin_batch() as batch:
+            batch.invalidate_manifest()
+
+        assert scans == 2
+
+    def test_failed_finish_releases_the_cache_for_a_new_batch(self, cache, monkeypatch):
+        batch = cache.begin_batch()
+        original_evict = cache._evict_manifest
+
+        def fail_evict(_manifest):
+            raise OSError("disk failure")
+
+        monkeypatch.setattr(cache, "_evict_manifest", fail_evict)
+
+        with pytest.raises(OSError, match="disk failure"):
+            batch.finish()
+
+        assert batch.finished
+        monkeypatch.setattr(cache, "_evict_manifest", original_evict)
+        with cache.begin_batch() as next_batch:
+            assert not next_batch.finished
+
+    def test_downscaled_derivative_is_recorded_in_the_active_manifest(
+        self, cache, mock_client, mock_asset, monkeypatch
+    ):
+        """Finish can enforce the limit because derivatives share the manifest."""
+
+        def fake_ffmpeg(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"downscaled" * 256)
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", fake_ffmpeg)
+        monkeypatch.setattr(
+            "immich_memories.processing.clip_probing.get_main_video_stream_map",
+            lambda _path: "0:v:0",
+        )
+
+        with cache.begin_batch() as batch:
+            analysis, original = batch.get_analysis_video(
+                mock_client, mock_asset, enable_downscaling=True
+            )
+            assert analysis != original
+            assert analysis in batch._manifest
+
+    def test_concurrent_distinct_downloads_record_every_manifest_entry(self, cache):
+        """Task 3 workers may update one batch without losing an entry."""
+        started = threading.Barrier(3)
+        errors: list[BaseException] = []
+
+        def make_asset(asset_id: str):
+            asset = MagicMock()
+            asset.id = asset_id
+            asset.original_file_name = "clip.MOV"
+            asset.live_photo_video_id = None
+            return asset
+
+        def download(_asset_id: str, destination: Path) -> None:
+            started.wait(timeout=1)
+            destination.write_bytes(b"video")
+
+        client = MagicMock()
+        client.download_asset.side_effect = download
+        assets = [make_asset("aa-one"), make_asset("bb-two")]
+
+        with cache.begin_batch() as batch:
+            threads = [
+                threading.Thread(
+                    target=lambda asset=asset: _download_in_thread(batch, client, asset, errors)
+                )
+                for asset in assets
+            ]
+            for thread in threads:
+                thread.start()
+            started.wait(timeout=1)
+            for thread in threads:
+                thread.join(timeout=1)
+
+            assert not errors
+            assert {path.name for path in batch._manifest} == {"aa-one.MOV", "bb-two.MOV"}
+
+    def test_finish_waits_for_active_download_then_rejects_new_work(self, cache):
+        """Final eviction cannot race a Task 3 worker's manifest update."""
+        operation_started = threading.Event()
+        release_operation = threading.Event()
+        finish_returned = threading.Event()
+        errors: list[BaseException] = []
+        asset = MagicMock()
+        asset.id = "aa-active"
+        asset.original_file_name = "clip.MOV"
+        asset.live_photo_video_id = None
+
+        def download(_asset_id: str, destination: Path) -> None:
+            operation_started.set()
+            assert release_operation.wait(timeout=1)
+            destination.write_bytes(b"video")
+
+        client = MagicMock()
+        client.download_asset.side_effect = download
+        batch = cache.begin_batch()
+        worker = threading.Thread(target=lambda: _download_in_thread(batch, client, asset, errors))
+        worker.start()
+        assert operation_started.wait(timeout=1)
+        finisher = threading.Thread(target=lambda: (batch.finish(), finish_returned.set()))
+        finisher.start()
+
+        assert not finish_returned.wait(timeout=0.05)
+        release_operation.set()
+        worker.join(timeout=1)
+        finisher.join(timeout=1)
+
+        assert not errors
+        assert finish_returned.is_set()
+        with pytest.raises(RuntimeError, match="finished"):
+            batch.download_or_get(client, asset)
 
 
 class TestGetStats:

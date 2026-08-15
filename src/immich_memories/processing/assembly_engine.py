@@ -8,8 +8,6 @@ Concat/xfade/batch operations are in ffmpeg_filter_graph.py.
 from __future__ import annotations
 
 import logging
-import shutil
-import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -27,9 +25,8 @@ from immich_memories.processing.hdr_utilities import (
     _detect_color_primaries,
     _get_clip_hdr_types,
     _get_colorspace_filter,
-    _get_dominant_hdr_type,
-    _get_gpu_encoder_args,
 )
+from immich_memories.processing.probe_cache import ProbeCache
 from immich_memories.processing.streaming_assembler import streaming_assemble_full
 
 logger = logging.getLogger(__name__)
@@ -88,19 +85,27 @@ def create_assembly_context(
     if target_w is None or target_h is None:
         target_w, target_h = resolve_target_resolution(settings, prober, clips)
 
-    pix_fmt = (
-        ("p010le" if sys.platform == "darwin" else "yuv420p10le")
-        if settings.preserve_hdr
-        else "yuv420p"
-    )
+    plan = settings.encoding_plan
+    pix_fmt = plan.pixel_format
     target_fps = prober.detect_max_framerate(clips)
-    hdr_type = _get_dominant_hdr_type(clips) if settings.preserve_hdr else "hlg"
+    hdr_type = plan.target_transfer.value if plan.hdr else "sdr"
 
-    clip_hdr_types = _get_clip_hdr_types(clips) if settings.preserve_hdr else [None] * len(clips)
+    # WHY: direct/standalone plans have no source provenance. Always inspect the
+    # actual clips so an HDR source cannot be relabeled SDR without conversion.
+    source_probe_cache = getattr(prober, "probe_cache", None)
+    clip_hdr_types = (
+        _get_clip_hdr_types(clips, probe_cache=source_probe_cache)
+        if isinstance(source_probe_cache, ProbeCache)
+        else _get_clip_hdr_types(clips)
+    )
     clip_primaries: list[str | None] = []
-    if settings.preserve_hdr:
+    if plan.hdr:
         for clip in clips:
-            clip_primaries.append(_detect_color_primaries(clip.path))
+            clip_primaries.append(
+                _detect_color_primaries(clip.path, probe_cache=source_probe_cache)
+                if isinstance(source_probe_cache, ProbeCache)
+                else _detect_color_primaries(clip.path)
+            )
     else:
         clip_primaries = [None] * len(clips)
 
@@ -110,7 +115,7 @@ def create_assembly_context(
             f"Mixed HDR content detected: {unique_types} - converting all to {hdr_type.upper()}"
         )
 
-    colorspace_filter = _get_colorspace_filter(hdr_type) if settings.preserve_hdr else ""
+    colorspace_filter = _get_colorspace_filter(hdr_type)
 
     return AssemblyContext(
         target_w=target_w,
@@ -228,20 +233,16 @@ class AssemblyEngine:
 
         ctx = create_assembly_context(self.settings, self.prober, clips, target_w, target_h)
         fade_duration = self.settings.transition_duration or 0.5
-        crf = self.settings.output_crf or 18
-
-        # GPU encoder + HDR — same _get_gpu_encoder_args the old filter graph used
-        encoder_args = _get_gpu_encoder_args(
-            crf=crf,
-            preserve_hdr=self.settings.preserve_hdr,
-            hdr_type=ctx.hdr_type,
-        )
-        if self.settings.preserve_hdr:
-            logger.info(f"Streaming assembly with {ctx.hdr_type.upper()} HDR preservation")
+        plan = self.settings.encoding_plan
+        if plan.hdr:
+            logger.info("Streaming %s HDR assembly with %s", ctx.hdr_type.upper(), plan.encoder)
         else:
-            logger.info("Streaming assembly with GPU-accelerated encoding")
+            logger.info("Streaming SDR assembly with %s", plan.encoder)
 
         logger.info(f"Streaming assembly: {len(clips)} clips at {target_w}x{target_h}")
+
+        def record_effective_plan(effective_plan) -> None:
+            self.settings.encoding_plan = effective_plan
 
         streaming_assemble_full(
             clips=clips,
@@ -251,34 +252,28 @@ class AssemblyEngine:
             height=target_h,
             fps=ctx.target_fps,
             fade_duration=fade_duration,
-            encoder_args=encoder_args,
+            encoding_plan=plan,
             ctx=ctx,
             normalize_audio=self.settings.normalize_clip_audio,
             privacy_mode=self.settings.privacy_mode,
-            # WHY: Only use HDR pipe when clips actually contain HDR content.
-            # When all clips are SDR, _get_dominant_hdr_type defaults to "hlg"
-            # but piping SDR as yuv420p10le causes shape mismatches on Linux.
-            hdr_type=ctx.hdr_type
-            if self.settings.preserve_hdr and any(t is not None for t in ctx.clip_hdr_types)
-            else None,
             scale_mode=self.settings.scale_mode,
             progress_callback=progress_callback,
             frame_preview_callback=frame_preview_callback,
+            probe_cache=self.prober.probe_cache,
+            effective_plan_callback=record_effective_plan,
         )
         return output_path
 
     def _assemble_single_clip(self, clip: AssemblyClip, output_path: Path) -> Path:
-        """Handle single clip: encode through FFmpeg if filters needed, else copy."""
-        needs_encoding = (
-            self.settings.privacy_mode
-            or (not self.settings.auto_resolution and self.settings.target_resolution)
-            or (clip.rotation_override is not None and clip.rotation_override != 0)
+        """Encode a single clip under the resolved final-output plan."""
+        target_resolution = resolve_target_resolution(self.settings, self.prober, [clip])
+        effective_plan = self.encoder.encode_single_clip(
+            clip,
+            output_path,
+            target_resolution=target_resolution,
         )
-        if needs_encoding:
-            target_resolution = resolve_target_resolution(self.settings, self.prober, [clip])
-            self.encoder.encode_single_clip(clip, output_path, target_resolution=target_resolution)
-            return output_path
-        shutil.copy2(clip.path, output_path)
+        if effective_plan is not None:  # compatibility with injected encoders
+            self.settings.encoding_plan = effective_plan
         return output_path
 
     def assemble_with_cuts(

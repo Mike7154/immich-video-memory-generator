@@ -10,6 +10,7 @@ from nicegui import ui
 from immich_memories.memory_types.factory import create_preset
 from immich_memories.memory_types.registry import MemoryType
 from immich_memories.ui.components import im_card
+from immich_memories.ui.nicegui_compat import io_bound_result
 from immich_memories.ui.state import get_app_state
 
 logger = logging.getLogger(__name__)
@@ -330,8 +331,6 @@ def _render_monthly_params() -> None:
 
 def _render_trip_params() -> None:
     """Year picker + dynamic trip detection dropdown."""
-    from nicegui import run
-
     from immich_memories.analysis.trip_detection import DetectedTrip
 
     state = get_app_state()
@@ -389,6 +388,7 @@ def _render_trip_params() -> None:
                 with SyncImmichClient(
                     base_url=state.immich_url,
                     api_key=state.immich_api_key,
+                    api_version=state.immich_api_version,
                 ) as client:
                     assets = client.get_videos_for_date_range(dr)
                 return detect_trips(
@@ -400,7 +400,7 @@ def _render_trip_params() -> None:
                     max_gap_days=trips_config.max_gap_days,
                 )
 
-            detected = await run.io_bound(do_detect)
+            detected = await io_bound_result(do_detect)
             state.detected_trips = detected
         except Exception as exc:  # WHY: UI graceful degradation
             logger.warning("Trip detection failed: %s", exc)
@@ -486,7 +486,8 @@ def _apply_preset_to_state(memory_type: MemoryType) -> None:
         if preset.date_ranges:
             state.date_range = preset.date_ranges[0]
         if preset.default_duration_seconds:
-            state.target_duration = int(preset.default_duration_seconds / 60)
+            state.target_duration = preset.default_duration_seconds / 60
+            state.duration_mode = "auto"
         elif preset.date_ranges:
             # Auto-compute duration from date range: ~1 min/month, ~8 min/year
             days = preset.date_ranges[0].days

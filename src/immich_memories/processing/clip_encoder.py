@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import logging
 import subprocess
-import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 from immich_memories.processing.assembly_config import (
     AssemblyClip,
     AssemblySettings,
     _get_rotation_filter,
+)
+from immich_memories.processing.encoding_plan import (
+    EncodingPlan,
+    HdrTransfer,
+    software_fallback_plan,
+    uses_hardware_encoder,
 )
 from immich_memories.processing.ffmpeg_prober import FFmpegProber
 from immich_memories.processing.ffmpeg_runner import (
@@ -22,44 +26,44 @@ from immich_memories.processing.ffmpeg_runner import (
 from immich_memories.processing.hdr_utilities import (
     _detect_hdr_type,
     _get_colorspace_filter,
-    _get_gpu_encoder_args,
+    _get_hdr_conversion_filter,
 )
+from immich_memories.processing.probe_cache import ProbeCache
 from immich_memories.processing.scaling_utilities import _get_smart_crop_filter
 from immich_memories.security import validate_video_path
 
 logger = logging.getLogger(__name__)
 
 
-def configure_pyav_output_stream(
-    output_container: Any,
-    target_fps: int,
-    is_hdr: bool,
-    width: int,
-    height: int,
-    crf: int,
-) -> Any:
-    """Configure a PyAV output stream. macOS uses VideoToolbox, Linux uses libx265."""
-    if sys.platform == "darwin":
-        output_stream = output_container.add_stream("hevc_videotoolbox", rate=target_fps)
-        if is_hdr:
-            output_stream.pix_fmt = "p010le"
-            output_stream.options = {
-                "tag": "hvc1",
-                "colorspace": "bt2020nc",
-                "color_primaries": "bt2020",
-                "color_trc": "arib-std-b67",
-            }
-        else:
-            output_stream.pix_fmt = "yuv420p"
-            output_stream.options = {"tag": "hvc1"}
+def encoder_args_for_plan(plan: EncodingPlan) -> list[str]:
+    """Build FFmpeg arguments from a resolved plan without selecting again."""
+    args = ["-c:v", plan.encoder, *plan.encoder_args, "-pix_fmt", plan.pixel_format]
+    if plan.codec.value == "h265" and plan.container == "mp4":
+        args.extend(["-tag:v", "hvc1"])
+    if plan.hdr:
+        color_trc = "smpte2084" if plan.target_transfer is HdrTransfer.PQ else "arib-std-b67"
+        args.extend(
+            [
+                "-colorspace",
+                "bt2020nc",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                color_trc,
+            ]
+        )
     else:
-        output_stream = output_container.add_stream("libx265", rate=target_fps)
-        output_stream.pix_fmt = "yuv420p10le" if is_hdr else "yuv420p"
-        output_stream.options = {"crf": str(crf), "preset": "fast"}
-
-    output_stream.width = width
-    output_stream.height = height
-    return output_stream
+        args.extend(
+            [
+                "-colorspace",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+            ]
+        )
+    return args
 
 
 def log_ffmpeg_error(result: subprocess.CompletedProcess) -> str:
@@ -100,29 +104,33 @@ class ClipEncoder:
         return self.default_resolution
 
     def resolve_encode_hdr(self, clip: AssemblyClip) -> tuple[str, str]:
-        hdr_type = "hlg"
-        if self.settings.preserve_hdr:
-            clip_hdr = _detect_hdr_type(clip.path)
-            if clip_hdr:
-                hdr_type = clip_hdr
-            return hdr_type, _get_colorspace_filter(hdr_type)
-        return hdr_type, ""
+        plan = self.settings.encoding_plan
+        source_probe_cache = getattr(self.prober, "probe_cache", None)
+        source_hdr = (
+            _detect_hdr_type(clip.path, probe_cache=source_probe_cache)
+            if isinstance(source_probe_cache, ProbeCache)
+            else _detect_hdr_type(clip.path)
+        )
+        if plan.hdr:
+            target_hdr = plan.target_transfer.value
+            conversion = _get_hdr_conversion_filter(source_hdr, target_hdr, required=True)
+            return target_hdr, conversion + _get_colorspace_filter(target_hdr)
+        if source_hdr:
+            return "sdr", _get_hdr_conversion_filter(
+                source_hdr, "sdr", required=True
+            ) + _get_colorspace_filter("sdr")
+        return "sdr", _get_colorspace_filter("sdr")
 
     def encode_single_clip(
         self,
         clip: AssemblyClip,
         output_path: Path,
         target_resolution: tuple[int, int] | None = None,
-    ) -> None:
+    ) -> EncodingPlan:
         """Encode with normalized resolution, frame rate, and A/V sync guarantee."""
         validate_video_path(clip.path, must_exist=True)
         target_w, target_h = self.resolve_encode_resolution(target_resolution)
 
-        pix_fmt = (
-            ("p010le" if sys.platform == "darwin" else "yuv420p10le")
-            if self.settings.preserve_hdr
-            else "yuv420p"
-        )
         target_fps = 60
         hdr_type, colorspace_filter = self.resolve_encode_hdr(clip)
 
@@ -138,12 +146,6 @@ class ClipEncoder:
         else:
             fps_filter = f"fps={target_fps}"
 
-        common_suffix = (
-            f"{fps_filter},settb=1/{target_fps},"
-            f"format={pix_fmt}{colorspace_filter},setsar=1,"
-            f"trim=0:{clip.duration},setpts=PTS-STARTPTS"
-        )
-
         audio_format = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
         use_loudnorm = self.settings.normalize_clip_audio and not clip.is_title_screen
         loudnorm = ",loudnorm=I=-16:TP=-1.5:LRA=11" if use_loudnorm else ""
@@ -158,42 +160,72 @@ class ClipEncoder:
                 f"{audio_format},asetpts=PTS-STARTPTS[aout]"
             )
 
-        filter_complex = self._build_single_clip_filter(
-            clip, target_w, target_h, rotation_filter, common_suffix, audio_filter
-        )
+        def build_command(plan: EncodingPlan) -> list[str]:
+            common_suffix = (
+                f"{fps_filter},settb=1/{target_fps},"
+                f"format={plan.pixel_format}{colorspace_filter},setsar=1,"
+                f"trim=0:{clip.duration},setpts=PTS-STARTPTS"
+            )
+            filter_complex = self._build_single_clip_filter(
+                clip, target_w, target_h, rotation_filter, common_suffix, audio_filter
+            )
+            return [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(clip.path),
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "[vout]",
+                "-map",
+                "[aout]",
+                *encoder_args_for_plan(plan),
+                "-r",
+                str(target_fps),
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
 
-        video_codec_args = _get_gpu_encoder_args(
-            crf=8,  # WHY: near-lossless for intermediates, final quality set in assembly
-            preserve_hdr=self.settings.preserve_hdr,
-            hdr_type=hdr_type,
-        )
+        plan = self.settings.encoding_plan
 
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(clip.path),
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[vout]",
-            "-map",
-            "[aout]",
-            *video_codec_args,
-            "-r",
-            str(target_fps),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
+        def retry_in_software() -> tuple[subprocess.CompletedProcess, EncodingPlan]:
+            fallback_plan = software_fallback_plan(plan)
+            logger.warning(
+                "Hardware encoder %s failed; retrying %s in software",
+                plan.encoder,
+                fallback_plan.codec.value,
+            )
+            return (
+                subprocess.run(
+                    build_command(fallback_plan), capture_output=True, text=True, timeout=1800
+                ),
+                fallback_plan,
+            )
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        try:
+            result = subprocess.run(
+                build_command(plan), capture_output=True, text=True, timeout=1800
+            )
+            effective_plan = plan
+        except (OSError, subprocess.TimeoutExpired):
+            if not uses_hardware_encoder(plan):
+                raise
+            result, effective_plan = retry_in_software()
+        else:
+            if result.returncode == 0 or not uses_hardware_encoder(plan):
+                if result.returncode != 0:
+                    raise RuntimeError(f"Failed to encode clip: {result.stderr[-500:]}")
+                return effective_plan
+            result, effective_plan = retry_in_software()
         if result.returncode != 0:
             raise RuntimeError(f"Failed to encode clip: {result.stderr[-500:]}")
+        return effective_plan
 
     def _build_single_clip_filter(
         self,
@@ -292,16 +324,17 @@ class ClipEncoder:
         """Re-encodes for frame-accurate trim boundaries (stream copy can't do this)."""
         validate_video_path(input_path, must_exist=True)
 
-        video_codec_args = _get_gpu_encoder_args(
-            crf=8,  # WHY: near-lossless for intermediates, final quality set in assembly
-            preserve_hdr=self.settings.preserve_hdr,
-        )
+        plan = self.settings.encoding_plan
+        video_codec_args = encoder_args_for_plan(plan)
+        _, color_filter = self.resolve_encode_hdr(AssemblyClip(path=input_path, duration=duration))
+        video_filter = f"{color_filter},format={plan.pixel_format}"
 
         audio_format = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
         loudnorm = ",loudnorm=I=-16:TP=-1.5:LRA=11" if self.settings.normalize_clip_audio else ""
 
         filter_complex = (
-            f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[vout];"
+            f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS"
+            f"{video_filter}[vout];"
             f"anullsrc=r=48000:cl=stereo,atrim=0:{duration}[silence];"
             f"[0:a]atrim=start={start}:duration={duration},{audio_format},"
             f"asetpts=PTS-STARTPTS{loudnorm},apad=whole_dur={duration}[asrc];"
@@ -336,7 +369,8 @@ class ClipEncoder:
             logger.warning(f"Trim with audio failed, using silence: {result.stderr[-200:]}")
 
             filter_complex_silent = (
-                f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[vout];"
+                f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS"
+                f"{video_filter}[vout];"
                 f"anullsrc=r=48000:cl=stereo,atrim=0:{duration},{audio_format},"
                 f"asetpts=PTS-STARTPTS[aout]"
             )
@@ -377,15 +411,12 @@ class ClipEncoder:
         ctx: AssemblyContext,
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> subprocess.CompletedProcess:
-        video_codec_args = _get_gpu_encoder_args(
-            crf=8,  # WHY: near-lossless for intermediates, final quality set in assembly
-            preserve_hdr=self.settings.preserve_hdr,
-            hdr_type=ctx.hdr_type,
+        video_codec_args = encoder_args_for_plan(self.settings.encoding_plan)
+        logger.info(
+            "Encoding final output with %s (%s)",
+            self.settings.encoding_plan.encoder,
+            "HDR" if self.settings.encoding_plan.hdr else "SDR",
         )
-        if self.settings.preserve_hdr:
-            logger.info(f"Using GPU-accelerated HEVC with {ctx.hdr_type.upper()} HDR preservation")
-        else:
-            logger.info("Using GPU-accelerated encoding")
 
         framerate_args = ["-r", str(ctx.target_fps)]
         logger.info(f"Output frame rate: {ctx.target_fps}fps")

@@ -4,28 +4,36 @@ from __future__ import annotations
 
 import logging
 import subprocess
-import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from immich_memories.processing.encoding_plan import HdrTransfer
 from immich_memories.security import validate_video_path
 
+if TYPE_CHECKING:
+    from immich_memories.processing.probe_cache import ProbeCache
+
 __all__ = [
+    "RequiredColorConversionUnavailable",
     "_detect_hdr_type",
     "_detect_color_primaries",
     "_get_dominant_hdr_type",
     "_get_colorspace_filter",
     "_get_hdr_conversion_filter",
     "_get_clip_hdr_types",
-    "_get_gpu_encoder_args",
     "_resolve_clip_hdr",
+    "detect_dominant_hdr_transfer",
     "quality_to_crf",
 ]
 
 logger = logging.getLogger(__name__)
 
 
-def _detect_hdr_type(video_path: Path) -> str | None:
+class RequiredColorConversionUnavailable(RuntimeError):
+    """A required transfer conversion cannot be performed by this FFmpeg build."""
+
+
+def _detect_hdr_type(video_path: Path, *, probe_cache: ProbeCache | None = None) -> str | None:
     """Detect the HDR type of a video file.
 
     Cross-checks BOTH transfer function AND color primaries to avoid
@@ -38,6 +46,14 @@ def _detect_hdr_type(video_path: Path) -> str | None:
         None if SDR or unknown
     """
     video_path = validate_video_path(video_path, must_exist=True)
+    if probe_cache is not None:
+        from immich_memories.processing.probe_cache import ProbeError
+
+        try:
+            return probe_cache.get(video_path).hdr_type
+        except ProbeError as exc:
+            logger.debug("HDR detection failed for %s: %s", video_path, exc)
+            return None
     try:
         result = subprocess.run(
             [
@@ -80,12 +96,22 @@ def _detect_hdr_type(video_path: Path) -> str | None:
     return None
 
 
-def _detect_color_primaries(video_path: Path | str) -> str | None:
+def _detect_color_primaries(
+    video_path: Path | str, *, probe_cache: ProbeCache | None = None
+) -> str | None:
     """Detect the color primaries of a video file.
 
     Returns primaries string like "bt709", "smpte432" (Display P3),
     "bt2020", or None if detection fails.
     """
+    if probe_cache is not None:
+        from immich_memories.processing.probe_cache import ProbeError
+
+        try:
+            return probe_cache.get(video_path).color_primaries
+        except (ProbeError, ValueError) as exc:
+            logger.debug("Color primaries detection failed for %s: %s", video_path, exc)
+            return None
     try:
         result = subprocess.run(
             [
@@ -122,27 +148,43 @@ def _get_dominant_hdr_type(clips: list) -> str:
     Returns "hlg" or "pq" based on what most clips use.
     Defaults to "hlg" if detection fails (iPhone is most common).
     """
-    hdr_types: dict[str, int] = {"hlg": 0, "pq": 0}
+    transfer = detect_dominant_hdr_transfer(clips)
+    if transfer is HdrTransfer.NONE:
+        logger.info("No HDR detected, defaulting to HLG colorspace")
+        return HdrTransfer.HLG.value
+    return transfer.value
 
+
+def detect_dominant_hdr_transfer(
+    clips: list, *, probe_cache: ProbeCache | None = None
+) -> HdrTransfer:
+    """Return the exact dominant source transfer, or NONE for all-SDR input."""
+    counts = {HdrTransfer.HLG: 0, HdrTransfer.PQ: 0}
     for clip in clips:
         path = clip.path if hasattr(clip, "path") else clip
-        hdr_type = _detect_hdr_type(path)
-        if hdr_type:
-            hdr_types[hdr_type] += 1
+        hdr_type = (
+            _detect_hdr_type(path, probe_cache=probe_cache)
+            if probe_cache is not None
+            else _detect_hdr_type(path)
+        )
+        if hdr_type == HdrTransfer.HLG.value:
+            counts[HdrTransfer.HLG] += 1
+        elif hdr_type == HdrTransfer.PQ.value:
+            counts[HdrTransfer.PQ] += 1
 
-    # Return dominant type, default to HLG if tied or none detected
-    if hdr_types["pq"] > hdr_types["hlg"]:
-        logger.info(f"Detected HDR10/PQ format (Android/Samsung/Pixel) - {hdr_types['pq']} clips")
-        return "pq"
-    elif hdr_types["hlg"] > 0:
-        logger.info(f"Detected HLG format (iPhone) - {hdr_types['hlg']} clips")
-        return "hlg"
-    else:
-        logger.info("No HDR detected, defaulting to HLG colorspace")
-        return "hlg"
+    if counts[HdrTransfer.PQ] > counts[HdrTransfer.HLG]:
+        logger.info(
+            "Detected HDR10/PQ format (Android/Samsung/Pixel) - %d clips",
+            counts[HdrTransfer.PQ],
+        )
+        return HdrTransfer.PQ
+    if counts[HdrTransfer.HLG] > 0:
+        logger.info("Detected HLG format (iPhone) - %d clips", counts[HdrTransfer.HLG])
+        return HdrTransfer.HLG
+    return HdrTransfer.NONE
 
 
-def has_any_hdr_clip(clips: list) -> bool:
+def has_any_hdr_clip(clips: list, *, probe_cache: ProbeCache | None = None) -> bool:
     """Check if at least one clip has HDR metadata.
 
     Used to decide whether title screens should be HDR or SDR.
@@ -155,7 +197,11 @@ def has_any_hdr_clip(clips: list) -> bool:
     """
     for clip in clips:
         path = clip.path if hasattr(clip, "path") else clip
-        hdr_type = _detect_hdr_type(path)
+        hdr_type = (
+            _detect_hdr_type(path, probe_cache=probe_cache)
+            if probe_cache is not None
+            else _detect_hdr_type(path)
+        )
         if hdr_type is not None:
             return True
     return False
@@ -170,6 +216,8 @@ def _get_colorspace_filter(hdr_type: str) -> str:
     Returns:
         FFmpeg setparams filter string
     """
+    if hdr_type in ("sdr", HdrTransfer.NONE.value):
+        return ",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
     if hdr_type == "pq":
         # HDR10/HDR10+ (Samsung, Pixel, etc.) - uses PQ/SMPTE2084 transfer
         return ",setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084"
@@ -206,14 +254,13 @@ def _get_sdr_to_hdr_filter(
     source_primaries: str | None,
     has_zscale: bool,
 ) -> str:
-    """Return zscale filter string for SDR-to-HDR upscale, or empty string.
+    """Return the required zscale filter string for SDR-to-HDR conversion.
 
     Uses npl=203 (SDR reference white per BT.2408), explicit TV range,
     and agamma=false for accurate gamma — prevents red/warm color cast.
     """
     if not has_zscale:
-        logger.warning("zscale not available - SDR to HDR conversion may look washed out")
-        return ""
+        raise RuntimeError("zscale is required for SDR-to-HDR transfer conversion")
     src_pri = source_primaries or "bt709"
     src_matrix = "bt709" if src_pri in ("bt709", "smpte432") else src_pri
     if target_type == "hlg":
@@ -234,10 +281,9 @@ def _get_sdr_to_hdr_filter(
 
 
 def _get_hdr_to_hdr_filter(source_type: str, target_type: str, has_zscale: bool) -> str:
-    """Return zscale filter string for HLG<->PQ conversion, or empty string."""
+    """Return the required zscale filter string for HLG<->PQ conversion."""
     if not has_zscale:
-        logger.warning("zscale not available - HDR conversion may not be accurate")
-        return ""
+        raise RuntimeError("zscale is required for HDR transfer conversion")
     if source_type == "hlg" and target_type == "pq":
         return (
             ",zscale=tin=arib-std-b67:t=smpte2084"
@@ -253,37 +299,64 @@ def _get_hdr_to_hdr_filter(source_type: str, target_type: str, has_zscale: bool)
     return ""
 
 
+def _get_hdr_to_sdr_filter(source_type: str, has_zscale: bool) -> str:
+    """Return a deterministic HDR-to-BT.709 tone-map filter."""
+    if not has_zscale:
+        raise RuntimeError("zscale is required for HDR-to-SDR tone mapping")
+    transfer = "smpte2084" if source_type == "pq" else "arib-std-b67"
+    return (
+        f",zscale=t=linear:tin={transfer}:pin=bt2020:min=bt2020nc:rin=tv:npl=100"
+        ",format=gbrpf32le,tonemap=tonemap=hable:desat=0"
+        ",zscale=t=bt709:p=bt709:m=bt709:r=tv,format=yuv420p"
+    )
+
+
 def _get_hdr_conversion_filter(
     source_type: str | None,
     target_type: str,
     source_primaries: str | None = None,
+    *,
+    required: bool = False,
 ) -> str:
     """Get filter to convert between HDR formats (HLG <-> PQ) or SDR -> HDR.
 
     Uses zscale for proper colorspace and transfer function conversion.
-    Falls back to colorspace filter if zscale unavailable.
+    Raises when zscale is unavailable for a required transfer conversion.
 
     Args:
         source_type: Source HDR type ("hlg", "pq", "sdr", or None for unknown)
-        target_type: Target HDR type ("hlg" or "pq")
+        target_type: Target dynamic range ("hlg", "pq", or "sdr")
         source_primaries: Source color primaries (e.g. "bt709", "smpte432" for
             Display P3). When None, defaults to "bt709" for SDR sources.
+        required: Raise a typed error instead of returning an empty filter when
+            conversion is required but zscale is unavailable.
 
     Returns:
         FFmpeg filter string for conversion, or empty string if no conversion needed
     """
-    if source_type == target_type:
+    normalized_source = (
+        "sdr" if source_type is None or source_type == HdrTransfer.NONE.value else source_type
+    )
+    if normalized_source == target_type:
         return ""
 
     has_zscale = _check_zscale_available()
+    if required and not has_zscale:
+        raise RequiredColorConversionUnavailable(
+            f"Required {normalized_source}-to-{target_type} color conversion "
+            "needs FFmpeg with the zscale filter"
+        )
 
-    if source_type is None or source_type == "sdr":
+    if target_type == "sdr":
+        return _get_hdr_to_sdr_filter(normalized_source, has_zscale)
+
+    if normalized_source == "sdr":
         return _get_sdr_to_hdr_filter(target_type, source_primaries, has_zscale)
 
-    return _get_hdr_to_hdr_filter(source_type, target_type, has_zscale)
+    return _get_hdr_to_hdr_filter(normalized_source, target_type, has_zscale)
 
 
-def _get_clip_hdr_types(clips: list) -> list[str | None]:
+def _get_clip_hdr_types(clips: list, *, probe_cache: ProbeCache | None = None) -> list[str | None]:
     """Get HDR type for each clip in the list.
 
     Returns:
@@ -292,14 +365,13 @@ def _get_clip_hdr_types(clips: list) -> list[str | None]:
     hdr_types = []
     for clip in clips:
         path = clip.path if hasattr(clip, "path") else clip
-        hdr_type = _detect_hdr_type(path)
+        hdr_type = (
+            _detect_hdr_type(path, probe_cache=probe_cache)
+            if probe_cache is not None
+            else _detect_hdr_type(path)
+        )
         hdr_types.append(hdr_type)
     return hdr_types
-
-
-def _hdr_color_args(color_trc: str) -> list[str]:
-    """Common HDR color metadata arguments for encoder commands."""
-    return ["-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", color_trc]
 
 
 def quality_to_crf(quality: str) -> int:
@@ -311,105 +383,6 @@ def quality_to_crf(quality: str) -> int:
     return {"high": 12, "medium": 18, "low": 28}.get(quality, 12)
 
 
-def _crf_to_vt_quality(crf: int) -> int:
-    """Map CRF to VideoToolbox -q:v (1-100, higher = better).
-
-    WHY: The old formula (100 - crf*3) gave q:v 31 for CRF 23 — far too
-    compressed. Apple apps use ~65-80 for high quality. This mapping
-    is calibrated against real iPhone HEVC output.
-    """
-    # CRF 12 → q:v 78 (archival), CRF 18 → q:v 62, CRF 28 → q:v 38
-    return max(20, min(90, 90 - crf * 2))
-
-
-def _encoder_args_macos(crf: int, preserve_hdr: bool, color_trc: str) -> list[str]:
-    """VideoToolbox encoder args for macOS."""
-    vt_quality = _crf_to_vt_quality(crf)
-    base = ["-c:v", "hevc_videotoolbox", "-q:v", str(vt_quality), "-tag:v", "hvc1"]
-    if preserve_hdr:
-        return base + ["-pix_fmt", "p010le"] + _hdr_color_args(color_trc)
-    return base
-
-
-def _encoder_args_nvenc(crf: int, preserve_hdr: bool, color_trc: str) -> list[str] | None:
-    """NVENC encoder args, or None if unavailable."""
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True
-        )
-        if "hevc_nvenc" not in result.stdout:
-            return None
-    except (OSError, subprocess.SubprocessError):
-        return None
-    base = [
-        "-c:v",
-        "hevc_nvenc",
-        "-preset",
-        "p4",
-        "-rc",
-        "constqp",
-        "-qp",
-        str(crf),
-        "-tag:v",
-        "hvc1",
-    ]
-    if preserve_hdr:
-        return base + ["-pix_fmt", "p010le"] + _hdr_color_args(color_trc)
-    return base
-
-
-def _encoder_args_cpu(crf: int, preserve_hdr: bool, color_trc: str, hdr_type: str) -> list[str]:
-    """CPU fallback encoder args (libx265 HDR or libx264 SDR)."""
-    if not preserve_hdr:
-        return ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf)]
-    x265_transfer = "smpte2084" if hdr_type == "pq" else "arib-std-b67"
-    return [
-        "-c:v",
-        "libx265",
-        "-preset",
-        "medium",
-        "-crf",
-        str(crf),
-        "-pix_fmt",
-        "yuv420p10le",
-        "-tag:v",
-        "hvc1",
-        *_hdr_color_args(color_trc),
-        "-x265-params",
-        f"hdr-opt=1:repeat-headers=1:colorprim=bt2020:transfer={x265_transfer}:colormatrix=bt2020nc",
-    ]
-
-
-def _get_gpu_encoder_args(
-    crf: int = 23, preserve_hdr: bool = False, hdr_type: str = "hlg"
-) -> list[str]:
-    """Get GPU-accelerated encoder arguments.
-
-    Uses hardware encoding when available:
-    - macOS: hevc_videotoolbox (Apple Silicon GPU)
-    - NVIDIA: hevc_nvenc (CUDA)
-    - Fallback: libx265/libx264 (CPU)
-
-    Args:
-        crf: Quality level (lower = better, 0-51)
-        preserve_hdr: If True, use 10-bit HDR settings
-        hdr_type: "hlg" for iPhone HLG, "pq" for Android HDR10/HDR10+
-
-    Returns:
-        List of FFmpeg encoder arguments.
-    """
-    color_trc = "smpte2084" if hdr_type == "pq" else "arib-std-b67"
-
-    if sys.platform == "darwin":
-        return _encoder_args_macos(crf, preserve_hdr, color_trc)
-
-    nvenc = _encoder_args_nvenc(crf, preserve_hdr, color_trc)
-    if nvenc is not None:
-        return nvenc
-
-    return _encoder_args_cpu(crf, preserve_hdr, color_trc, hdr_type)
-
-
 def _resolve_clip_hdr(
     clip_idx: int, ctx: Any | None, hdr_type: str | None
 ) -> tuple[str, str, str, str, bool]:
@@ -417,43 +390,32 @@ def _resolve_clip_hdr(
 
     Returns (hdr_conversion, colorspace_filter, output_pix_fmt, sdr_to_hdr_filter, clip_is_hdr).
     """
-    hdr_conversion = ""
-    colorspace_filter = ""
+    target_type = hdr_type or "sdr"
+    source_type: str | None = None
+    source_primaries: str | None = None
     output_pix_fmt = ""
-    clip_is_hdr = False
+    colorspace_filter = _get_colorspace_filter(target_type)
 
     if ctx is not None:
-        output_pix_fmt = getattr(ctx, "pix_fmt", "")
-        colorspace_filter = getattr(ctx, "colorspace_filter", "")
+        target_type = getattr(ctx, "hdr_type", target_type)
+        pix_fmt = getattr(ctx, "pix_fmt", "")
+        output_pix_fmt = f",format={pix_fmt}" if pix_fmt else ""
+        colorspace_filter = getattr(ctx, "colorspace_filter", "") or _get_colorspace_filter(
+            target_type
+        )
         clip_hdr_types = getattr(ctx, "clip_hdr_types", [])
         clip_primaries = getattr(ctx, "clip_primaries", [])
-        dominant_hdr = getattr(ctx, "hdr_type", "")
-
         if clip_idx < len(clip_hdr_types):
-            clip_is_hdr = clip_hdr_types[clip_idx] is not None
-            if clip_hdr_types[clip_idx] != dominant_hdr:
-                source_pri = clip_primaries[clip_idx] if clip_idx < len(clip_primaries) else None
-                hdr_conversion = _get_hdr_conversion_filter(
-                    clip_hdr_types[clip_idx], dominant_hdr, source_primaries=source_pri
-                )
+            source_type = clip_hdr_types[clip_idx]
+        if clip_idx < len(clip_primaries):
+            source_primaries = clip_primaries[clip_idx]
 
-    # WHY: SDR clip in HDR output needs zscale sRGB→HLG/PQ conversion.
-    # Without this, SDR full-range data tagged as TV-range HLG = red tint.
-    sdr_to_hdr_filter = ""
-    if hdr_type and not clip_is_hdr:
-        trc = "arib-std-b67" if hdr_type == "hlg" else "smpte2084"
-        # WHY: format=yuv420p normalizes yuvj444p (full range, 4:4:4) to
-        # yuv420p (TV range, 4:2:0) BEFORE the zscale HDR conversion.
-        # Without this, different SDR formats (yuvj444p from live merges
-        # vs yuv420p from regular clips) produce different chroma values
-        # after conversion → green flash during crossfade.
-        sdr_to_hdr_filter = (
-            "format=yuv420p,"
-            f"zscale=t={trc}:tin=iec61966-2-1"
-            ":p=bt2020:pin=bt709"
-            ":m=bt2020nc:min=bt709"
-            ":npl=203"
-            ",format=yuv420p10le"
-        )
-
-    return hdr_conversion, colorspace_filter, output_pix_fmt, sdr_to_hdr_filter, clip_is_hdr
+    clip_is_hdr = source_type in {HdrTransfer.HLG.value, HdrTransfer.PQ.value}
+    normalized_source = source_type or "sdr"
+    hdr_conversion = _get_hdr_conversion_filter(
+        normalized_source,
+        target_type,
+        source_primaries=source_primaries,
+        required=True,
+    )
+    return hdr_conversion, colorspace_filter, output_pix_fmt, "", clip_is_hdr

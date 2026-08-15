@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,7 +21,9 @@ from immich_memories.cli._pipeline_runner import (
     run_pipeline_and_generate,
 )
 from immich_memories.cli._trip_generation import handle_trip_generation, resolve_music_arg
-from immich_memories.timeperiod import DateRange
+from immich_memories.filename_builder import normalize_output_path
+from immich_memories.processing.encoding_plan import resolve_output_selection
+from immich_memories.timeperiod import DateRange, parse_date
 
 if TYPE_CHECKING:
     from immich_memories.config_loader import Config
@@ -37,7 +40,7 @@ def _build_params_table(
     scale_mode: str | None,
     transition: str,
     resolution: str,
-    output_format: str,
+    output_format: str | None,
     output_path: Path,
     add_date: bool,
     keep_intermediates: bool,
@@ -65,7 +68,7 @@ def _build_params_table(
     table.add_row("Scale Mode", scale_mode or config.defaults.scale_mode)
     table.add_row("Transition", transition)
     table.add_row("Resolution", resolution)
-    table.add_row("Format", output_format)
+    table.add_row("Format", output_format or config.output.codec)
     table.add_row("Output", str(output_path))
     if add_date:
         table.add_row("Date Overlay", "Enabled")
@@ -96,6 +99,22 @@ def _has_music_backends(config: Config) -> bool:
     from immich_memories.generate_music import music_config_available
 
     return music_config_available(config)
+
+
+def _print_generation_result(
+    *,
+    dry_run: bool,
+    result_path: Path,
+    should_upload: bool,
+    album_name: str | None,
+) -> None:
+    """Report a plan without claiming an artifact or upload exists."""
+    if dry_run:
+        print_success("Dry-run planning complete; no video was created")
+        return
+    print_success(f"Video saved to: {result_path}")
+    if should_upload:
+        print_success(f"Uploaded to Immich (album: {album_name or 'none'})")
 
 
 def register_generate_commands(main: click.Group) -> None:
@@ -195,9 +214,9 @@ def register_generate_commands(main: click.Group) -> None:
     @click.option(
         "--format",
         "output_format",
-        type=click.Choice(["mp4", "prores"]),
-        default="mp4",
-        help="Output format",
+        type=click.Choice(["mp4", "h265", "prores"]),
+        default=None,
+        help="Output format override (default: config value)",
     )
     @click.option(
         "--quality",
@@ -271,9 +290,12 @@ def register_generate_commands(main: click.Group) -> None:
     )
     @click.option(
         "--analysis-depth",
-        type=click.Choice(["fast", "thorough"]),
+        type=click.Choice(["auto", "fast", "thorough"]),
         default=None,
-        help="Analysis depth: fast (metadata gap-fill) or thorough (LLM gap-fill)",
+        help=(
+            "Analysis depth: auto (full analysis for manageable pools), "
+            "fast (favorites first), or thorough (every eligible clip)"
+        ),
     )
     @click.option(
         "--trip-index",
@@ -299,6 +321,16 @@ def register_generate_commands(main: click.Group) -> None:
         default=None,
         help="Select trip closest to this date (YYYY-MM-DD, use with --memory-type trip)",
     )
+    @click.option(
+        "--source",
+        type=click.Choice(["manual", "scheduled", "auto"]),
+        default="manual",
+        hidden=True,
+    )
+    @click.option("--memory-key", type=str, default=None, hidden=True)
+    @click.option("--memory-category", type=str, default=None, hidden=True)
+    @click.option("--automation-attempt-id", type=str, default=None, hidden=True)
+    @click.option("--automation-target-date", type=str, default=None, hidden=True)
     @click.option("--quiet", is_flag=True, help="Suppress interactive progress, emit log lines")
     @click.pass_context
     def generate(
@@ -319,7 +351,7 @@ def register_generate_commands(main: click.Group) -> None:
         transition: str,
         resolution: str,
         music_volume: float,
-        output_format: str,
+        output_format: str | None,
         quality: str | None,
         output: str | None,
         music: str | None,
@@ -340,6 +372,11 @@ def register_generate_commands(main: click.Group) -> None:
         all_trips: bool,
         years_back: int | None,
         near_date: str | None,
+        source: str,
+        memory_key: str | None,
+        memory_category: str | None,
+        automation_attempt_id: str | None,
+        automation_target_date: str | None,
         quiet: bool,
     ) -> None:
         """Generate a video compilation.
@@ -362,6 +399,11 @@ def register_generate_commands(main: click.Group) -> None:
         from immich_memories.cli._live_display import LiveDisplay, ProgressDisplay, QuietDisplay
 
         config = ctx.obj["config"]
+        output_selection = resolve_output_selection(
+            config_codec=config.output.codec,
+            config_container=config.output.format,
+            format_override=output_format,
+        )
 
         # CLI quality flag overrides config
         if quality:
@@ -373,6 +415,25 @@ def register_generate_commands(main: click.Group) -> None:
         if not config.immich.url or not config.immich.api_key:
             print_error("Immich not configured. Run 'immich-memories config' first.")
             sys.exit(1)
+
+        if automation_attempt_id is not None and source != "auto":
+            raise click.UsageError("--automation-attempt-id requires --source=auto")
+
+        exact_on_this_day: date | None = None
+        if automation_target_date is not None:
+            trusted_on_this_day = (
+                source == "auto"
+                and bool(memory_key)
+                and memory_category == memory_type == "on_this_day"
+            )
+            if not trusted_on_this_day:
+                raise click.UsageError(
+                    "--automation-target-date requires complete on_this_day automation identity"
+                )
+            try:
+                exact_on_this_day = parse_date(automation_target_date)
+            except ValueError as exc:
+                raise click.UsageError(str(exc)) from exc
 
         # Validate memory type constraints
         if memory_type in ("person_spotlight", "multi_person") and not person_names:
@@ -410,6 +471,7 @@ def register_generate_commands(main: click.Group) -> None:
                 month=month,
                 hemisphere=hemisphere,
                 years_back=years_back,
+                on_this_day_target=exact_on_this_day,
             )
         except click.UsageError:
             raise
@@ -432,10 +494,9 @@ def register_generate_commands(main: click.Group) -> None:
 
         # Determine output path
         if output:
-            output_path = Path(output)
+            output_path = normalize_output_path(Path(output), output_selection.container)
         else:
             output_dir = config.output.output_path
-            output_dir.mkdir(parents=True, exist_ok=True)
             person_slug = (
                 "_".join(n.lower().replace(" ", "_") for n in person_names)
                 if person_names
@@ -448,7 +509,9 @@ def register_generate_commands(main: click.Group) -> None:
                 date_slug = (
                     f"{date_range.start.strftime('%Y%m%d')}-{date_range.end.strftime('%Y%m%d')}"
                 )
-            output_path = output_dir / f"{person_slug}_{type_slug}_{date_slug}.mp4"
+            output_path = output_dir / (
+                f"{person_slug}_{type_slug}_{date_slug}.{output_selection.container}"
+            )
 
         if not quiet:
             console.print()
@@ -464,7 +527,7 @@ def register_generate_commands(main: click.Group) -> None:
             config.photos.duration = photo_duration
 
         # Analysis depth: CLI override → stored for PipelineConfig
-        effective_analysis_depth = analysis_depth or "fast"
+        effective_analysis_depth = analysis_depth or "auto"
 
         # Infer memory type from context when not explicitly set
         if memory_type is None and person_names:
@@ -507,10 +570,6 @@ def register_generate_commands(main: click.Group) -> None:
             console.print(table)
             console.print()
 
-        if dry_run:
-            print_info("Dry run - no video will be generated")
-            return
-
         from immich_memories.api.immich import ImmichAPIError, SyncImmichClient
         from immich_memories.generate import GenerationError
 
@@ -529,6 +588,7 @@ def register_generate_commands(main: click.Group) -> None:
                 with SyncImmichClient(
                     base_url=config.immich.url,
                     api_key=config.immich.api_key,
+                    api_version=config.immich.api_version,
                 ) as client:
                     progress.update(task, completed=True)
                     # Trip detection flow: branch early
@@ -552,6 +612,7 @@ def register_generate_commands(main: click.Group) -> None:
                             music_volume=music_volume,
                             no_music=no_music,
                             resolution=resolution,
+                            orientation=orientation,
                             scale_mode=scale_mode,
                             output_format=output_format,
                             add_date=add_date,
@@ -562,6 +623,13 @@ def register_generate_commands(main: click.Group) -> None:
                             upload_to_immich=upload_to_immich,
                             album=album,
                             duration=duration,
+                            requested_start=date_range.start.date() if start and end else None,
+                            requested_end=date_range.end.date() if start and end else None,
+                            source=source,
+                            memory_key=memory_key,
+                            memory_category=memory_category,
+                            automation_attempt_id=automation_attempt_id,
+                            dry_run=dry_run,
                         )
                         return
 
@@ -601,6 +669,7 @@ def register_generate_commands(main: click.Group) -> None:
                                 month=month,
                                 hemisphere=hemisphere,
                                 years_back=years_back,
+                                on_this_day_target=exact_on_this_day,
                             )
                             if isinstance(date_result, list):
                                 date_ranges = date_result
@@ -668,6 +737,7 @@ def register_generate_commands(main: click.Group) -> None:
                         no_music=no_music,
                         output_path=output_path,
                         output_resolution=resolution,
+                        output_orientation=orientation,
                         scale_mode=effective_scale_mode,
                         output_format=output_format,
                         add_date_overlay=add_date,
@@ -680,11 +750,19 @@ def register_generate_commands(main: click.Group) -> None:
                         date_range=date_range,
                         upload_to_immich=upload_to_immich,
                         album=album,
+                        source=source,
+                        memory_key=memory_key,
+                        memory_category=memory_category,
+                        automation_attempt_id=automation_attempt_id,
+                        dry_run=dry_run,
                     )
 
-                print_success(f"Video saved to: {result_path}")
-                if should_upload:
-                    print_success(f"Uploaded to Immich (album: {album_name or 'none'})")
+                _print_generation_result(
+                    dry_run=dry_run,
+                    result_path=result_path,
+                    should_upload=should_upload,
+                    album_name=album_name,
+                )
 
         except ImmichAPIError as e:
             print_error(f"Immich API error: {e}")
@@ -692,6 +770,8 @@ def register_generate_commands(main: click.Group) -> None:
         except GenerationError as e:
             print_error(str(e))
             sys.exit(1)
+        except click.ClickException:
+            raise
         except Exception as e:  # WHY: CLI top-level error boundary — sanitizes and displays error
             from immich_memories.security import sanitize_error_message
 

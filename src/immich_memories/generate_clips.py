@@ -12,8 +12,14 @@ from immich_memories.generate_privacy import clip_location_name
 from immich_memories.processing.assembly_config import AssemblyClip
 
 if TYPE_CHECKING:
-    from immich_memories.cache.video_cache import VideoDownloadCache
+    from immich_memories.cache.video_cache import CacheBatch
     from immich_memories.generate import GenerationParams
+    from immich_memories.processing.download_coordinator import (
+        DownloadCoordinator,
+        DownloadResult,
+        PrefetchAsset,
+    )
+    from immich_memories.processing.probe_cache import ProbeCache
 
 logger = logging.getLogger(__name__)
 
@@ -21,37 +27,78 @@ logger = logging.getLogger(__name__)
 MIN_CLIP_DURATION = 1.5
 
 
-def _probe_file_duration(path: Path) -> float | None:
+def _probe_file_duration(path: Path, *, probe_cache: ProbeCache | None = None) -> float | None:
     """Probe actual file duration via ffprobe. Returns None on failure."""
-    import subprocess
+    from immich_memories.processing.probe_cache import ProbeCache, ProbeError
 
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "quiet",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "csv=p=0",
-                str(path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return float(result.stdout.strip())
-    except (ValueError, subprocess.TimeoutExpired):
-        pass
+    with contextlib.suppress(OSError, ProbeError, ValueError):
+        duration = (probe_cache or ProbeCache()).get(path).duration_seconds
+        return duration or None
     return None
+
+
+def _prefetch_assets(clips: list) -> list[PrefetchAsset]:
+    """Return network-only video targets, including burst components."""
+    from immich_memories.api.models import AssetType
+    from immich_memories.processing.download_coordinator import DownloadTarget
+
+    targets: list[PrefetchAsset] = []
+    for clip in clips:
+        if clip.local_path and Path(clip.local_path).exists():
+            continue
+        if clip.asset.type == AssetType.IMAGE and not clip.asset.live_photo_video_id:
+            continue
+        if clip.live_burst_video_ids and clip.live_burst_trim_points:
+            targets.extend(DownloadTarget(id=video_id) for video_id in clip.live_burst_video_ids)
+        else:
+            targets.append(clip.asset)
+    return targets
+
+
+def _download_video_path(
+    params: GenerationParams,
+    clip,
+    video_cache: CacheBatch | None,
+    output_dir: Path,
+    prefetched: dict[str, DownloadResult] | None,
+) -> Path | None:
+    """Resolve one clip's source without retrying completed burst prefetches."""
+    from immich_memories.generate_downloads import download_clip
+
+    if clip.live_burst_video_ids and clip.live_burst_trim_points:
+        burst_results = (
+            {
+                video_id: prefetched[video_id]
+                for video_id in clip.live_burst_video_ids
+                if video_id in prefetched
+            }
+            if prefetched is not None
+            else None
+        )
+        return download_clip(
+            params.client,
+            video_cache,
+            clip,
+            output_dir,
+            prefetched_burst_results=burst_results,
+        )
+
+    prefetched_result = prefetched.get(clip.asset.id) if prefetched is not None else None
+    if prefetched_result and prefetched_result.path is not None:
+        return prefetched_result.path
+    if prefetched_result and prefetched_result.error:
+        logger.warning("Failed to prefetch %s: %s", clip.asset.id, prefetched_result.error)
+        return None
+    return download_clip(params.client, video_cache, clip, output_dir)
 
 
 def _extract_clips(
     params: GenerationParams,
-    video_cache: VideoDownloadCache,
+    video_cache: CacheBatch | None,
     output_dir: Path,
+    *,
+    download_coordinator: DownloadCoordinator | None = None,
+    probe_cache: ProbeCache | None = None,
 ) -> list[AssemblyClip]:
     """Download videos and extract clip segments. Renders IMAGE clips as photo animations."""
     from immich_memories.api.models import AssetType
@@ -64,6 +111,9 @@ def _extract_clips(
 
     assembly_clips: list[AssemblyClip] = []
     total = len(params.clips)
+    prefetched: dict[str, DownloadResult] | None = None
+    if download_coordinator is not None:
+        prefetched = download_coordinator.prefetch(_prefetch_assets(params.clips))
 
     for i, clip in enumerate(params.clips):
         progress = (i / total) * 0.7
@@ -80,9 +130,7 @@ def _extract_clips(
                     assembly_clips.append(photo_clip)
                 continue
 
-            from immich_memories.generate_downloads import download_clip
-
-            video_path = download_clip(params.client, video_cache, clip, output_dir)
+            video_path = _download_video_path(params, clip, video_cache, output_dir, prefetched)
             if not video_path or not video_path.exists():
                 logger.warning(f"Failed to download {clip.asset.id}, skipping")
                 continue
@@ -102,7 +150,11 @@ def _extract_clips(
             # frame underruns) but also never more than what was requested
             # (prevents audio starting early).
             nominal_duration = end_time - start_time
-            actual_duration = _probe_file_duration(segment_path)
+            actual_duration = (
+                _probe_file_duration(segment_path, probe_cache=probe_cache)
+                if probe_cache is not None
+                else _probe_file_duration(segment_path)
+            )
             duration = (
                 min(actual_duration, nominal_duration) if actual_duration else nominal_duration
             )
@@ -139,7 +191,14 @@ def _cleanup_temp_dirs(output_dir: Path) -> None:
     """Remove intermediate directories created during generation."""
     import shutil
 
-    for subdir in (".title_screens", ".intermediates", ".live_merges", ".assembly_temps", "photos"):
+    for subdir in (
+        ".title_screens",
+        ".intermediates",
+        ".live_merges",
+        ".assembly_temps",
+        ".temporary_downloads",
+        "photos",
+    ):
         path = output_dir / subdir
         if path.exists():
             with contextlib.suppress(Exception):

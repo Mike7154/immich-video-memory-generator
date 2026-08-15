@@ -6,7 +6,6 @@ and the main SceneScorer class. Factory functions are in scoring_factory.py.
 
 from __future__ import annotations
 
-import gc
 import logging
 import platform
 import subprocess
@@ -610,6 +609,11 @@ class SceneScorer:
         self._current_cap: cv2.VideoCapture | None = None
         self._current_path: str | None = None
 
+    @property
+    def content_min_confidence(self) -> float:
+        """Minimum confidence required to accept a semantic score."""
+        return self._content_analysis_config.min_confidence
+
     @classmethod
     def from_profile(cls, profile: ScoringProfile, **kwargs) -> SceneScorer:
         """Create a SceneScorer from a ScoringProfile dataclass."""
@@ -684,8 +688,6 @@ class SceneScorer:
         # Memory cleanup (don't release cap - it's cached for reuse)
         if prev_frame is not None:
             del prev_frame
-        gc.collect()
-
         # Aggregate scores
         avg_face = np.mean(face_scores) if face_scores else 0.0
         avg_motion = np.mean(motion_scores) if motion_scores else 0.5
@@ -889,11 +891,7 @@ class SceneScorer:
             moments.append(s)
             if progress_callback:
                 progress_callback(i + 1, len(segments))
-            if (i + 1) % 10 == 0:
-                gc.collect()
-
         del segments
-        gc.collect()
 
         moments.sort(key=lambda m: self._compute_sort_key(m, video_duration))
         return moments

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from pathlib import Path
 
@@ -19,6 +20,29 @@ from immich_memories.config import Config, get_config, init_config_dir
 
 # Re-export helpers so external code can still do `from immich_memories.cli import console` etc.
 __all__ = ["console", "main", "print_error", "print_info", "print_success"]
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return whether a UI bind target is unambiguously local-only."""
+    normalized = host.strip().strip("[]").rstrip(".").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _warn_about_unauthenticated_external_bind(config: Config, host: str) -> None:
+    """Warn before a stateful unauthenticated UI listens beyond loopback."""
+    if config.auth.enabled or _is_loopback_host(host):
+        return
+    click.echo(
+        f"Warning: authentication is disabled while the UI binds to {host}. "
+        "Any client that can reach this address can use the app. "
+        "The UI is single-user, single-replica; enable authentication before exposing it.",
+        err=True,
+    )
 
 
 @click.group()
@@ -47,10 +71,12 @@ def main(ctx: click.Context, config: str | None) -> None:
 
     try:
         if config:
-            config_path = Path(config)
+            config_path = Path(config).expanduser().resolve()
             ctx.obj["config"] = Config.from_yaml(config_path)
+            ctx.obj["config_path"] = config_path
         else:
             ctx.obj["config"] = get_config()
+            ctx.obj["config_path"] = None
     except ValidationError as e:
         print_error(format_validation_error(e))
         sys.exit(1)
@@ -73,6 +99,7 @@ def ui(ctx: click.Context, port: int | None, host: str | None, reload: bool) -> 
     config: Config = ctx.obj["config"]
     host = host or config.server.host
     port = port or config.server.port
+    _warn_about_unauthenticated_external_bind(config, host)
     print_info(f"Starting Immich Memories UI on http://{host}:{port}")
 
     # Import the app module to register routes and run

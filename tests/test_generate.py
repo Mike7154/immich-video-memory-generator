@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -12,14 +14,100 @@ from immich_memories.config_loader import Config
 from immich_memories.generate import (
     GenerationError,
     GenerationParams,
+    _apply_final_content_budget,
     _build_assembly_settings,
     _report,
     _total_clip_duration,
+    _validate_final_duration,
     assets_to_clips,
 )
 from immich_memories.generate_music import music_config_available
 from immich_memories.generate_privacy import clip_location_name
 from tests.conftest import make_asset, make_clip
+
+
+def _h264_output_plan():
+    from immich_memories.processing.encoding_plan import EncodingPlan, HdrTransfer, OutputCodec
+
+    return EncodingPlan(
+        codec=OutputCodec.H264,
+        encoder="libx264",
+        encoder_args=("-c:v", "libx264"),
+        target_transfer=HdrTransfer.NONE,
+        tone_map_to_sdr=False,
+        pixel_format="yuv420p",
+        container="mp4",
+    )
+
+
+def _final_probe_payload(*, codec: str = "h264") -> dict[str, object]:
+    return {
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": codec,
+                "pix_fmt": "yuv420p",
+                "color_transfer": "bt709",
+                "color_primaries": "bt709",
+                "width": 1920,
+                "height": 1080,
+                "nb_read_frames": "360",
+            }
+        ],
+        "format": {
+            "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+            "duration": "12.0",
+            "size": "4096",
+            "tags": {"major_brand": "isom"},
+        },
+    }
+
+
+def test_cli_generate_passes_configured_api_version_to_client(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from immich_memories.api.compatibility import ApiVersionPolicy
+    from immich_memories.cli import main
+
+    config = Config(
+        immich={
+            "url": "https://immich.example.com",
+            "api_key": "test-api-key",
+            "api_version": "v2",
+        }
+    )
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+
+    with (
+        patch("immich_memories.cli.get_config", return_value=config),
+        patch("immich_memories.api.immich.SyncImmichClient", return_value=client) as client_factory,
+        patch(
+            "immich_memories.cli.generate.fetch_videos_and_live_photos",
+            return_value=([], []),
+        ),
+    ):
+        result = CliRunner().invoke(
+            main,
+            [
+                "generate",
+                "--start",
+                "2025-01-01",
+                "--end",
+                "2025-01-31",
+                "--no-music",
+                "--output",
+                str(tmp_path / "memory.mp4"),
+            ],
+        )
+
+    assert result.exit_code == 1
+    client_factory.assert_called_once_with(
+        base_url="https://immich.example.com",
+        api_key="test-api-key",
+        api_version=ApiVersionPolicy.V2,
+    )
 
 
 class TestGenerationParams:
@@ -55,6 +143,403 @@ class TestGenerationError:
     def test_is_exception(self):
         with pytest.raises(GenerationError, match="test error"):
             raise GenerationError("test error")
+
+
+def test_generation_rejects_artifact_more_than_one_second_over_target(tmp_path: Path) -> None:
+    params = GenerationParams(
+        clips=[make_clip("clip-1")],
+        output_path=tmp_path / "memory.mp4",
+        config=Config(),
+        target_duration_seconds=60.0,
+    )
+
+    with pytest.raises(GenerationError, match="duration budget"):
+        _validate_final_duration(params, 61.1)
+
+
+def test_generation_accepts_one_second_duration_tolerance(tmp_path: Path) -> None:
+    params = GenerationParams(
+        clips=[make_clip("clip-1")],
+        output_path=tmp_path / "memory.mp4",
+        config=Config(),
+        target_duration_seconds=60.0,
+    )
+
+    _validate_final_duration(params, 61.0)
+
+
+def test_generation_accepts_finalized_month_plan_within_soft_maximum(tmp_path: Path) -> None:
+    from immich_memories.processing.timeline_budget import TimelinePlan
+
+    params = GenerationParams(
+        clips=[make_clip("clip-1")],
+        output_path=tmp_path / "memory.mp4",
+        config=Config(),
+        target_duration_seconds=60.0,
+        timeline_plan=TimelinePlan(
+            target_duration=60.0,
+            content_budget=52.5,
+            title_budget=17.5,
+            title_duration=3.5,
+            ending_duration=4.0,
+            divider_duration=2.0,
+            max_dividers=5,
+            divider_policy="all",
+            eligible_dividers=5,
+            soft_max_duration=70.0,
+        ),
+    )
+
+    _validate_final_duration(params, 65.0)
+
+
+def test_generation_rejects_finalized_month_plan_above_soft_tolerance(tmp_path: Path) -> None:
+    from immich_memories.processing.timeline_budget import TimelinePlan
+
+    params = GenerationParams(
+        clips=[make_clip("clip-1")],
+        output_path=tmp_path / "memory.mp4",
+        config=Config(),
+        target_duration_seconds=60.0,
+        timeline_plan=TimelinePlan(
+            60.0,
+            52.5,
+            17.5,
+            3.5,
+            4.0,
+            2.0,
+            5,
+            divider_policy="all",
+            eligible_dividers=5,
+            soft_max_duration=70.0,
+        ),
+    )
+
+    with pytest.raises(GenerationError, match=r"71\.1s > 71\.0s"):
+        _validate_final_duration(params, 71.1)
+
+
+def test_generation_without_dividers_keeps_normal_duration_limit(tmp_path: Path) -> None:
+    from immich_memories.processing.timeline_budget import TimelinePlan
+
+    params = GenerationParams(
+        clips=[make_clip("clip-1")],
+        output_path=tmp_path / "memory.mp4",
+        config=Config(),
+        target_duration_seconds=60.0,
+        timeline_plan=TimelinePlan(
+            60.0,
+            52.5,
+            7.5,
+            3.5,
+            4.0,
+            2.0,
+            0,
+            divider_policy="none",
+            eligible_dividers=5,
+            soft_max_duration=70.0,
+        ),
+    )
+
+    with pytest.raises(GenerationError, match=r"65\.0s > 61\.0s"):
+        _validate_final_duration(params, 65.0)
+
+
+def test_title_settings_consume_the_resolved_timeline_plan(tmp_path: Path) -> None:
+    from immich_memories.generate import _build_title_settings
+    from immich_memories.processing.timeline_budget import TimelinePlan
+
+    params = GenerationParams(
+        clips=[],
+        output_path=tmp_path / "memory.mp4",
+        config=Config(),
+        timeline_plan=TimelinePlan(
+            target_duration=15.0,
+            content_budget=12.0,
+            title_budget=3.0,
+            title_duration=3.0,
+            ending_duration=0.0,
+            divider_duration=2.0,
+            max_dividers=0,
+        ),
+    )
+
+    settings = _build_title_settings(params, params.config, [])
+
+    assert settings is not None
+    assert settings.title_duration == 3.0
+    assert settings.show_ending_screen is False
+    assert settings.max_dividers == 0
+
+
+def test_final_content_budget_trims_all_clips_proportionally(tmp_path: Path) -> None:
+    from immich_memories.processing.assembly_config import AssemblyClip
+    from immich_memories.processing.timeline_budget import TimelinePlan
+
+    params = GenerationParams(
+        clips=[make_clip("clip-1")],
+        output_path=tmp_path / "memory.mp4",
+        config=Config(),
+        target_duration_seconds=15.0,
+        timeline_plan=TimelinePlan(15.0, 12.0, 3.0, 3.0, 0.0, 2.0, 0),
+    )
+    clips = [
+        AssemblyClip(path=tmp_path / f"{index}.mp4", duration=5.0, asset_id=str(index))
+        for index in range(3)
+    ]
+
+    trimmed = _apply_final_content_budget(params, clips)
+
+    assert [clip.duration for clip in trimmed] == [4.0, 4.0, 4.0]
+    assert [clip.asset_id for clip in trimmed] == ["0", "1", "2"]
+
+
+def test_short_budget_keeps_temporal_variety_without_micro_clips(tmp_path: Path) -> None:
+    from immich_memories.processing.assembly_config import AssemblyClip
+    from immich_memories.processing.timeline_budget import TimelinePlan
+
+    params = GenerationParams(
+        clips=[make_clip("clip-1")],
+        output_path=tmp_path / "memory.mp4",
+        config=Config(),
+        target_duration_seconds=15.0,
+        timeline_plan=TimelinePlan(15.0, 12.0, 3.0, 3.0, 0.0, 2.0, 0),
+    )
+    clips = [
+        AssemblyClip(path=tmp_path / f"{index}.mp4", duration=5.0, asset_id=str(index))
+        for index in range(20)
+    ]
+
+    trimmed = _apply_final_content_budget(params, clips)
+
+    assert len(trimmed) == 8
+    assert trimmed[0].asset_id == "0"
+    assert trimmed[-1].asset_id == "19"
+    assert all(clip.duration >= 1.5 for clip in trimmed)
+    assert sum(clip.duration for clip in trimmed) == pytest.approx(12.0)
+
+
+def test_direct_generation_normalizes_staged_and_final_paths_to_plan_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A direct caller's stale suffix cannot override the resolved output contract."""
+    from immich_memories import generate as generate_module
+    from immich_memories.generate import generate_memory
+    from immich_memories.processing import output_contract
+    from immich_memories.processing.assembly_config import AssemblyClip, AssemblySettings
+    from immich_memories.processing.encoding_plan import EncodingPlan, HdrTransfer, OutputCodec
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source-video")
+    assembly_clip = AssemblyClip(path=source, duration=5.0, asset_id="clip-1")
+    config = Config(
+        cache={
+            "directory": str(tmp_path / "cache"),
+            "database": str(tmp_path / "runs.db"),
+        }
+    )
+    phase_events = []
+    params = GenerationParams(
+        clips=[make_clip("clip-1")],
+        output_path=tmp_path / "memory.mp4",
+        config=config,
+        no_music=True,
+        phase_callback=phase_events.append,
+    )
+    assembled_paths: list[Path] = []
+    encoding_plan = EncodingPlan(
+        codec=OutputCodec.PRORES,
+        encoder="prores_ks",
+        encoder_args=("-profile:v", "3"),
+        target_transfer=HdrTransfer.NONE,
+        tone_map_to_sdr=False,
+        pixel_format="yuv422p10le",
+        container="mov",
+    )
+
+    class Assembler:
+        def assemble_with_titles(
+            self,
+            _clips,
+            output_path: Path,
+            _progress_callback,
+            **_kwargs,
+        ) -> Path:
+            assembled_paths.append(output_path)
+            output_path.write_bytes(b"assembled-video")
+            return output_path
+
+    probe_payload = {
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "prores",
+                "pix_fmt": "yuv422p10le",
+                "color_transfer": "bt709",
+                "color_primaries": "bt709",
+                "width": 1920,
+                "height": 1080,
+                "nb_read_frames": "360",
+            }
+        ],
+        "format": {
+            "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+            "duration": "12.0",
+            "size": "4096",
+            "tags": {"major_brand": "qt  "},
+        },
+    }
+
+    def run_probe(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, json.dumps(probe_payload), "")
+
+    def extract_at_download_ownership(*_args, **_kwargs):
+        assert [event.phase.value for event in phase_events] == ["discovery", "download"]
+        assert phase_events[-1].current == 0
+        assert phase_events[-1].total == 1
+        return [assembly_clip]
+
+    monkeypatch.setattr(output_contract.subprocess, "run", run_probe)
+    tracker = MagicMock()
+    video_cache = MagicMock()
+    with (
+        patch("immich_memories.tracking.RunTracker", return_value=tracker),
+        patch(
+            "immich_memories.cache.video_cache.VideoDownloadCache",
+            return_value=video_cache,
+        ),
+        patch.object(
+            generate_module, "_extract_clips", side_effect=extract_at_download_ownership
+        ) as extract_clips,
+        patch.object(
+            generate_module,
+            "_build_assembly_settings",
+            return_value=AssemblySettings(encoding_plan=encoding_plan),
+        ) as build_settings,
+        patch.object(
+            generate_module, "_create_assembler", return_value=Assembler()
+        ) as create_assembler,
+        patch.object(generate_module, "_run_music_phase"),
+        patch.object(generate_module, "_cleanup_temp_clips"),
+    ):
+        result = generate_memory(params)
+
+    assert assembled_paths[0].name == "memory.assembling.mov"
+    assert result.name == "memory.mov"
+    assert result.read_bytes() == b"assembled-video"
+    assert not assembled_paths[0].exists()
+    run_probe_cache = extract_clips.call_args.kwargs["probe_cache"]
+    assert build_settings.call_args.kwargs["probe_cache"] is run_probe_cache
+    assert create_assembler.call_args.kwargs["probe_cache"] is run_probe_cache
+    phase_names = [event.phase.value for event in phase_events]
+    assert list(dict.fromkeys(phase_names)) == [
+        "discovery",
+        "download",
+        "analysis",
+        "selection",
+        "render",
+        "music",
+        "delivery",
+        "complete",
+    ]
+    assert [event.phase.order for event in phase_events] == sorted(
+        event.phase.order for event in phase_events
+    )
+    assert phase_events[1].current == 0
+    assert phase_events[1].total == 1
+    assert next(event for event in phase_events if event.phase.value == "music").message == (
+        "Music disabled"
+    )
+    assert next(event for event in phase_events if event.phase.value == "delivery").message == (
+        "Delivery not requested"
+    )
+    render_messages = [event.message for event in phase_events if event.phase.value == "render"]
+    assert render_messages == ["Rendering memory", "Render complete"]
+    tracker.complete_phase.assert_any_call(
+        items_processed=1,
+        extra_metrics={
+            "output_width": 1920,
+            "output_height": 1080,
+            "codec": "prores",
+            "encoder": "prores_ks",
+            "crf": 18,
+            "encoder_args": ["-profile:v", "3"],
+            "planned_pixel_format": "yuv422p10le",
+            "output_pixel_format": "yuv422p10le",
+            "target_transfer": "none",
+        },
+    )
+
+
+def test_generation_validation_failure_preserves_old_final_and_stops_downstream_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invalid assembly must fail before music, upload, or successful run completion."""
+    from immich_memories import generate as generate_module
+    from immich_memories.generate import generate_memory
+    from immich_memories.processing import output_contract
+    from immich_memories.processing.assembly_config import AssemblyClip, AssemblySettings
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source-video")
+    assembly_clip = AssemblyClip(path=source, duration=5.0, asset_id="clip-1")
+    config = Config(
+        cache={"directory": str(tmp_path / "cache"), "database": str(tmp_path / "runs.db")}
+    )
+    client = MagicMock()
+    params = GenerationParams(
+        clips=[make_clip("clip-1")],
+        output_path=tmp_path / "memory.mp4",
+        config=config,
+        client=client,
+        no_music=True,
+        upload_enabled=True,
+    )
+    run_output_dir = tmp_path / "memory_fixed-run"
+    run_output_dir.mkdir()
+    old_final = run_output_dir / "memory.mp4"
+    old_final.write_bytes(b"previous-valid-memory")
+
+    class WrongCodecAssembler:
+        def assemble_with_titles(self, _clips, output_path: Path, _callback, **_kwargs) -> Path:
+            output_path.write_bytes(b"new-wrong-codec")
+            return output_path
+
+    def run_probe(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command, 0, json.dumps(_final_probe_payload(codec="hevc")), ""
+        )
+
+    monkeypatch.setattr(output_contract.subprocess, "run", run_probe)
+    tracker = MagicMock()
+    tracker.db.get_run.return_value.status = "running"
+    music_phase = MagicMock()
+    upload = MagicMock()
+    with (
+        pytest.raises(GenerationError, match="expected h264, got hevc"),
+        patch("immich_memories.tracking.generate_run_id", return_value="fixed-run"),
+        patch("immich_memories.tracking.RunTracker", return_value=tracker),
+        patch("immich_memories.cache.video_cache.VideoDownloadCache", return_value=MagicMock()),
+        patch.object(generate_module, "_extract_clips", return_value=[assembly_clip]),
+        patch.object(
+            generate_module,
+            "_build_assembly_settings",
+            return_value=AssemblySettings(encoding_plan=_h264_output_plan()),
+        ),
+        patch.object(generate_module, "_create_assembler", return_value=WrongCodecAssembler()),
+        patch.object(generate_module, "_run_music_phase", music_phase),
+        patch.object(generate_module, "_upload_to_immich", upload),
+        patch.object(generate_module, "_cleanup_temp_clips"),
+    ):
+        generate_memory(params)
+
+    assert old_final.read_bytes() == b"previous-valid-memory"
+    assert (run_output_dir / "memory.assembling.mp4").exists()
+    music_phase.assert_not_called()
+    upload.assert_not_called()
+    tracker.complete_artifact.assert_not_called()
+    tracker.complete_run.assert_not_called()
+    tracker.fail_run.assert_called_once()
 
 
 class TestBuildAssemblySettings:
@@ -108,8 +593,8 @@ class TestBuildAssemblySettings:
         assert settings.auto_resolution is False
         assert settings.target_resolution == (1920, 1080)
 
-    def test_explicit_auto_enables_auto_detection(self):
-        """When output_resolution is 'auto', enable source-based auto-detection."""
+    def test_explicit_auto_resolves_before_assembly(self):
+        """Auto resolution is frozen before photo/title intermediates are rendered."""
         params = GenerationParams(
             clips=[],
             output_path=Path("/tmp/out.mp4"),
@@ -117,8 +602,8 @@ class TestBuildAssemblySettings:
             output_resolution="auto",
         )
         settings = _build_assembly_settings(params, [])
-        assert settings.auto_resolution is True
-        assert settings.target_resolution is None
+        assert settings.auto_resolution is False
+        assert settings.target_resolution == (1920, 1080)
 
     def test_no_resolution_uses_config_720p(self):
         """Config default of 720p is respected when no CLI flag given."""
@@ -293,8 +778,9 @@ class TestAutoMusicGeneration:
 
         # WHY: mock the async music generation to avoid real API calls
         with patch(
-            "immich_memories.generate_music.asyncio.run",
-        ) as mock_run:
+            "immich_memories.audio.music_generator.generate_music_for_video",
+            new_callable=AsyncMock,
+        ) as mock_generate:
             from immich_memories.audio.music_generator_models import (
                 GeneratedMusic,
                 MusicGenerationResult,
@@ -303,7 +789,7 @@ class TestAutoMusicGeneration:
 
             fake_music_path = tmp_path / "music.wav"
             fake_music_path.write_bytes(b"fake audio")
-            mock_run.return_value = MusicGenerationResult(
+            mock_generate.return_value = MusicGenerationResult(
                 versions=[
                     GeneratedMusic(
                         version_id=0,
@@ -343,8 +829,8 @@ class TestAutoMusicGeneration:
         )
         assert result is None
 
-    def test_auto_music_returns_none_on_failure(self, tmp_path):
-        """If music generation fails, return None instead of crashing."""
+    def test_auto_music_propagates_backend_failure_to_optional_phase(self, tmp_path):
+        """Backend failures reach the optional phase boundary for sanitization."""
         from immich_memories.generate_music import auto_generate_music
         from immich_memories.processing.assembly_config import AssemblyClip
 
@@ -361,14 +847,17 @@ class TestAutoMusicGeneration:
         )
 
         # WHY: mock to simulate API failure
-        with patch(
-            "immich_memories.generate_music.asyncio.run",
-            side_effect=RuntimeError("API unreachable"),
+        with (
+            patch(
+                "immich_memories.audio.music_generator.generate_music_for_video",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("API unreachable"),
+            ),
+            pytest.raises(RuntimeError, match="API unreachable"),
         ):
-            result = auto_generate_music(
+            auto_generate_music(
                 params.config, assembly_clips, tmp_path / "run_output", params.memory_type
             )
-            assert result is None
 
 
 class TestClipLocationName:
@@ -498,62 +987,32 @@ class TestQuietModeProgressCallback:
 
 
 class TestApplyMusicFileAtomic:
-    """_apply_music_file must use atomic replace for crash-safe swap."""
+    """Music staging must match the immutable encoding contract."""
 
-    def test_replaces_video_with_mixed_output(self, tmp_path):
-        """After mixing, video_path has mixed content and no temp file remains."""
+    def test_rejects_video_suffix_that_disagrees_with_plan(self, tmp_path):
+        """Music mixing must not conceal a stale container from a direct caller."""
         from immich_memories.generate_music import apply_music_file
+        from immich_memories.processing.encoding_plan import EncodingPlan, HdrTransfer, OutputCodec
 
         video = tmp_path / "output.mp4"
         music = tmp_path / "music.wav"
         video.write_bytes(b"original video")
         music.write_bytes(b"music data")
-
-        # WHY: mock the audio mixer to avoid real FFmpeg — we only test the file swap
-        with patch(
-            "immich_memories.audio.mixer.mix_audio_with_ducking",
-        ) as mock_mix:
-
-            def fake_mix(video_path, music_path, output_path, config):
-                output_path.write_bytes(b"mixed video")
-
-            mock_mix.side_effect = fake_mix
-
-            apply_music_file(video, music, volume=0.8)
-
-        assert video.read_bytes() == b"mixed video"
-        assert not (tmp_path / "output.with_music.mp4").exists()
-
-    def test_does_not_unlink_original_before_swap(self, tmp_path):
-        """Crash-safety: must not unlink() then rename() — use replace() instead."""
-        from immich_memories.generate_music import apply_music_file
-
-        video = tmp_path / "output.mp4"
-        music = tmp_path / "music.wav"
-        video.write_bytes(b"original video")
-        music.write_bytes(b"music data")
-
-        unlink_calls: list[Path] = []
-        original_unlink = Path.unlink
-
-        def tracking_unlink(self, missing_ok=False):
-            unlink_calls.append(self)
-            return original_unlink(self, missing_ok=missing_ok)
-
-        # WHY: mock the audio mixer to avoid real FFmpeg — we only test the swap
-        with (
-            patch("immich_memories.audio.mixer.mix_audio_with_ducking") as mock_mix,
-            patch.object(Path, "unlink", tracking_unlink),
-        ):
-
-            def fake_mix(video_path, music_path, output_path, config):
-                output_path.write_bytes(b"mixed video")
-
-            mock_mix.side_effect = fake_mix
-
-            apply_music_file(video, music, volume=0.8)
-
-        # The original video path must NOT appear in unlink calls
-        assert video not in unlink_calls, (
-            "Original video was unlinked before swap — use Path.replace() for crash-safety"
+        plan = EncodingPlan(
+            codec=OutputCodec.PRORES,
+            encoder="prores_ks",
+            encoder_args=("-profile:v", "3"),
+            target_transfer=HdrTransfer.NONE,
+            tone_map_to_sdr=False,
+            pixel_format="yuv422p10le",
+            container="mov",
         )
+
+        with (
+            patch("immich_memories.audio.mixer.mix_audio_with_ducking") as mix,
+            pytest.raises(ValueError, match="does not match encoding plan container"),
+        ):
+            apply_music_file(video, music, volume=0.8, encoding_plan=plan)
+
+        mix.assert_not_called()
+        assert video.read_bytes() == b"original video"

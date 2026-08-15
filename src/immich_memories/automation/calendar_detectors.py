@@ -9,15 +9,20 @@ from __future__ import annotations
 import calendar
 from datetime import date
 
-from immich_memories.automation.candidates import MemoryCandidate, make_memory_key
+from immich_memories.automation.candidates import (
+    CandidateCategory,
+    MemoryCandidate,
+    make_memory_key,
+)
 from immich_memories.config_loader import Config
 from immich_memories.i18n import get_ordinal
+from immich_memories.timeperiod import birthday_year
 
 
 class MonthlyDetector:
-    """Proposes monthly highlight memories for recent un-generated months."""
+    """Proposes a monthly highlight for the latest completed month only."""
 
-    LOOKBACK_MONTHS = 6
+    LOOKBACK_MONTHS = 1
     BASE_SCORE = 0.7
 
     def detect(
@@ -58,6 +63,7 @@ class MonthlyDetector:
             candidates.append(
                 MemoryCandidate(
                     memory_type="monthly_highlights",
+                    category=CandidateCategory.MONTHLY_REVIEW,
                     date_range_start=start,
                     date_range_end=end,
                     person_names=[],
@@ -116,6 +122,7 @@ class YearlyDetector:
             candidates.append(
                 MemoryCandidate(
                     memory_type="year_in_review",
+                    category=CandidateCategory.YEAR_IN_REVIEW,
                     date_range_start=start,
                     date_range_end=end,
                     person_names=[],
@@ -189,6 +196,7 @@ class PersonSpotlightDetector:
             candidates.append(
                 MemoryCandidate(
                     memory_type="person_spotlight",
+                    category=CandidateCategory.PERSON_SPOTLIGHT,
                     date_range_start=start,
                     date_range_end=end,
                     person_names=[person.name],
@@ -247,6 +255,7 @@ class OnThisDayDetector:
         return [
             MemoryCandidate(
                 memory_type="on_this_day",
+                category=CandidateCategory.ON_THIS_DAY,
                 date_range_start=date(today.year, today.month, today.day),
                 date_range_end=date(today.year, today.month, today.day),
                 person_names=[],
@@ -287,14 +296,16 @@ class BirthdayDetector:
 
             bday = person.birth_date
             # WHY: 2-day minimum buffer after birthday to let photo sync happen
-            this_year_bday = date(today.year, bday.month, bday.day)
-            days_since = (today - this_year_bday).days
+            most_recent_bday = birthday_year(bday, today.year).start.date()
+            if most_recent_bday > today:
+                most_recent_bday = birthday_year(bday, today.year - 1).start.date()
+            days_since = (today - most_recent_bday).days
             if days_since < 2 or days_since > self.WINDOW_DAYS:
                 continue
 
-            target_year = today.year - 1
-            start = date(target_year, 1, 1)
-            end = date(target_year, 12, 31)
+            completed_birthday_year = birthday_year(bday, most_recent_bday.year - 1)
+            start = completed_birthday_year.start.date()
+            end = completed_birthday_year.end.date()
             name_lower = person.name.lower()
             mem_key = make_memory_key("person_spotlight", start, end, [name_lower])
 
@@ -302,7 +313,7 @@ class BirthdayDetector:
                 continue
 
             asset_count = counts.get(person.id, 0)
-            age = today.year - bday.year
+            age = most_recent_bday.year - bday.year
             reason = (
                 f"Birthday ({age} years old), {asset_count} assets"
                 if asset_count
@@ -312,6 +323,7 @@ class BirthdayDetector:
             candidates.append(
                 MemoryCandidate(
                     memory_type="person_spotlight",
+                    category=CandidateCategory.BIRTHDAY,
                     date_range_start=start,
                     date_range_end=end,
                     person_names=[person.name],

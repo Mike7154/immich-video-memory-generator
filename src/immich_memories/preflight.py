@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 from dataclasses import dataclass
 from enum import Enum
 
 import httpx
 
+from immich_memories.analysis.provider_health import (
+    ProviderHealth,
+    ProviderState,
+    classify_openai_response,
+)
+from immich_memories.api.compatibility import UnsupportedImmichVersion
 from immich_memories.config import Config
+from immich_memories.security import sanitize_error_message
 
 logger = logging.getLogger(__name__)
 
@@ -57,26 +65,52 @@ def check_immich(config: Config) -> CheckResult:
             details="Set immich.api_key in config or IMMICH_MEMORIES_IMMICH__API_KEY env var",
         )
 
-    try:
-        from immich_memories.api.immich import SyncImmichClient
+    from immich_memories.api.immich import ImmichAPIError, SyncImmichClient
 
+    try:
         with SyncImmichClient(
             base_url=config.immich.url,
             api_key=config.immich.api_key,
+            api_version=config.immich.api_version,
         ) as client:
+            resolved_version = client.get_api_version()
             user = client.get_current_user()
             return CheckResult(
                 name="Immich",
                 status=CheckStatus.OK,
                 message=f"Connected as {user.name or user.email}",
-                details=f"Server: {config.immich.url}",
+                details=f"Server: {config.immich.url}; API: {resolved_version.value}",
             )
+    except UnsupportedImmichVersion as e:
+        safe_message = sanitize_error_message(str(e)).replace(config.immich.api_key, "***")
+        return CheckResult(
+            name="Immich",
+            status=CheckStatus.ERROR,
+            message="Unsupported Immich version",
+            details=safe_message,
+        )
+    except ImmichAPIError as e:
+        safe_message = sanitize_error_message(str(e)).replace(config.immich.api_key, "***")
+        diagnostics = [safe_message]
+        if e.status_code is not None:
+            diagnostics.append(f"HTTP {e.status_code}")
+        if e.correlation_id:
+            safe_correlation = sanitize_error_message(e.correlation_id).replace(
+                config.immich.api_key, "***"
+            )
+            diagnostics.append(f"Correlation ID: {safe_correlation}")
+        return CheckResult(
+            name="Immich",
+            status=CheckStatus.ERROR,
+            message="Connection failed",
+            details="; ".join(diagnostics),
+        )
     except (httpx.TimeoutException, httpx.HTTPStatusError, OSError) as e:
         return CheckResult(
             name="Immich",
             status=CheckStatus.ERROR,
             message="Connection failed",
-            details=str(e),
+            details=sanitize_error_message(str(e)).replace(config.immich.api_key, "***"),
         )
 
 
@@ -115,7 +149,7 @@ def _check_ollama(base_url: str, model: str) -> CheckResult:
                 name="LLM",
                 status=CheckStatus.OK,
                 message=f"Connected (ollama, {len(models)} models)",
-                details=f"Server: {base_url}, Model: {model}",
+                details=f"Model: {model}",
             )
 
     except httpx.ConnectError:
@@ -123,15 +157,48 @@ def _check_ollama(base_url: str, model: str) -> CheckResult:
             name="LLM",
             status=CheckStatus.WARNING,
             message="Cannot connect",
-            details=f"Server not reachable at {base_url}",
+            details="Check the configured LLM base URL and that Ollama is running",
         )
     except (httpx.TimeoutException, httpx.HTTPStatusError, OSError) as e:
         return CheckResult(
             name="LLM",
             status=CheckStatus.WARNING,
             message="Connection error",
-            details=str(e),
+            details=type(e).__name__,
         )
+
+
+def _openai_health_failure(health: ProviderHealth, model: str) -> CheckResult | None:
+    """Translate provider health into a safe, actionable preflight failure."""
+    if health.state is ProviderState.AUTH_FAILED:
+        return CheckResult(
+            name="LLM",
+            status=CheckStatus.ERROR,
+            message="Authentication failed",
+            details="The configured API key was rejected",
+        )
+    if health.state is ProviderState.MODEL_MISSING:
+        return CheckResult(
+            name="LLM",
+            status=CheckStatus.WARNING,
+            message=f"Configured model unavailable: {model}",
+            details=f"Model: {model}",
+        )
+    if health.state is ProviderState.ROUTE_MISSING:
+        return CheckResult(
+            name="LLM",
+            status=CheckStatus.WARNING,
+            message="Chat-completions route unavailable",
+            details="Check that the configured base URL exposes /chat/completions",
+        )
+    if health.available:
+        return None
+    return CheckResult(
+        name="LLM",
+        status=CheckStatus.WARNING,
+        message=health.message,
+        details="Check the configured LLM provider",
+    )
 
 
 def _check_openai_compatible(base_url: str, model: str, api_key: str) -> CheckResult:
@@ -161,20 +228,19 @@ def _check_openai_compatible(base_url: str, model: str, api_key: str) -> CheckRe
                 json=payload,
             )
 
-            if response.status_code == 401:
-                return CheckResult(
-                    name="LLM",
-                    status=CheckStatus.ERROR,
-                    message="Authentication failed",
-                    details=f"API key rejected by {base_url}",
-                )
+            try:
+                response_body = response.json()
+            except ValueError:
+                response_body = {}
+            health = classify_openai_response(response.status_code, response_body, model)
+            if failure := _openai_health_failure(health, model):
+                return failure
 
-            response.raise_for_status()
             return CheckResult(
                 name="LLM",
                 status=CheckStatus.OK,
                 message="Connected (openai-compatible)",
-                details=f"Server: {base_url}, Model: {model}",
+                details=f"Model: {model}",
             )
 
     except httpx.ConnectError:
@@ -182,14 +248,14 @@ def _check_openai_compatible(base_url: str, model: str, api_key: str) -> CheckRe
             name="LLM",
             status=CheckStatus.WARNING,
             message="Cannot connect",
-            details=f"Server not reachable at {base_url}",
+            details="Check the configured LLM base URL and provider availability",
         )
     except (httpx.TimeoutException, httpx.HTTPStatusError, OSError) as e:
         return CheckResult(
             name="LLM",
             status=CheckStatus.WARNING,
             message="Connection error",
-            details=str(e),
+            details=type(e).__name__,
         )
 
 
@@ -276,6 +342,40 @@ def check_hardware() -> CheckResult:
         )
 
 
+def check_audio_content(config: Config) -> CheckResult:
+    """Report semantic-audio capability without importing Torch or loading a model."""
+    audio = config.audio_content
+    if not audio.enabled:
+        return CheckResult(
+            name="Audio content",
+            status=CheckStatus.SKIPPED,
+            message="Audio-content analysis disabled",
+        )
+    if not audio.use_panns:
+        return CheckResult(
+            name="Audio content",
+            status=CheckStatus.OK,
+            message="Energy-only audio analysis enabled",
+            details="Semantic labels such as laughter and speech are unavailable",
+        )
+    if (
+        importlib.util.find_spec("torch") is not None
+        and importlib.util.find_spec("panns_inference") is not None
+    ):
+        return CheckResult(
+            name="Audio content",
+            status=CheckStatus.OK,
+            message="Semantic PANNs audio classification ready",
+            details="Laughter, baby, speech, music, and other AudioSet labels are available",
+        )
+    return CheckResult(
+        name="Audio content",
+        status=CheckStatus.WARNING,
+        message="PANNs unavailable; using energy-only fallback",
+        details="Install the audio-ml extra for semantic laughter, baby, speech, and music labels",
+    )
+
+
 def run_preflight_checks(config: Config) -> list[CheckResult]:
     """Run all preflight checks.
 
@@ -288,5 +388,63 @@ def run_preflight_checks(config: Config) -> list[CheckResult]:
     return [
         check_immich(config),
         check_llm(config),
+        check_audio_content(config),
+        check_notifications(config),
         check_hardware(),
     ]
+
+
+def check_notifications(config: Config) -> CheckResult:
+    """Report optional durable notification health without probing provider URLs."""
+    if not config.notifications.enabled:
+        return CheckResult(
+            name="Notifications",
+            status=CheckStatus.SKIPPED,
+            message="Notifications disabled",
+        )
+    if not config.notifications.urls:
+        return CheckResult(
+            name="Notifications",
+            status=CheckStatus.WARNING,
+            message="No notification URLs configured",
+        )
+
+    from immich_memories.automation.notification_state import NotificationStateStore
+
+    try:
+        health = NotificationStateStore(config.cache.database_path).get()
+    except Exception:  # WHY: optional health telemetry cannot fail provider preflight
+        return CheckResult(
+            name="Notifications",
+            status=CheckStatus.WARNING,
+            message="Notification health unavailable",
+        )
+    if health is None:
+        return CheckResult(
+            name="Notifications",
+            status=CheckStatus.OK,
+            message="Configured; no delivery attempted yet",
+        )
+    if health.is_cooling_down(config.notifications.cooldown_hours):
+        category = health.failure_category.value if health.failure_category else "delivery"
+        return CheckResult(
+            name="Notifications",
+            status=CheckStatus.WARNING,
+            message=f"Delivery paused after {category} failure",
+            details=f"Normal attempts resume after the {config.notifications.cooldown_hours}h cooldown",
+        )
+    if health.last_success_at is not None and (
+        health.last_failure_at is None or health.last_success_at >= health.last_failure_at
+    ):
+        return CheckResult(
+            name="Notifications",
+            status=CheckStatus.OK,
+            message="Last notification delivered successfully",
+            details=f"Last success: {health.last_success_at.isoformat()}",
+        )
+    return CheckResult(
+        name="Notifications",
+        status=CheckStatus.WARNING,
+        message="Previous notification delivery failed",
+        details="Cooldown expired; run auto test-notification to verify recovery",
+    )

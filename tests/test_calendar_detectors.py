@@ -6,22 +6,34 @@ from datetime import date
 from unittest.mock import MagicMock
 
 from immich_memories.automation.calendar_detectors import (
+    BirthdayDetector,
     MonthlyDetector,
+    OnThisDayDetector,
     PersonSpotlightDetector,
     YearlyDetector,
 )
-from immich_memories.automation.candidates import MemoryCandidate, make_memory_key
+from immich_memories.automation.candidates import (
+    CandidateCategory,
+    MemoryCandidate,
+    make_memory_key,
+)
 
 
 def _make_config():
     return MagicMock()
 
 
-def _make_person(name: str, *, thumbnail: str | None = "/thumb.jpg") -> MagicMock:
+def _make_person(
+    name: str,
+    *,
+    thumbnail: str | None = "/thumb.jpg",
+    birth_date: date | None = None,
+) -> MagicMock:
     p = MagicMock()
     p.name = name
     p.thumbnail_path = thumbnail
     p.id = f"id-{name.lower()}"
+    p.birth_date = birth_date
     return p
 
 
@@ -29,16 +41,17 @@ def _make_person(name: str, *, thumbnail: str | None = "/thumb.jpg") -> MagicMoc
 # MonthlyDetector
 # ---------------------------------------------------------------------------
 class TestMonthlyDetector:
-    def test_produces_candidates_for_ungenerated_months(self):
+    def test_produces_candidate_for_latest_completed_month(self):
         today = date(2026, 3, 15)
         assets = {"2026-02": 50, "2026-01": 30, "2025-12": 20}
         detector = MonthlyDetector()
 
         result = detector.detect(assets, [], set(), _make_config(), today)
 
-        assert len(result) == 3
+        assert len(result) == 1
         assert all(isinstance(c, MemoryCandidate) for c in result)
         assert result[0].memory_type == "monthly_highlights"
+        assert result[0].category is CandidateCategory.MONTHLY_REVIEW
         assert result[0].date_range_start == date(2026, 2, 1)
         assert result[0].date_range_end == date(2026, 2, 28)
         assert result[0].asset_count == 50
@@ -50,8 +63,7 @@ class TestMonthlyDetector:
 
         result = MonthlyDetector().detect(assets, [], {feb_key}, _make_config(), today)
 
-        assert len(result) == 1
-        assert result[0].date_range_start == date(2026, 1, 1)
+        assert result == []
 
     def test_handles_empty_assets(self):
         result = MonthlyDetector().detect({}, [], set(), _make_config(), date(2026, 3, 1))
@@ -67,7 +79,7 @@ class TestMonthlyDetector:
         assert len(result) == 1
         assert result[0].date_range_start == date(2026, 2, 1)
 
-    def test_recent_months_score_higher(self):
+    def test_does_not_emit_older_monthly_backlog(self):
         today = date(2026, 6, 15)
         assets = {
             "2026-05": 10,
@@ -80,11 +92,8 @@ class TestMonthlyDetector:
 
         result = MonthlyDetector().detect(assets, [], set(), _make_config(), today)
 
-        assert len(result) == 6
-        scores = [c.score for c in result]
-        # Scores should be monotonically decreasing
-        assert scores == sorted(scores, reverse=True)
-        assert scores[0] > scores[-1]
+        assert len(result) == 1
+        assert result[0].date_range_start == date(2026, 5, 1)
 
     def test_most_recent_month_gets_special_reason(self):
         today = date(2026, 3, 15)
@@ -92,8 +101,8 @@ class TestMonthlyDetector:
 
         result = MonthlyDetector().detect(assets, [], set(), _make_config(), today)
 
+        assert len(result) == 1
         assert "most recent month" in result[0].reason
-        assert "never generated" in result[1].reason
 
     def test_handles_year_boundary(self):
         """January should look back into prior year's months."""
@@ -127,6 +136,7 @@ class TestYearlyDetector:
 
         assert len(result) == 1
         assert result[0].memory_type == "year_in_review"
+        assert result[0].category is CandidateCategory.YEAR_IN_REVIEW
         assert result[0].date_range_start == date(2025, 1, 1)
         assert result[0].date_range_end == date(2025, 12, 31)
         assert result[0].asset_count == 60
@@ -202,6 +212,7 @@ class TestPersonSpotlightDetector:
 
         assert len(result) == 3
         assert result[0].memory_type == "person_spotlight"
+        assert result[0].category is CandidateCategory.PERSON_SPOTLIGHT
         assert result[0].person_names == ["Alice"]
         assert result[0].date_range_start == date(2025, 1, 1)
         assert result[0].date_range_end == date(2025, 12, 31)
@@ -217,6 +228,90 @@ class TestPersonSpotlightDetector:
 
         assert len(result) == 1
         assert result[0].person_names == ["Bob"]
+
+
+# ---------------------------------------------------------------------------
+# OnThisDayDetector
+# ---------------------------------------------------------------------------
+class TestOnThisDayDetector:
+    def test_produces_on_this_day_category(self):
+        today = date(2026, 3, 15)
+        assets = {f"{year}-03": 10 for year in range(2021, 2026)}
+
+        result = OnThisDayDetector().detect(assets, [], set(), _make_config(), today)
+
+        assert len(result) == 1
+        assert result[0].memory_type == "on_this_day"
+        assert result[0].category is CandidateCategory.ON_THIS_DAY
+
+
+# ---------------------------------------------------------------------------
+# BirthdayDetector
+# ---------------------------------------------------------------------------
+class TestBirthdayDetector:
+    def test_uses_just_completed_birthday_year_and_exact_memory_key(self):
+        person = _make_person("Alice", birth_date=date(2000, 3, 1))
+
+        result = BirthdayDetector().detect(
+            {},
+            [person],
+            set(),
+            _make_config(),
+            date(2026, 3, 10),
+            person_asset_counts={person.id: 100},
+        )
+
+        assert len(result) == 1
+        assert result[0].memory_type == "person_spotlight"
+        assert result[0].category is CandidateCategory.BIRTHDAY
+        assert result[0].date_range_start == date(2025, 3, 1)
+        assert result[0].date_range_end == date(2026, 2, 28)
+        assert result[0].memory_key == make_memory_key(
+            "person_spotlight",
+            date(2025, 3, 1),
+            date(2026, 2, 28),
+            ["alice"],
+        )
+
+    def test_uses_existing_leap_day_birthday_rule(self):
+        person = _make_person("Leap", birth_date=date(2000, 2, 29))
+
+        result = BirthdayDetector().detect(
+            {},
+            [person],
+            set(),
+            _make_config(),
+            date(2025, 3, 10),
+            person_asset_counts={person.id: 50},
+        )
+
+        assert len(result) == 1
+        assert result[0].date_range_start == date(2024, 2, 29)
+        assert result[0].date_range_end == date(2025, 2, 27)
+
+    def test_uses_previous_year_occurrence_just_after_new_year(self):
+        person = _make_person("New Year Eve", birth_date=date(2000, 12, 31))
+
+        result = BirthdayDetector().detect(
+            {},
+            [person],
+            set(),
+            _make_config(),
+            date(2026, 1, 2),
+            person_asset_counts={person.id: 75},
+        )
+
+        assert len(result) == 1
+        candidate = result[0]
+        assert candidate.date_range_start == date(2024, 12, 31)
+        assert candidate.date_range_end == date(2025, 12, 30)
+        assert candidate.memory_key == make_memory_key(
+            "person_spotlight",
+            date(2024, 12, 31),
+            date(2025, 12, 30),
+            ["new year eve"],
+        )
+        assert "25 years old" in candidate.reason
 
     def test_handles_no_people(self):
         result = PersonSpotlightDetector().detect({}, [], set(), _make_config(), date(2026, 3, 1))

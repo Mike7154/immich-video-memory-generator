@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
+
+from immich_memories.processing.assembly_config import AssemblyClip, AssemblySettings
+from immich_memories.processing.encoding_plan import EncodingPlan, HdrTransfer, OutputCodec
 
 
 class TestDetectHdrType:
@@ -165,6 +171,62 @@ class TestDetectColorPrimaries:
 class TestHdrConversionFilter:
     """Test that SDR→HLG conversion uses correct zscale parameters."""
 
+    @pytest.mark.parametrize(
+        ("source_transfer", "target_transfer"),
+        [
+            (None, "sdr"),
+            ("none", "sdr"),
+            ("sdr", "sdr"),
+            ("hlg", "hlg"),
+            ("pq", "pq"),
+        ],
+    )
+    def test_exact_normalized_transfer_does_not_probe_zscale(
+        self,
+        source_transfer: str | None,
+        target_transfer: str,
+    ) -> None:
+        """An exact transfer path must not require or even probe zscale."""
+        from immich_memories.processing.hdr_utilities import _get_hdr_conversion_filter
+
+        with patch(
+            "immich_memories.processing.hdr_utilities._check_zscale_available",
+            side_effect=AssertionError("exact transfer must not probe zscale"),
+        ):
+            result = _get_hdr_conversion_filter(
+                source_transfer,
+                target_transfer,
+                required=True,
+            )
+
+        assert result == ""
+
+    @pytest.mark.parametrize(
+        ("source_type", "target_type"),
+        [
+            (None, "hlg"),
+            (None, "pq"),
+            ("hlg", "pq"),
+            ("pq", "hlg"),
+            ("hlg", "sdr"),
+            ("pq", "sdr"),
+        ],
+    )
+    def test_required_transfer_conversion_fails_without_zscale(
+        self, source_type: str | None, target_type: str
+    ) -> None:
+        """Missing zscale must abort instead of attaching false target metadata."""
+        from immich_memories.processing.hdr_utilities import _get_hdr_conversion_filter
+
+        with (
+            patch(
+                "immich_memories.processing.hdr_utilities._check_zscale_available",
+                return_value=False,
+            ),
+            pytest.raises(RuntimeError, match="zscale"),
+        ):
+            _get_hdr_conversion_filter(source_type, target_type)
+
     def test_sdr_to_hlg_default_bt709_primaries(self):
         """Default SDR→HLG conversion should use bt709 primaries."""
         from immich_memories.processing.hdr_utilities import _get_hdr_conversion_filter
@@ -212,3 +274,217 @@ class TestHdrConversionFilter:
 
         assert "pin=bt2020" in result
         assert "npl=203" in result
+
+    def test_h264_plan_tone_maps_hlg_input_to_sdr(self):
+        """Explicit H.264/SDR output must tone-map an HDR source before encoding."""
+        from immich_memories.processing.assembly_engine import create_assembly_context
+        from immich_memories.processing.filter_builder import FilterBuilder
+
+        plan = EncodingPlan(
+            codec=OutputCodec.H264,
+            encoder="libx264",
+            encoder_args=("-preset", "medium", "-crf", "18"),
+            target_transfer=HdrTransfer.NONE,
+            tone_map_to_sdr=True,
+            pixel_format="yuv420p",
+            container="mp4",
+        )
+        settings = AssemblySettings(encoding_plan=plan)
+        prober = MagicMock()
+        prober.detect_max_framerate.return_value = 30
+        clip = AssemblyClip(path=Path("/tmp/hlg.mp4"), duration=5.0)
+
+        with (
+            patch(
+                "immich_memories.processing.assembly_engine._get_clip_hdr_types",
+                return_value=["hlg"],
+            ),
+            patch(
+                "immich_memories.processing.assembly_engine._detect_color_primaries",
+                return_value="bt2020",
+            ),
+            patch(
+                "immich_memories.processing.hdr_utilities._check_zscale_available",
+                return_value=True,
+            ),
+        ):
+            context = create_assembly_context(settings, prober, [clip], 1920, 1080)
+            conversion = FilterBuilder(
+                settings, prober, lambda _path: None
+            ).get_clip_hdr_conversion(0, context)
+
+        assert context.hdr_type == "sdr"
+        assert context.pix_fmt == "yuv420p"
+        assert "setparams=colorspace=bt709" in context.colorspace_filter
+        assert "color_primaries=bt709" in context.colorspace_filter
+        assert "color_trc=bt709" in context.colorspace_filter
+        assert "zscale=t=linear" in conversion
+        assert "tonemap=" in conversion
+        assert "zscale=t=bt709" in conversion
+
+    def test_standalone_sdr_context_probes_actual_hdr_before_multi_clip_assembly(self):
+        """A plan without provenance must still discover HDR before building the graph."""
+        from immich_memories.processing.assembly_engine import create_assembly_context
+        from immich_memories.processing.filter_builder import FilterBuilder
+
+        plan = EncodingPlan(
+            codec=OutputCodec.H264,
+            encoder="libx264",
+            encoder_args=("-preset", "medium", "-crf", "18"),
+            target_transfer=HdrTransfer.NONE,
+            tone_map_to_sdr=False,
+            pixel_format="yuv420p",
+            container="mp4",
+        )
+        settings = AssemblySettings(encoding_plan=plan)
+        prober = MagicMock()
+        prober.detect_max_framerate.return_value = 30
+        clips = [
+            AssemblyClip(path=Path("/tmp/hlg.mp4"), duration=5.0),
+            AssemblyClip(path=Path("/tmp/sdr.mp4"), duration=5.0),
+        ]
+
+        with (
+            patch(
+                "immich_memories.processing.assembly_engine._get_clip_hdr_types",
+                return_value=["hlg", None],
+            ) as detect_transfers,
+            patch(
+                "immich_memories.processing.hdr_utilities._check_zscale_available",
+                return_value=True,
+            ),
+        ):
+            context = create_assembly_context(settings, prober, clips, 1920, 1080)
+            conversion = FilterBuilder(
+                settings, prober, lambda _path: None
+            ).get_clip_hdr_conversion(0, context)
+
+        detect_transfers.assert_called_once_with(clips)
+        assert context.clip_hdr_types == ["hlg", None]
+        assert "zscale=t=linear:tin=arib-std-b67" in conversion
+        assert "tonemap=" in conversion
+
+    def test_filter_builder_fails_when_required_transfer_conversion_is_unavailable(self):
+        """The normal assembly path must not relabel HLG pixels as PQ."""
+        from immich_memories.processing.assembly_engine import create_assembly_context
+        from immich_memories.processing.filter_builder import FilterBuilder
+        from immich_memories.processing.hdr_utilities import (
+            RequiredColorConversionUnavailable,
+        )
+
+        plan = EncodingPlan(
+            codec=OutputCodec.H265,
+            encoder="libx265",
+            encoder_args=("-preset", "medium", "-crf", "18"),
+            target_transfer=HdrTransfer.PQ,
+            tone_map_to_sdr=False,
+            pixel_format="yuv420p10le",
+            container="mp4",
+        )
+        settings = AssemblySettings(encoding_plan=plan)
+        prober = MagicMock()
+        prober.detect_max_framerate.return_value = 30
+        clip = AssemblyClip(path=Path("/tmp/hlg.mp4"), duration=5.0)
+
+        with (
+            patch(
+                "immich_memories.processing.assembly_engine._get_clip_hdr_types",
+                return_value=["hlg"],
+            ),
+            patch(
+                "immich_memories.processing.assembly_engine._detect_color_primaries",
+                return_value="bt2020",
+            ),
+        ):
+            context = create_assembly_context(settings, prober, [clip], 1920, 1080)
+
+        with (
+            patch(
+                "immich_memories.processing.hdr_utilities._check_zscale_available",
+                return_value=False,
+            ),
+            pytest.raises(RequiredColorConversionUnavailable),
+        ):
+            FilterBuilder(settings, prober, lambda _path: None).get_clip_hdr_conversion(0, context)
+
+    def test_clip_filter_fails_when_required_transfer_conversion_is_unavailable(self):
+        """Building the final FFmpeg graph must fail before emitting tags-only HDR."""
+        from immich_memories.processing.assembly_engine import create_assembly_context
+        from immich_memories.processing.filter_builder import FilterBuilder
+        from immich_memories.processing.hdr_utilities import (
+            RequiredColorConversionUnavailable,
+        )
+
+        plan = EncodingPlan(
+            codec=OutputCodec.H265,
+            encoder="libx265",
+            encoder_args=("-preset", "medium", "-crf", "18"),
+            target_transfer=HdrTransfer.PQ,
+            tone_map_to_sdr=False,
+            pixel_format="yuv420p10le",
+            container="mp4",
+        )
+        settings = AssemblySettings(encoding_plan=plan)
+        prober = MagicMock()
+        prober.detect_max_framerate.return_value = 30
+        clip = AssemblyClip(path=Path("/tmp/hlg.mp4"), duration=5.0)
+
+        with (
+            patch(
+                "immich_memories.processing.assembly_engine._get_clip_hdr_types",
+                return_value=["hlg"],
+            ),
+            patch(
+                "immich_memories.processing.assembly_engine._detect_color_primaries",
+                return_value="bt2020",
+            ),
+        ):
+            context = create_assembly_context(settings, prober, [clip], 1920, 1080)
+
+        with (
+            patch(
+                "immich_memories.processing.hdr_utilities._check_zscale_available",
+                return_value=False,
+            ),
+            pytest.raises(RequiredColorConversionUnavailable),
+        ):
+            FilterBuilder(settings, prober, lambda _path: None).build_clip_video_filter(
+                0,
+                clip,
+                context,
+                use_aspect_ratio_handling=False,
+            )
+
+    def test_filter_builder_fails_closed_for_unexpected_hdr_source(self):
+        """Actual HDR input cannot bypass conversion through stale plan provenance."""
+        from immich_memories.processing.filter_builder import FilterBuilder
+        from immich_memories.processing.hdr_utilities import (
+            RequiredColorConversionUnavailable,
+        )
+
+        plan = EncodingPlan(
+            codec=OutputCodec.H264,
+            encoder="libx264",
+            encoder_args=("-preset", "medium", "-crf", "18"),
+            target_transfer=HdrTransfer.NONE,
+            tone_map_to_sdr=False,
+            pixel_format="yuv420p",
+            container="mp4",
+        )
+        settings = AssemblySettings(encoding_plan=plan)
+        context = MagicMock(
+            hdr_type="sdr",
+            clip_hdr_types=["hlg"],
+            clip_primaries=["bt2020"],
+        )
+
+        with (
+            patch(
+                "immich_memories.processing.hdr_utilities._check_zscale_available",
+                return_value=False,
+            ),
+            pytest.raises(RequiredColorConversionUnavailable),
+        ):
+            FilterBuilder(settings, MagicMock(), lambda _path: None).get_clip_hdr_conversion(
+                0, context
+            )

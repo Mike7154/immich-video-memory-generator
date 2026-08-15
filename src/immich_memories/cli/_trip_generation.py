@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import click
 
 from immich_memories.analysis.trip_detection import DetectedTrip, haversine_km
 from immich_memories.cli._helpers import console, print_error, print_info, print_success
@@ -16,6 +19,7 @@ from immich_memories.cli._pipeline_runner import (
     fetch_videos_and_live_photos,
     run_pipeline_and_generate,
 )
+from immich_memories.processing.encoding_plan import resolve_output_selection
 from immich_memories.timeperiod import DateRange
 
 if TYPE_CHECKING:
@@ -66,6 +70,81 @@ def resolve_music_arg(music: str | None) -> str | None:
     return music
 
 
+def _print_trip_result(
+    *,
+    dry_run: bool,
+    location_name: str,
+    result_path: Path,
+    should_upload: bool,
+    album_name: str | None,
+) -> None:
+    """Report trip planning without claiming an artifact or upload exists."""
+    if dry_run:
+        print_success(f"Trip plan complete: {location_name}")
+        return
+    print_success(f"Trip video: {result_path}")
+    if should_upload:
+        print_success(f"Uploaded to Immich (album: {album_name or 'none'})")
+
+
+def _has_trusted_automation_identity(
+    source: str,
+    memory_key: str | None,
+    memory_category: str | None,
+) -> bool:
+    """Return whether hidden context identifies an automation trip candidate."""
+    return source == "auto" and bool(memory_key) and memory_category == "trip"
+
+
+def _exact_trip_match_error(start: date, end: date, match_count: int) -> click.ClickException:
+    if match_count == 0:
+        message = f"No detected trip exactly matches {start.isoformat()} to {end.isoformat()}"
+    else:
+        message = (
+            f"Exact trip range {start.isoformat()} to {end.isoformat()} found "
+            f"{match_count} detected trips; expected exactly one"
+        )
+    return click.ClickException(message)
+
+
+def _select_requested_trips(
+    trips: list[DetectedTrip],
+    *,
+    trip_index: int | None,
+    all_trips: bool,
+    month: int | None,
+    near_date: str | None,
+    requested_start: date | None,
+    requested_end: date | None,
+    source: str,
+    memory_key: str | None,
+    memory_category: str | None,
+) -> list[DetectedTrip]:
+    """Select one exact automation trip or preserve the manual selectors."""
+    exact_automation_request = _has_trusted_automation_identity(
+        source,
+        memory_key,
+        memory_category,
+    )
+    if exact_automation_request and requested_start is not None and requested_end is not None:
+        exact_matches = [
+            trip
+            for trip in trips
+            if trip.start_date == requested_start and trip.end_date == requested_end
+        ]
+        if len(exact_matches) != 1:
+            raise _exact_trip_match_error(requested_start, requested_end, len(exact_matches))
+        return exact_matches
+
+    from immich_memories.cli._trip_display import select_trips
+
+    try:
+        return select_trips(trips, trip_index, all_trips, month=month, near_date=near_date)
+    except ValueError as e:
+        print_error(str(e))
+        sys.exit(1)
+
+
 def handle_trip_generation(
     *,
     client: SyncImmichClient,
@@ -96,6 +175,14 @@ def handle_trip_generation(
     upload_to_immich: bool,
     album: str | None,
     duration: float | int | None = None,
+    requested_start: date | None = None,
+    requested_end: date | None = None,
+    source: str = "manual",
+    memory_key: str | None = None,
+    memory_category: str | None = None,
+    automation_attempt_id: str | None = None,
+    orientation: str = "landscape",
+    dry_run: bool = False,
 ) -> None:
     """Detect trips, select, and generate video for each."""
     from datetime import datetime as dt_cls
@@ -103,10 +190,21 @@ def handle_trip_generation(
     from immich_memories.cli._trip_display import (
         format_trips_table,
         run_trip_detection,
-        select_trips,
     )
 
     trips = run_trip_detection(client, config, year, progress, person_names)
+    selected = _select_requested_trips(
+        trips,
+        trip_index=trip_index,
+        all_trips=all_trips,
+        month=month,
+        near_date=near_date,
+        requested_start=requested_start,
+        requested_end=requested_end,
+        source=source,
+        memory_key=memory_key,
+        memory_category=memory_category,
+    )
 
     trips_table = format_trips_table(trips)
     if trips_table:
@@ -118,17 +216,17 @@ def handle_trip_generation(
         print_error("No trips detected for this year")
         sys.exit(0)
 
-    try:
-        selected = select_trips(trips, trip_index, all_trips, month=month, near_date=near_date)
-    except ValueError as e:
-        print_error(str(e))
-        sys.exit(1)
-
     if not selected:
         print_info(
             "Use --trip-index N, --month M, --near-date DATE, or --all-trips to select trip(s)"
         )
         return
+
+    output_selection = resolve_output_selection(
+        config_codec=config.output.codec,
+        config_container=config.output.format,
+        format_override=output_format,
+    )
 
     for trip in selected:
         trip_date_range = DateRange(
@@ -136,10 +234,12 @@ def handle_trip_generation(
             end=dt_cls.combine(trip.end_date, dt_cls.max.time()),
         )
         trip_days = (trip.end_date - trip.start_date).days + 1
-        trip_duration = float(duration or max(60, min(600, trip_days * 35)))
+        trip_duration = float(duration) if duration is not None else None
 
         trip_slug = trip.location_name.lower().replace(" ", "_")[:30]
-        trip_output = output_path.parent / f"trip_{trip_slug}_{trip.start_date.isoformat()}.mp4"
+        trip_output = output_path.parent / (
+            f"trip_{trip_slug}_{trip.start_date.isoformat()}.{output_selection.container}"
+        )
 
         console.print(
             f"[bold cyan]Generating trip:[/bold cyan] {trip.location_name} "
@@ -193,6 +293,7 @@ def handle_trip_generation(
             no_music=no_music,
             output_path=trip_output,
             output_resolution=resolution,
+            output_orientation=orientation,
             scale_mode=scale_mode or config.defaults.scale_mode,
             output_format=output_format,
             add_date_overlay=add_date,
@@ -206,9 +307,18 @@ def handle_trip_generation(
             upload_to_immich=upload_to_immich,
             album=album,
             memory_preset_params=trip_preset,
+            source=source,
+            memory_key=memory_key,
+            memory_category=memory_category,
+            automation_attempt_id=automation_attempt_id,
+            dry_run=dry_run,
         )
 
         console.print()
-        print_success(f"Trip video: {result_path}")
-        if should_upload:
-            print_success(f"Uploaded to Immich (album: {album_name or 'none'})")
+        _print_trip_result(
+            dry_run=dry_run,
+            location_name=trip.location_name,
+            result_path=result_path,
+            should_upload=should_upload,
+            album_name=album_name,
+        )

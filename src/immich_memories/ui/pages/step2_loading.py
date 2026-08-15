@@ -7,14 +7,36 @@ import logging
 
 from nicegui import run, ui
 
+from immich_memories.analysis.cache_projection import (
+    apply_cached_segment,
+    is_compatible_analysis_cache,
+)
 from immich_memories.analysis.live_photo_pipeline import fetch_live_photo_clips
 from immich_memories.api.immich import SyncImmichClient
 from immich_memories.api.models import VideoClipInfo
+from immich_memories.operations.phases import OperationalPhase, PhaseEvent
 from immich_memories.processing.clip_probing import probe_video_url
 from immich_memories.security import sanitize_error_message
+from immich_memories.ui.nicegui_compat import io_bound_result
 from immich_memories.ui.state import get_app_state
 
 logger = logging.getLogger(__name__)
+
+
+def _set_phase_status(status_label, event: PhaseEvent) -> None:
+    """Render the shared operational message without persisting UI-only discovery."""
+    status_label.set_text(event.message)
+
+
+def _ui_phase(
+    phase: OperationalPhase,
+    message: str,
+    *,
+    current: int = 0,
+    total: int = 0,
+) -> PhaseEvent:
+    return PhaseEvent(phase, current, total, message, 0.0)
+
 
 MIN_CLIP_DURATION = 1.5
 
@@ -25,6 +47,7 @@ def _fetch_assets(state) -> list:
     with SyncImmichClient(
         base_url=state.immich_url,
         api_key=state.immich_api_key,
+        api_version=state.immich_api_version,
     ) as client:
         multi_ids = state.memory_preset_params.get("person_ids", [])
         if len(multi_ids) >= 2:
@@ -69,7 +92,11 @@ def _build_clips(assets: list) -> tuple[list[VideoClipInfo], int]:
 def _fetch_photos(state, date_range) -> list:
     """Fetch photo assets (blocking)."""
     person_id = state.selected_person.id if state.selected_person else None
-    with SyncImmichClient(state.immich_url, state.immich_api_key) as client:
+    with SyncImmichClient(
+        base_url=state.immich_url,
+        api_key=state.immich_api_key,
+        api_version=state.immich_api_version,
+    ) as client:
         return client.get_photos_for_date_range(date_range, person_id=person_id)
 
 
@@ -78,7 +105,11 @@ def _fetch_live_photos(state, date_range) -> tuple[list[VideoClipInfo], set[str]
     lp_person_id = state.selected_person.id if state.selected_person else None
     multi_ids = state.memory_preset_params.get("person_ids", [])
 
-    with SyncImmichClient(state.immich_url, state.immich_api_key) as lp_client:
+    with SyncImmichClient(
+        base_url=state.immich_url,
+        api_key=state.immich_api_key,
+        api_version=state.immich_api_version,
+    ) as lp_client:
         return fetch_live_photo_clips(
             lp_client,
             date_range,
@@ -105,24 +136,8 @@ def _merge_live_photos(
 
 
 def _set_initial_selection(clips: list[VideoClipInfo], state) -> None:
-    """Set initial selected_clip_ids, prioritizing real videos over live photos."""
-    has_live = state.include_live_photos and any(c.asset.is_live_photo for c in clips)
-    if not has_live:
-        state.selected_clip_ids = {c.asset.id for c in clips}
-        return
-
-    video_clips = [c for c in clips if not c.asset.is_live_photo]
-    video_duration = sum(c.duration_seconds or 0 for c in video_clips)
-    target_seconds = state.target_duration * 60
-
-    if video_duration >= target_seconds:
-        state.selected_clip_ids = {c.asset.id for c in video_clips}
-        logger.info(
-            f"Enough video ({video_duration:.0f}s >= {target_seconds}s target), "
-            f"live photos available but not pre-selected"
-        )
-    else:
-        state.selected_clip_ids = {c.asset.id for c in clips}
+    """Make every discovered clip eligible for the user's review."""
+    state.selected_clip_ids = {c.asset.id for c in clips}
 
 
 def _load_clips() -> None:
@@ -145,31 +160,42 @@ def _load_clips() -> None:
 
     async def do_load():
         try:
-            status_label.set_text("Fetching videos from Immich...")
+            _set_phase_status(
+                status_label,
+                _ui_phase(OperationalPhase.DISCOVERY, "Fetching videos from Immich..."),
+            )
             progress_bar.value = 0.02
 
             date_range = state.date_range
             if date_range is None:
                 raise ValueError("No date range configured")
 
-            assets = await run.io_bound(_fetch_assets, state)
+            assets = await io_bound_result(_fetch_assets, state)
             assets = _filter_near_home(assets, state)
 
-            status_label.set_text(f"Found {len(assets)} assets. Filtering...")
+            _set_phase_status(
+                status_label,
+                _ui_phase(
+                    OperationalPhase.DISCOVERY,
+                    f"Found {len(assets)} assets. Filtering...",
+                    current=len(assets),
+                    total=len(assets),
+                ),
+            )
             progress_bar.value = 0.05
 
             clips, _ = _build_clips(assets)
 
             if state.include_live_photos:
                 status_label.set_text("Fetching Live Photos...")
-                live_clips, live_video_ids = await run.io_bound(
+                live_clips, live_video_ids = await io_bound_result(
                     _fetch_live_photos, state, date_range
                 )
                 clips = _merge_live_photos(clips, live_clips, live_video_ids)
 
             if state.include_photos:
                 status_label.set_text("Fetching photos...")
-                photo_assets = await run.io_bound(_fetch_photos, state, date_range)
+                photo_assets = await io_bound_result(_fetch_photos, state, date_range)
                 state.photo_assets = photo_assets
                 state.selected_photo_ids = {a.id for a in photo_assets}
                 if photo_assets:
@@ -183,9 +209,13 @@ def _load_clips() -> None:
             total_msg = f"Found {len(clips)} videos"
             if photo_count:
                 total_msg += f" and {photo_count} photos"
-            status_label.set_text(f"{total_msg}. Loading thumbnails...")
+            _set_phase_status(
+                status_label,
+                _ui_phase(OperationalPhase.DOWNLOAD, f"{total_msg}. Loading thumbnails..."),
+            )
             progress_bar.value = 0.1
             await _load_thumbnails_and_metadata_async(clips, status_label, progress_bar)
+            _hydrate_and_report_cached_analysis(state, clips, status_label)
 
             if state.include_photos and state.photo_assets:
                 await _load_photo_thumbnails_async(state.photo_assets, status_label)
@@ -267,7 +297,11 @@ async def _fetch_thumbnails_batched(
         batch = need_thumbs[i : i + batch_size]
 
         def fetch_thumb_batch(clips_batch=batch):
-            with SyncImmichClient(state.immich_url, state.immich_api_key) as client:
+            with SyncImmichClient(
+                base_url=state.immich_url,
+                api_key=state.immich_api_key,
+                api_version=state.immich_api_version,
+            ) as client:
                 for clip in clips_batch:
                     with contextlib.suppress(Exception):
                         thumb = client.get_asset_thumbnail(clip.asset.id, size="preview")
@@ -300,7 +334,11 @@ async def _fetch_metadata_batched(
         batch = need_meta[i : i + batch_size]
 
         def fetch_meta_batch(clips_batch=batch):
-            with SyncImmichClient(state.immich_url, state.immich_api_key) as client:
+            with SyncImmichClient(
+                base_url=state.immich_url,
+                api_key=state.immich_api_key,
+                api_version=state.immich_api_version,
+            ) as client:
                 for clip in clips_batch:
                     _probe_and_cache_metadata(clip, client, state, analysis_cache)
 
@@ -327,6 +365,35 @@ def _apply_metadata(clip: VideoClipInfo, meta: dict) -> None:
     clip.color_transfer = meta.get("color_transfer")
     clip.color_primaries = meta.get("color_primaries")
     clip.bit_depth = meta.get("bit_depth")
+
+
+def _hydrate_compatible_cached_analysis(state, clips: list[VideoClipInfo]) -> int:
+    """Surface current-model cache entries; stale entries deliberately remain misses."""
+    config = state.config
+    analysis_cache = state.analysis_cache
+    state.cached_analysis_ids = set()
+    if config is None or analysis_cache is None:
+        return 0
+
+    for clip in clips:
+        cached = analysis_cache.get_analysis(clip.asset.id)
+        if not is_compatible_analysis_cache(cached, config):
+            continue
+        best_segment = cached.get_best_segment()
+        if best_segment is None:
+            continue
+        apply_cached_segment(clip, best_segment)
+        state.clip_segments[clip.asset.id] = (best_segment.start_time, best_segment.end_time)
+        state.cached_analysis_ids.add(clip.asset.id)
+
+    return len(state.cached_analysis_ids)
+
+
+def _hydrate_and_report_cached_analysis(state, clips, status_label) -> None:
+    """Hydrate compatible analysis without adding branches to the loading workflow."""
+    hydrated = _hydrate_compatible_cached_analysis(state, clips)
+    if hydrated:
+        status_label.set_text(f"Loaded {hydrated} current cached analyses")
 
 
 def _probe_and_cache_metadata(clip, client, state, analysis_cache) -> None:
@@ -380,7 +447,11 @@ async def _load_photo_thumbnails_async(
         batch = need[i : i + batch_size]
 
         def fetch_batch(assets_batch=batch):
-            with SyncImmichClient(state.immich_url, state.immich_api_key) as client:
+            with SyncImmichClient(
+                base_url=state.immich_url,
+                api_key=state.immich_api_key,
+                api_version=state.immich_api_version,
+            ) as client:
                 for asset in assets_batch:
                     with contextlib.suppress(Exception):
                         thumb = client.get_asset_thumbnail(asset.id, size="preview")

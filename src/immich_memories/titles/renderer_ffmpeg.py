@@ -17,14 +17,16 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .encoding import _get_gpu_encoder_args
+from immich_memories.processing.encoding_plan import EncodingPlan
+
+from .encoding import standalone_title_encoding_plan, title_color_filter, title_encoder_args
 
 logger = logging.getLogger(__name__)
 
 
-def _get_encoder_args(hdr: bool = True) -> list[str]:
-    """Get encoder arguments — delegates to shared encoding._get_gpu_encoder_args."""
-    return _get_gpu_encoder_args(hdr=hdr)
+def _get_encoder_args(encoding_plan: EncodingPlan | None = None) -> list[str]:
+    """Get encoder arguments from the supplied or standalone title plan."""
+    return title_encoder_args(encoding_plan or standalone_title_encoding_plan())
 
 
 @dataclass
@@ -90,6 +92,7 @@ def create_title_ffmpeg(
     subtitle: str | None,
     output_path: Path,
     config: FFmpegTitleConfig | None = None,
+    encoding_plan: EncodingPlan | None = None,
 ) -> Path:
     """Create a title screen using FFmpeg native filters.
 
@@ -106,6 +109,7 @@ def create_title_ffmpeg(
         Path to generated video.
     """
     cfg = config or FFmpegTitleConfig()
+    plan = encoding_plan or standalone_title_encoding_plan()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     font_path = _get_system_font()
@@ -176,7 +180,7 @@ def create_title_ffmpeg(
         filters.append(subtitle_filter)
 
     # Combine filters
-    filter_chain = ",".join(filters)
+    filter_chain = ",".join([*filters, title_color_filter(plan)])
 
     # Build FFmpeg command
     cmd = [
@@ -195,8 +199,8 @@ def create_title_ffmpeg(
         # Apply text filters
         "-vf",
         filter_chain,
-        # Encoding - GPU accelerated with 10-bit for smooth gradients
-        *_get_encoder_args(),
+        # Encoding follows the supplied output contract.
+        *title_encoder_args(plan),
         "-c:a",
         "aac",
         "-b:a",
@@ -227,6 +231,7 @@ def create_title_with_effects(
     subtitle: str | None,
     output_path: Path,
     config: FFmpegTitleConfig | None = None,
+    encoding_plan: EncodingPlan | None = None,
 ) -> Path:
     """Create a title screen with animated effects using FFmpeg.
 
@@ -242,6 +247,7 @@ def create_title_with_effects(
         Path to generated video.
     """
     cfg = config or FFmpegTitleConfig()
+    plan = encoding_plan or standalone_title_encoding_plan()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     font_path = _get_system_font()
@@ -337,6 +343,7 @@ def create_title_with_effects(
         filters[-1] = filters[-1].replace("[t2]", "[out]")
         last_label = "out"
 
+    filters.append(f"[{last_label}]{title_color_filter(plan)}[encoded]")
     filter_complex = ";".join(filters)
 
     cmd = [
@@ -353,11 +360,11 @@ def create_title_with_effects(
         "-filter_complex",
         filter_complex,
         "-map",
-        f"[{last_label}]",
+        "[encoded]",
         "-map",
         "1:a",
-        # Encoding - GPU accelerated with 10-bit for smooth gradients
-        *_get_encoder_args(),
+        # Encoding follows the supplied output contract.
+        *title_encoder_args(plan),
         "-c:a",
         "aac",
         "-b:a",

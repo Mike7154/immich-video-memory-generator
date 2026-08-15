@@ -5,7 +5,23 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from enum import StrEnum
 from typing import Any, Literal
+
+from immich_memories.operations.phases import OperationalPhase
+
+
+def normalize_memory_people(people: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Canonicalize person identities for automation variety comparisons."""
+    return tuple(" ".join(person.split()).casefold() for person in people)
+
+
+class DeliveryStatus(StrEnum):
+    """Durable Immich delivery state for a completed local artifact."""
+
+    NOT_REQUESTED = "not_requested"
+    PENDING = "pending"
+    DELIVERED = "delivered"
 
 
 @dataclass
@@ -134,7 +150,11 @@ class RunMetadata:
     # Automation / dedup
     memory_type: str | None = None
     memory_key: str | None = None
+    memory_category: str | None = None
+    memory_people: tuple[str, ...] = ()
     source: str = "manual"  # "manual" | "scheduled" | "auto"
+    automation_attempt_id: str | None = None
+    last_phase: OperationalPhase | None = None
 
     # Input parameters
     person_name: str | None = None
@@ -147,6 +167,12 @@ class RunMetadata:
     output_path: str | None = None
     output_size_bytes: int = 0
     output_duration_seconds: float = 0.0
+    delivery_status: DeliveryStatus = DeliveryStatus.NOT_REQUESTED
+    delivery_attempts: int = 0
+    delivery_error: str | None = None
+    immich_asset_id: str | None = None
+    delivery_album: str | None = None
+    warnings: list[str] = field(default_factory=list)
 
     # Statistics
     clips_analyzed: int = 0
@@ -158,6 +184,9 @@ class RunMetadata:
 
     # Phase statistics (populated when loaded from DB)
     phases: list[PhaseStats] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.memory_people = normalize_memory_people(self.memory_people)
 
     @property
     def total_duration_seconds(self) -> float:
@@ -175,7 +204,11 @@ class RunMetadata:
             "status": self.status,
             "memory_type": self.memory_type,
             "memory_key": self.memory_key,
+            "memory_category": self.memory_category,
+            "memory_people": list(self.memory_people),
             "source": self.source,
+            "automation_attempt_id": self.automation_attempt_id,
+            "last_phase": self.last_phase.value if self.last_phase else None,
             "person_name": self.person_name,
             "person_id": self.person_id,
             "date_range_start": (
@@ -186,6 +219,12 @@ class RunMetadata:
             "output_path": self.output_path,
             "output_size_bytes": self.output_size_bytes,
             "output_duration_seconds": self.output_duration_seconds,
+            "delivery_status": self.delivery_status.value,
+            "delivery_attempts": self.delivery_attempts,
+            "delivery_error": self.delivery_error,
+            "immich_asset_id": self.immich_asset_id,
+            "delivery_album": self.delivery_album,
+            "warnings": self.warnings,
             "clips_analyzed": self.clips_analyzed,
             "clips_selected": self.clips_selected,
             "errors_count": self.errors_count,
@@ -206,7 +245,11 @@ class RunMetadata:
             status=data.get("status", "running"),
             memory_type=data.get("memory_type"),
             memory_key=data.get("memory_key"),
+            memory_category=data.get("memory_category"),
+            memory_people=tuple(data.get("memory_people") or ()),
             source=data.get("source", "manual"),
+            automation_attempt_id=data.get("automation_attempt_id"),
+            last_phase=(OperationalPhase(data["last_phase"]) if data.get("last_phase") else None),
             person_name=data.get("person_name"),
             person_id=data.get("person_id"),
             date_range_start=(
@@ -224,6 +267,14 @@ class RunMetadata:
             output_path=data.get("output_path"),
             output_size_bytes=data.get("output_size_bytes", 0),
             output_duration_seconds=data.get("output_duration_seconds", 0.0),
+            delivery_status=DeliveryStatus(
+                data.get("delivery_status") or DeliveryStatus.NOT_REQUESTED
+            ),
+            delivery_attempts=data.get("delivery_attempts") or 0,
+            delivery_error=data.get("delivery_error"),
+            immich_asset_id=data.get("immich_asset_id"),
+            delivery_album=data.get("delivery_album"),
+            warnings=list(data.get("warnings") or []),
             clips_analyzed=data.get("clips_analyzed", 0),
             clips_selected=data.get("clips_selected", 0),
             errors_count=data.get("errors_count", 0),

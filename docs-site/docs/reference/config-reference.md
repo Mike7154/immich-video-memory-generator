@@ -21,6 +21,27 @@ advanced:
 Or kept at the top level (both formats work).
 :::
 
+## Immich connection
+
+Immich Memories supports **Immich v2 and v3**. Automatic runtime detection is the default:
+
+```yaml
+immich:
+  url: "https://photos.example.com"
+  api_key: "${IMMICH_API_KEY}"
+  api_version: auto  # auto | v2 | v3
+```
+
+Keep `api_version` on `auto` for normal use. The client detects and caches the server major for
+each runtime client; you do not choose it for each generation. Explicit `v2` or `v3` is a manual
+troubleshooting escape hatch for a proxy or unusual deployment that prevents correct detection.
+An override forces that API contract.
+
+The compatibility boundary normalizes v2 duration strings and v3 millisecond durations to
+seconds, chooses the matching upload fields before any file upload, and emits timezone-aware
+search dates accepted by v3. Run the read-only `immich-memories config test` command to check
+credentials and see the resolved API contract without generating or uploading a memory.
+
 ## Video analysis
 
 ```yaml
@@ -72,6 +93,14 @@ defaults:
   transition_buffer: 0.5         # Extra footage around clips for smooth fades
 ```
 
+`target_duration_seconds` describes the finished video, not just the selected source clips. The
+planner budgets opening/title/ending cards and subtracts the expected overlap from fades before it
+sets the content budget. Month dividers use an all-or-none policy, and trip location cards are
+counted only after the final media selection. If filtering leaves usable time on the table, the
+optimizer backfills eligible leftovers and can relax the preferred photo ratio; hard eligibility
+and deduplication rules remain enforced. Frame and transition boundaries can leave the encoded
+result less than one transition away from the requested duration.
+
 ## Output
 
 ```yaml
@@ -79,10 +108,30 @@ output:
   directory: "~/Videos/Memories"
   format: "mp4"                  # mp4 or mov
   resolution: "1080p"            # 720p, 1080p, 4k
-  codec: "h264"                  # h264, h265, prores
+  codec: h265                     # h264, h265, prores
+  hdr_mode: auto                  # auto, sdr, hdr
   crf: 18                        # Quality (0-51, lower = better)
   quality: "high"                # high, medium, low (shorthand for CRF presets)
 ```
+
+CRF is the image-quality authority. `quality` is only a shorthand used when `crf` is omitted;
+an explicit `crf` wins. Software H.264/H.265 encoders receive CRF directly. FFmpeg's
+VideoToolbox encoders do not implement CRF, so the app translates the same 0-51 setting to
+VideoToolbox's 1-100 quality scale (for example, CRF 18 becomes `-q:v 75`). Lower CRF still means
+higher quality for software H.264/H.265 and Apple VideoToolbox. NVENC, VAAPI, QSV, and ProRes use
+their existing backend policies; `output.crf` is not currently translated for those encoders.
+
+The final encoding plan permits only `mp4` and `mov` containers with `h264`, `h265`, or `prores`
+codecs. `generate --format` accepts only `mp4`, `h265`, and `prores`: they select H.264/MP4,
+H.265/MP4, and ProRes/MOV respectively. Config can select compatible codec/container pairs;
+internal and UI overrides also represent `h264_mov` and `h265_mov`, but `h264_mov` and `h265_mov`
+are not CLI choices. ProRes requires MOV; H.264 and ProRes do not support HDR output.
+
+`hdr_mode: auto` preserves detected HLG or PQ sources when `codec: h265` is selected. It converts
+SDR clips, photos, and title screens into the chosen HDR transfer before blending, so intermediate
+files do not all need to carry HDR metadata. H.264 is always SDR: with `codec: h264`, `auto`
+tone-maps detected HDR sources and logs the reason. Use `hdr_mode: sdr` when SDR is intentional, or
+`hdr_mode: hdr` with H.265 to force an HDR output even when every source is SDR.
 
 ## Photos
 
@@ -112,6 +161,10 @@ hardware:
   gpu_memory_limit: 0            # GPU memory limit in MB (0 = unlimited)
 ```
 
+`encoder_preset` controls encoder speed/effort; it does not replace `output.crf`. On Apple,
+`fast` enables VideoToolbox's speed-priority mode while `balanced` and `quality` leave it disabled.
+Image quality still comes from the CRF translation described above.
+
 ## Audio and music
 
 ```yaml
@@ -137,8 +190,8 @@ ace_step:
   enabled: false
   mode: "api"                    # api (remote REST server) or lib (local, requires Python 3.12)
   api_url: "http://localhost:8000"
-  model_variant: "turbo"         # turbo (fast) or base (quality)
-  lm_model_size: "1.7B"
+  model_variant: "turbo"         # Default 2B; use acestep-v15-xl-turbo for the 4B production profile
+  lm_model_size: "1.7B"          # Default planner; use 4B with the XL production profile
   use_lm: true
   bf16: true
   num_versions: 3
@@ -183,13 +236,19 @@ content_analysis:
 audio_content:
   enabled: false
   weight: 0.15
-  use_panns: true                # PANNs ML model (requires torch)
+  use_panns: true                # Semantic labels via optional audio-ml extra
   min_confidence: 0.3
   laughter_confidence: 0.2
   laughter_bonus: 0.1
   protect_laughter: true
   protect_speech: true
 ```
+
+`use_panns: true` uses PANNs to label laughter, babies, speech, music, cheering, engines, and
+other AudioSet events. Install it with `uv sync --extra audio-ml` or
+`pip install 'immich-memories[audio-ml]'`. If the extra is missing, generation continues with the
+energy-only analyzer. That fallback can find loud and quiet structure, but it cannot reliably tell
+laughter from speech, music, or background noise.
 
 ## Title screens
 
@@ -353,6 +412,13 @@ notifications:
     - "tgram://bot_token/chat_id"
   on_success: true                # notify on successful generation
   on_failure: true                # notify on failed generation
+  attach_thumbnail: false         # opt in; attachments cost bandwidth/provider quota
+  cooldown_hours: 24              # pause normal attempts after a delivery failure
 ```
+
+Delivery failures are stored as sanitized health state. Normal success and failure
+notifications pause during the cooldown instead of hammering a quota-limited provider.
+`auto test-notification` always bypasses the cooldown and a successful test clears it.
+Provider URLs, credentials, and response bodies are never included in health output.
 
 Test your config: `immich-memories auto test-notification`

@@ -9,9 +9,11 @@ Orchestrates the 4-phase pipeline:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from immich_memories.analysis.clip_analyzer import ClipAnalyzer
@@ -25,10 +27,13 @@ if TYPE_CHECKING:
     from immich_memories.api.models import VideoClipInfo
     from immich_memories.cache.database import VideoAnalysisCache
     from immich_memories.cache.thumbnail_cache import ThumbnailCache
+    from immich_memories.cache.video_cache import VideoDownloadCache
     from immich_memories.config_loader import Config
     from immich_memories.config_models import AnalysisConfig
 
 logger = logging.getLogger(__name__)
+
+AUTO_FULL_ANALYSIS_MAX_CACHE_MISSES = 60
 
 
 def _cap_analysis_candidates(
@@ -62,6 +67,7 @@ class PipelineConfig:
     # Selection settings
     target_clips: int = 120  # Target number of clips to select
     avg_clip_duration: float = 5.0  # Average clip duration in final video
+    target_duration_seconds: float | None = None  # Explicit strict content budget
     hdr_only: bool = False  # Only select HDR clips
     prioritize_favorites: bool = True  # Prioritize favorite clips
     max_non_favorite_ratio: float = 0.70  # Max ratio of non-favorites (0.70 = at most 70%)
@@ -96,8 +102,15 @@ class PipelineConfig:
     # Photo ratio cap — max fraction of selected clips that can be photos
     photo_max_ratio: float = 0.50  # 0.50 = at most 50% photos
 
-    # Analysis depth: "fast" = metadata gap-fill, "thorough" = LLM gap-fill
-    analysis_depth: str = "fast"
+    # Analysis depth: auto budgets misses, fast favors speed, thorough analyzes all.
+    analysis_depth: str = "auto"
+
+    @property
+    def duration_target(self) -> float:
+        """Return explicit seconds when final planning supplied them."""
+        if self.target_duration_seconds is not None:
+            return self.target_duration_seconds
+        return self.target_clips * self.avg_clip_duration
 
 
 @dataclass
@@ -155,6 +168,20 @@ class SmartPipeline:
         self.run_id = run_id
         self._analysis_config = analysis_config
         self._app_config = app_config
+        from immich_memories.analysis.provider_health import ProviderCircuit
+
+        self.provider_circuit = ProviderCircuit()
+        self.last_deep_analysis_count = 0
+        self._video_cache: VideoDownloadCache | None = None
+        cache_config = app_config.cache
+        if cache_config.video_cache_enabled and isinstance(cache_config.video_cache_path, Path):
+            from immich_memories.cache.video_cache import VideoDownloadCache
+
+            self._video_cache = VideoDownloadCache(
+                cache_dir=cache_config.video_cache_path,
+                max_size_gb=cache_config.video_cache_max_size_gb,
+                max_age_days=cache_config.video_cache_max_age_days,
+            )
 
         # Wire composed services
         self.previewer = PreviewBuilder(
@@ -162,9 +189,17 @@ class SmartPipeline:
             cache_config=app_config.cache,
             analysis_config=analysis_config,
             content_analysis_config=app_config.content_analysis,
+            video_cache=self._video_cache,
+            hardware_enabled=app_config.hardware.enabled,
         )
         self.analyzer = ClipAnalyzer(
-            self.config, client, analysis_cache, self.previewer, app_config=app_config
+            self.config,
+            client,
+            analysis_cache,
+            self.previewer,
+            app_config=app_config,
+            video_cache=self._video_cache,
+            provider_circuit=self.provider_circuit,
         )
         self.scaler = ClipScaler()
         self.refiner = ClipRefiner(self.config, self.scaler)
@@ -200,20 +235,117 @@ class SmartPipeline:
             # Phase 1: Cluster by thumbnail
             deduplicated = self._phase_cluster(clips)
 
-            # Phase 2: Filter and pre-select
-            candidates = self._phase_filter(deduplicated)
+            # Phase 2: hard eligibility + a cost-bounded analysis shortlist.
+            eligible = self._hard_eligible_clips(deduplicated)
+            candidates = self._analysis_candidates(eligible)
+            self.last_deep_analysis_count = len(candidates)
 
-            # Phase 3: Analyze selected clips
-            analyzed = self.analyzer.phase_analyze(candidates, self.tracker)
+            # Phase 3: one cache batch covers every candidate download.
+            analyzed = self._analyze_with_cache_batch(candidates)
+            candidate_ids = {clip.asset.id for clip in candidates}
+            leftovers = [clip for clip in eligible if clip.asset.id not in candidate_ids]
+            fallbacks = self.analyzer.plan_cached_or_metadata(leftovers)
 
-            return analyzed
+            return [*analyzed, *fallbacks]
 
         except (
             Exception
         ) as e:  # WHY: top-level pipeline boundary — logs + cleans up tracker before re-raise
             logger.error(f"Pipeline failed: {e}")
-            self.tracker.finish()
             raise
+        finally:
+            # Analysis owns native captures/models regardless of cache mode or failure.
+            with contextlib.suppress(Exception):
+                self.analyzer.close()
+            with contextlib.suppress(Exception):
+                self.previewer.close()
+
+    def _analysis_candidates(self, eligible: list[VideoClipInfo]) -> list[VideoClipInfo]:
+        """Resolve user-facing analysis depth into the concrete candidate set."""
+        requested_depth = self.config.analysis_depth
+        if requested_depth == "thorough":
+            logger.info("Thorough mode: analyzing all %d eligible clips", len(eligible))
+            self._complete_passthrough_filter("Thorough", len(eligible))
+            return eligible
+
+        if requested_depth == "auto":
+            cache_misses = self._semantic_cache_miss_count(eligible)
+            self.config.analysis_depth = "thorough"
+            if cache_misses <= AUTO_FULL_ANALYSIS_MAX_CACHE_MISSES:
+                logger.info(
+                    "Auto mode: %d eligible clips, %d current-model cache misses; "
+                    "analyzing every eligible clip",
+                    len(eligible),
+                    cache_misses,
+                )
+                self._complete_passthrough_filter("Auto", len(eligible))
+                return eligible
+            logger.info(
+                "Auto mode: %d current-model cache misses exceeds %d; "
+                "using density shortlist with LLM analysis",
+                cache_misses,
+                AUTO_FULL_ANALYSIS_MAX_CACHE_MISSES,
+            )
+
+        return self._phase_filter(eligible, hard_filtered=True)
+
+    def _complete_passthrough_filter(self, mode: str, candidate_count: int) -> None:
+        """Keep four-phase progress truthful when a mode deliberately skips shortlisting."""
+        self.tracker.start_phase(PipelinePhase.FILTERING, 1)
+        self.tracker.start_item(f"{mode} mode: keeping all {candidate_count} eligible clips")
+        self.tracker.complete_item("filters")
+        self.tracker.complete_phase()
+
+    def _semantic_cache_miss_count(self, clips: list[VideoClipInfo]) -> int:
+        """Count clips that need work under the exact active semantic model."""
+        from immich_memories.analysis.cache_projection import is_compatible_analysis_cache
+
+        return sum(
+            not is_compatible_analysis_cache(
+                self.analysis_cache.get_analysis(clip.asset.id), self._app_config
+            )
+            for clip in clips
+        )
+
+    def run_planning_analysis(
+        self,
+        clips: list[VideoClipInfo],
+        progress_callback: Callable[[dict], None] | None = None,
+    ) -> list[ClipWithSegment]:
+        """Run normal metadata filters with cached-only segment analysis."""
+        if progress_callback:
+            self.tracker.add_callback(
+                lambda _: progress_callback(self.tracker.get_status_summary())
+            )
+        self.tracker.start()
+        try:
+            deduplicated = self._phase_cluster(clips)
+            eligible = self._hard_eligible_clips(deduplicated)
+            candidates = self._phase_filter(eligible, hard_filtered=True)
+            self.last_deep_analysis_count = len(candidates)
+            planned = self.analyzer.phase_plan_cached(candidates, self.tracker)
+            candidate_ids = {clip.asset.id for clip in candidates}
+            leftovers = [clip for clip in eligible if clip.asset.id not in candidate_ids]
+            return [*planned, *self.analyzer.plan_cached_or_metadata(leftovers)]
+        finally:
+            with contextlib.suppress(Exception):
+                self.analyzer.close()
+            with contextlib.suppress(Exception):
+                self.previewer.close()
+
+    def _analyze_with_cache_batch(self, candidates: list[VideoClipInfo]) -> list[ClipWithSegment]:
+        """Run analysis with one shared cache manifest when file caching is enabled."""
+        if self._video_cache is None:
+            return self.analyzer.phase_analyze(candidates, self.tracker)
+
+        with self._video_cache.begin_batch() as batch:
+            self.analyzer.bind_cache_batch(batch)
+            self.previewer.bind_cache_batch(batch)
+            try:
+                return self.analyzer.phase_analyze(candidates, self.tracker)
+            finally:
+                self.analyzer.bind_cache_batch(None)
+                self.previewer.bind_cache_batch(None)
 
     def run_selection(
         self,
@@ -367,27 +499,29 @@ class SmartPipeline:
                 f"({unique_count} clips available)"
             )
 
-    def _maybe_switch_to_thorough(self, clips: list[VideoClipInfo]) -> None:
-        """Switch to thorough LLM analysis when favorites can't drive selection.
-
-        Threshold scales with target duration: 5 favorites per 60s.
-        A 5-minute video needs ~25 favorites to stay in fast mode.
-        A 30-second video only needs ~3.
-        """
-        if self.config.analysis_depth != "fast":
-            return
-        target_seconds = self.config.target_clips * self.config.avg_clip_duration
-        # WHY: 5 per 60s — below that, favorites alone can't anchor selection
-        threshold = max(2, int(5 * target_seconds / 60))
-        fav_count = sum(1 for c in clips if c.asset.is_favorite)
-        if fav_count < threshold:
-            self.config.analysis_depth = "thorough"
+    def _hard_eligible_clips(self, clips: list[VideoClipInfo]) -> list[VideoClipInfo]:
+        """Apply only rules that must permanently exclude a source clip."""
+        min_duration = self._analysis_config.min_segment_duration
+        eligible = [c for c in clips if (c.duration_seconds or 0) >= min_duration]
+        too_short_count = len(clips) - len(eligible)
+        if too_short_count > 0:
             logger.info(
-                f"Only {fav_count} favorites (need {threshold} for {target_seconds:.0f}s) "
-                f"— switching to thorough LLM analysis"
+                f"Duration filter: removed {too_short_count} clips shorter than "
+                f"{min_duration:.1f}s minimum"
             )
 
-    def _phase_filter(self, clips: list[VideoClipInfo]) -> list[VideoClipInfo]:
+        if self.config.hdr_only:
+            before = len(eligible)
+            eligible = [clip for clip in eligible if clip.is_hdr]
+            logger.info("HDR eligibility filter: %d -> %d clips", before, len(eligible))
+        return eligible
+
+    def _phase_filter(
+        self,
+        clips: list[VideoClipInfo],
+        *,
+        hard_filtered: bool = False,
+    ) -> list[VideoClipInfo]:
         """Phase 2: Select clips for analysis using density-proportional budget.
 
         Uses density budget to distribute raw footage quotas across time
@@ -403,24 +537,13 @@ class SmartPipeline:
         self.tracker.start_phase(PipelinePhase.FILTERING, 1)
         self.tracker.start_item("Computing density budget")
 
-        a_config = self._analysis_config
-        min_duration = a_config.min_segment_duration
-
-        # Filter too-short clips (applies to ALL clips)
-        before_count = len(clips)
-        clips = [c for c in clips if (c.duration_seconds or 0) >= min_duration]
-        too_short_count = before_count - len(clips)
-        if too_short_count > 0:
-            logger.info(
-                f"Duration filter: removed {too_short_count} clips shorter than "
-                f"{min_duration:.1f}s minimum"
-            )
+        if not hard_filtered:
+            clips = self._hard_eligible_clips(clips)
 
         self._adapt_target_for_content(clips)
 
         # Analyze-all mode: skip budget, send everything
         if self.config.analyze_all:
-            self._available_non_favorites = []
             self.tracker.complete_item("filters")
             self.tracker.complete_phase()
             logger.info(f"Phase 2: Analyze-all mode — sending all {len(clips)} clips to analysis")
@@ -432,7 +555,10 @@ class SmartPipeline:
                 asset_id=c.asset.id,
                 asset_type="video",
                 date=c.asset.file_created_at,
-                duration=c.duration_seconds or 5.0,
+                duration=min(
+                    c.duration_seconds or self.config.avg_clip_duration,
+                    self.config.avg_clip_duration,
+                ),
                 is_favorite=c.asset.is_favorite,
                 score=c.quality_score,
                 width=c.width,
@@ -445,15 +571,15 @@ class SmartPipeline:
         entries = self._apply_budget_quality_gate(entries)
 
         # Compute density budget
-        target_seconds = self.config.target_clips * self.config.avg_clip_duration
+        target_seconds = self.config.duration_target
         buckets = compute_density_budget(
             assets=entries,
             target_duration_seconds=target_seconds,
             raw_multiplier=1.3,
         )
 
-        raw_budget = (target_seconds - 50) * 1.3
-        log_budget_summary(buckets, raw_budget)
+        effective_raw_budget = sum(bucket.quota_seconds for bucket in buckets)
+        log_budget_summary(buckets, effective_raw_budget)
 
         # Collect selected asset IDs from budget
         selected_ids: set[str] = set()
@@ -466,14 +592,8 @@ class SmartPipeline:
         selected = [clip_map[aid] for aid in selected_ids if aid in clip_map]
         selected = _cap_analysis_candidates(selected, self.config.target_clips)
 
-        self._available_non_favorites = [
-            c for c in clips if c.asset.id not in {c.asset.id for c in selected}
-        ]
-
         fav_count = sum(1 for c in selected if c.asset.is_favorite)
         gap_count = len(selected) - fav_count
-
-        self._maybe_switch_to_thorough(selected)
 
         self.tracker.complete_item("filters")
         self.tracker.complete_phase()

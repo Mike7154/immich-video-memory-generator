@@ -5,13 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
+
+from immich_memories.api.compatibility import ApiVersionPolicy
+from immich_memories.tracking.models import DeliveryStatus
 
 if TYPE_CHECKING:
     from immich_memories.api.models import Person, VideoClipInfo
     from immich_memories.cache.thumbnail_cache import ThumbnailCache
     from immich_memories.config_loader import Config
+    from immich_memories.processing.timeline_budget import TimelinePlan
     from immich_memories.timeperiod import DateRange
 
 
@@ -31,6 +35,7 @@ class AppState:
     config_saved: bool = False
     immich_url: str = ""
     immich_api_key: str = ""
+    immich_api_version: ApiVersionPolicy = ApiVersionPolicy.AUTO
 
     # Time period selection
     time_period_mode: str = "year"  # "year", "period", or "custom"
@@ -53,12 +58,15 @@ class AppState:
     clips: list[VideoClipInfo] = field(default_factory=list)
     selected_clip_ids: set[str] = field(default_factory=set)
     clip_segments: dict[str, tuple[float, float]] = field(default_factory=dict)
+    cached_analysis_ids: set[str] = field(default_factory=set)
     clip_rotations: dict[str, int | None] = field(default_factory=dict)
 
     # Generation options
     generation_options: dict[str, Any] = field(default_factory=dict)
     processing: bool = False
     output_path: Path | None = None
+    generation_warning: str | None = None
+    delivery_status: DeliveryStatus = DeliveryStatus.NOT_REQUESTED
 
     # Music preview (generated in Step 3, used in Step 4)
     music_preview_result: Any | None = None  # MusicGenerationResult
@@ -73,9 +81,11 @@ class AppState:
     pipeline_running: bool = False
     pipeline_result: dict[str, Any] | None = None
     pipeline_config: dict[str, Any] = field(default_factory=dict)
+    timeline_plan: TimelinePlan | None = None
 
     # Generation settings
-    target_duration: int = 10  # minutes
+    duration_mode: Literal["auto", "manual"] = "auto"
+    target_duration: float = 10.0  # minutes; fractional values preserve exact seconds
     avg_clip_duration: int = 5  # seconds per clip
     hdr_only: bool = False
     prioritize_favorites: bool = True
@@ -90,8 +100,8 @@ class AppState:
     scored_photos: list[Any] = field(default_factory=list)
     photo_budget_result: Any | None = None
 
-    # Analysis depth (fast or thorough)
-    analysis_depth: str = "fast"
+    # Analysis depth (auto, fast, or thorough)
+    analysis_depth: str = "auto"
 
     # Connection
     connected_user: str | None = None
@@ -136,8 +146,10 @@ class AppState:
         self.selected_clip_ids = set()
         self.selected_photo_ids = set()
         self.clip_segments = {}
+        self.cached_analysis_ids = set()
         self.clip_rotations = {}
         self.pipeline_result = None
+        self.timeline_plan = None
         self.review_selected_mode = False
         self._duplicates_processed = False
         self.title_suggestion_title = None
@@ -149,6 +161,11 @@ class AppState:
     def get_selected_clips(self) -> list[VideoClipInfo]:
         """Get the list of currently selected clips."""
         return [c for c in self.clips if c.asset.id in self.selected_clip_ids]
+
+    @property
+    def target_duration_seconds(self) -> float:
+        """Return the exact total runtime requested by Auto or Manual mode."""
+        return self.target_duration * 60.0
 
 
 # Session store: maps session_id → AppState
@@ -211,5 +228,6 @@ def ensure_config(state: AppState) -> None:
         state.config = config
         state.immich_url = config.immich.url
         state.immich_api_key = config.immich.api_key
+        state.immich_api_version = config.immich.api_version
         state.include_live_photos = config.analysis.include_live_photos
         state.include_photos = config.photos.enabled

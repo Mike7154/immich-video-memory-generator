@@ -6,6 +6,18 @@ from datetime import date
 from unittest.mock import MagicMock, patch
 
 
+def _trip_config():
+    """Return a real config so strict encoding fields cannot become MagicMocks."""
+    from immich_memories.config_loader import Config
+
+    config = Config()
+    config.trips.homebase_latitude = 50.85
+    config.trips.homebase_longitude = 4.35
+    config.trips.min_distance_km = 50
+    config.defaults.transition = "smart"
+    return config
+
+
 class TestPhotoOnlyTripNotSkipped:
     """A trip with photos but no videos should not be skipped at the gate."""
 
@@ -138,11 +150,7 @@ class TestTripGenerationPhotoFetch:
 
             mock_generate.return_value = (MagicMock(), False, None)
 
-            mock_config = MagicMock()
-            mock_config.trips.homebase_latitude = 50.85
-            mock_config.trips.homebase_longitude = 4.35
-            mock_config.trips.min_distance_km = 50
-            mock_config.defaults.transition = "smart"
+            mock_config = _trip_config()
 
             handle_trip_generation(
                 client=mock_client,
@@ -172,11 +180,18 @@ class TestTripGenerationPhotoFetch:
                 subtitle_override=None,
                 upload_to_immich=False,
                 album=None,
+                source="auto",
+                memory_key="trip:key",
+                memory_category="trip",
+                automation_attempt_id="attempt-trip-1",
+                dry_run=True,
             )
 
             # Photos fetched and pipeline called (not skipped)
             mock_client.get_photos_for_date_range.assert_called_once()
             mock_generate.assert_called_once()
+            assert mock_generate.call_args.kwargs["automation_attempt_id"] == "attempt-trip-1"
+            assert mock_generate.call_args.kwargs["dry_run"] is True
 
     def test_empty_trip_skipped_gracefully(self):
         """Trip with no videos, no live photos, and no photos → skipped with error."""
@@ -220,7 +235,7 @@ class TestTripGenerationPhotoFetch:
 
             handle_trip_generation(
                 client=mock_client,
-                config=MagicMock(),
+                config=_trip_config(),
                 progress=MagicMock(),
                 year=2021,
                 month=7,

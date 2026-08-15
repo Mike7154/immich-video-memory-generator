@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import MagicMock, call, patch
+
+import pytest
+
+from immich_memories.config_loader import Config
 
 
 class TestDensityBudgetCap:
@@ -109,6 +114,310 @@ class TestDensityBudgetCap:
         # With 1.3x multiplier + 1.5x cap, should be well under 200
         assert len(result) < 100
 
+    def test_short_target_logs_the_effective_positive_raw_budget(self):
+        """The diagnostic must report the calculator's capped-overhead budget."""
+        from immich_memories.analysis.smart_pipeline import PipelineConfig, SmartPipeline
+
+        config = PipelineConfig(target_clips=10, target_duration_seconds=48.5)
+        pipeline = SmartPipeline(
+            client=MagicMock(),
+            analysis_cache=MagicMock(),
+            thumbnail_cache=MagicMock(),
+            config=config,
+            analysis_config=MagicMock(min_segment_duration=1.5),
+            app_config=MagicMock(),
+        )
+        clips = [self._make_clip(f"clip{i}") for i in range(20)]
+
+        with patch("immich_memories.analysis.density_budget.log_budget_summary") as summary:
+            pipeline._phase_filter(clips)
+
+        buckets, logged_budget = summary.call_args.args
+        assert logged_budget > 0
+        assert logged_budget == pytest.approx(sum(bucket.quota_seconds for bucket in buckets))
+
+    def test_density_budget_counts_usable_excerpt_not_full_source_duration(self):
+        """A five-minute source consumes one planned excerpt in the analysis budget."""
+        from immich_memories.analysis.smart_pipeline import PipelineConfig, SmartPipeline
+
+        pipeline = SmartPipeline(
+            client=MagicMock(),
+            analysis_cache=MagicMock(),
+            thumbnail_cache=MagicMock(),
+            config=PipelineConfig(target_clips=10, avg_clip_duration=5.0),
+            analysis_config=MagicMock(min_segment_duration=1.5),
+            app_config=MagicMock(),
+        )
+        clip = self._make_clip("five-minute-source")
+        clip.duration_seconds = 300.0
+
+        with patch(
+            "immich_memories.analysis.density_budget.compute_density_budget",
+            return_value=[],
+        ) as compute:
+            pipeline._phase_filter([clip])
+
+        assert compute.call_args.kwargs["assets"][0].duration == 5.0
+
+
+class TestAnalysisEligibility:
+    def _pipeline(self, tmp_path: Path, **config_kwargs):
+        from immich_memories.analysis.smart_pipeline import PipelineConfig, SmartPipeline
+
+        analysis_cache = MagicMock()
+        analysis_cache.get_analysis.return_value = None
+        return SmartPipeline(
+            client=MagicMock(),
+            analysis_cache=analysis_cache,
+            thumbnail_cache=MagicMock(),
+            config=PipelineConfig(**config_kwargs),
+            analysis_config=MagicMock(min_segment_duration=1.5),
+            app_config=Config(
+                cache={"directory": str(tmp_path / "cache")},
+                llm={"model": "qwen-3.6"},
+                content_analysis={"enabled": True},
+            ),
+        )
+
+    def test_auto_analyzes_every_cache_miss_in_a_manageable_pool(self, tmp_path: Path) -> None:
+        pipeline = self._pipeline(tmp_path, analysis_depth="auto")
+        clips = [TestDensityBudgetCap()._make_clip(f"clip-{index}") for index in range(41)]
+        pipeline._phase_cluster = MagicMock(return_value=clips)
+        pipeline._phase_filter = MagicMock(side_effect=AssertionError("must not shortlist"))
+        pipeline._analyze_with_cache_batch = MagicMock(return_value=[])
+        pipeline.analyzer.plan_cached_or_metadata = MagicMock(return_value=[])
+
+        pipeline.run_analysis(clips)
+
+        pipeline._analyze_with_cache_batch.assert_called_once_with(clips)
+        assert pipeline.last_deep_analysis_count == 41
+        assert pipeline.config.analysis_depth == "thorough"
+
+    def test_auto_shortlists_large_cache_miss_pools_but_uses_llm_for_shortlist(
+        self, tmp_path: Path
+    ) -> None:
+        pipeline = self._pipeline(tmp_path, analysis_depth="auto")
+        clips = [TestDensityBudgetCap()._make_clip(f"clip-{index}") for index in range(100)]
+        shortlisted = clips[:30]
+        pipeline._phase_cluster = MagicMock(return_value=clips)
+        pipeline._phase_filter = MagicMock(return_value=shortlisted)
+        pipeline._analyze_with_cache_batch = MagicMock(return_value=[])
+        pipeline.analyzer.plan_cached_or_metadata = MagicMock(return_value=[])
+
+        pipeline.run_analysis(clips)
+
+        pipeline._phase_filter.assert_called_once_with(clips, hard_filtered=True)
+        pipeline._analyze_with_cache_batch.assert_called_once_with(shortlisted)
+        assert pipeline.last_deep_analysis_count == 30
+        assert pipeline.config.analysis_depth == "thorough"
+
+    def test_auto_budgets_current_model_cache_misses_not_total_assets(self, tmp_path: Path) -> None:
+        pipeline = self._pipeline(tmp_path, analysis_depth="auto")
+        clips = [TestDensityBudgetCap()._make_clip(f"clip-{index}") for index in range(100)]
+
+        def cached_or_missing(asset_id: str):
+            if int(asset_id.removeprefix("clip-")) < 50:
+                return MagicMock(model_version="qwen-3.6", segments=[MagicMock()])
+            return None
+
+        pipeline.analysis_cache.get_analysis.side_effect = cached_or_missing
+        pipeline._phase_cluster = MagicMock(return_value=clips)
+        pipeline._phase_filter = MagicMock(side_effect=AssertionError("must not shortlist"))
+        pipeline._analyze_with_cache_batch = MagicMock(return_value=[])
+        pipeline.analyzer.plan_cached_or_metadata = MagicMock(return_value=[])
+
+        pipeline.run_analysis(clips)
+
+        pipeline._analyze_with_cache_batch.assert_called_once_with(clips)
+        assert pipeline.last_deep_analysis_count == 100
+
+    def test_thorough_analyzes_every_eligible_clip_unconditionally(self, tmp_path: Path) -> None:
+        pipeline = self._pipeline(tmp_path, analysis_depth="thorough")
+        clips = [TestDensityBudgetCap()._make_clip(f"clip-{index}") for index in range(20)]
+        pipeline._phase_cluster = MagicMock(return_value=clips)
+        pipeline._phase_filter = MagicMock(side_effect=AssertionError("must not shortlist"))
+        pipeline._analyze_with_cache_batch = MagicMock(return_value=[])
+        pipeline.analyzer.plan_cached_or_metadata = MagicMock(return_value=[])
+
+        pipeline.run_analysis(clips)
+
+        pipeline._analyze_with_cache_batch.assert_called_once_with(clips)
+        assert pipeline.last_deep_analysis_count == 20
+
+    def test_fast_analysis_shortlist_does_not_delete_eligible_leftovers(self, tmp_path: Path):
+        from immich_memories.analysis.smart_pipeline import ClipWithSegment
+
+        pipeline = self._pipeline(
+            tmp_path,
+            target_clips=1,
+            avg_clip_duration=5.0,
+            analysis_depth="fast",
+        )
+        clips = [
+            TestDensityBudgetCap()._make_clip("analyzed"),
+            TestDensityBudgetCap()._make_clip("leftover-1"),
+            TestDensityBudgetCap()._make_clip("leftover-2"),
+        ]
+        analyzed = ClipWithSegment(clips[0], 1.0, 5.0, 0.9)
+        fallbacks = [
+            ClipWithSegment(clips[1], 0.0, 5.0, 0.2),
+            ClipWithSegment(clips[2], 0.0, 5.0, 0.1),
+        ]
+        pipeline._phase_cluster = MagicMock(return_value=clips)
+        pipeline._phase_filter = MagicMock(return_value=[clips[0]])
+        pipeline._analyze_with_cache_batch = MagicMock(return_value=[analyzed])
+        pipeline.analyzer.plan_cached_or_metadata = MagicMock(return_value=fallbacks)
+
+        result = pipeline.run_analysis(clips)
+
+        assert [item.clip.asset.id for item in result] == [
+            "analyzed",
+            "leftover-1",
+            "leftover-2",
+        ]
+        assert pipeline.last_deep_analysis_count == 1
+        pipeline.analyzer.plan_cached_or_metadata.assert_called_once_with(clips[1:])
+
+    def test_hdr_only_is_a_hard_eligibility_rule_even_for_favorites(self, tmp_path: Path):
+        pipeline = self._pipeline(tmp_path, hdr_only=True)
+        hdr = TestDensityBudgetCap()._make_clip("hdr")
+        hdr.color_transfer = "smpte2084"
+        favorite_sdr = TestDensityBudgetCap()._make_clip("favorite-sdr", is_favorite=True)
+
+        result = pipeline._hard_eligible_clips([hdr, favorite_sdr])
+
+        assert [clip.asset.id for clip in result] == ["hdr"]
+
+
+class TestSharedVideoCacheBatch:
+    def test_pipeline_owns_and_injects_one_cache_batch(self, tmp_path: Path):
+        """All analysis downloads share the pipeline's one active batch."""
+        from immich_memories.analysis.smart_pipeline import SmartPipeline
+
+        cache = MagicMock()
+        batch = MagicMock()
+        cache.begin_batch.return_value.__enter__.return_value = batch
+        pipeline = SmartPipeline(
+            client=MagicMock(),
+            analysis_cache=MagicMock(),
+            thumbnail_cache=MagicMock(),
+            analysis_config=MagicMock(),
+            app_config=Config(cache={"directory": str(tmp_path / "cache")}),
+        )
+        pipeline._video_cache = cache
+        pipeline.analyzer._video_cache = cache
+        pipeline.previewer._video_cache = cache
+        pipeline.analyzer.bind_cache_batch = MagicMock()
+        pipeline.previewer.bind_cache_batch = MagicMock()
+        pipeline.analyzer.phase_analyze = MagicMock(return_value=[])
+
+        result = pipeline._analyze_with_cache_batch([])
+
+        assert result == []
+        cache.begin_batch.assert_called_once()
+        pipeline.analyzer.bind_cache_batch.assert_has_calls([call(batch), call(None)])
+        pipeline.previewer.bind_cache_batch.assert_has_calls([call(batch), call(None)])
+
+    def test_pipeline_releases_shared_batch_after_analysis_failure(self, tmp_path: Path):
+        """A failed item cannot strand the active cache batch on the pipeline."""
+        from immich_memories.analysis.smart_pipeline import SmartPipeline
+
+        cache = MagicMock()
+        batch = MagicMock()
+        cache.begin_batch.return_value.__enter__.return_value = batch
+        pipeline = SmartPipeline(
+            client=MagicMock(),
+            analysis_cache=MagicMock(),
+            thumbnail_cache=MagicMock(),
+            analysis_config=MagicMock(),
+            app_config=Config(cache={"directory": str(tmp_path / "cache")}),
+        )
+        pipeline._video_cache = cache
+        pipeline.analyzer.bind_cache_batch = MagicMock()
+        pipeline.previewer.bind_cache_batch = MagicMock()
+        pipeline.analyzer.phase_analyze = MagicMock(side_effect=RuntimeError("analysis failed"))
+
+        with pytest.raises(RuntimeError, match="analysis failed"):
+            pipeline._analyze_with_cache_batch([])
+
+        cache.begin_batch.return_value.__exit__.assert_called_once()
+        pipeline.analyzer.bind_cache_batch.assert_has_calls([call(batch), call(None)])
+        pipeline.previewer.bind_cache_batch.assert_has_calls([call(batch), call(None)])
+
+    def test_pipeline_closes_analysis_services_without_cache_after_failure(self, tmp_path: Path):
+        """No-cache analysis failures still release reusable native/model services."""
+        from immich_memories.analysis.smart_pipeline import SmartPipeline
+
+        pipeline = SmartPipeline(
+            client=MagicMock(),
+            analysis_cache=MagicMock(),
+            thumbnail_cache=MagicMock(),
+            analysis_config=MagicMock(),
+            app_config=Config(cache={"directory": str(tmp_path / "cache")}),
+        )
+        pipeline._phase_cluster = MagicMock(return_value=[])
+        pipeline._phase_filter = MagicMock(return_value=[])
+        pipeline._analyze_with_cache_batch = MagicMock(side_effect=RuntimeError("analysis failed"))
+        pipeline.analyzer.close = MagicMock()
+        pipeline.previewer.close = MagicMock()
+
+        with pytest.raises(RuntimeError, match="analysis failed"):
+            pipeline.run_analysis([])
+
+        pipeline.analyzer.close.assert_called_once()
+        pipeline.previewer.close.assert_called_once()
+
+    def test_analysis_failure_retains_analysis_phase(self, tmp_path: Path):
+        """A failed analysis must not be reported as completed selection work."""
+        from immich_memories.analysis.progress import PipelinePhase
+        from immich_memories.analysis.smart_pipeline import SmartPipeline
+        from immich_memories.operations.phases import OperationalPhase
+
+        pipeline = SmartPipeline(
+            client=MagicMock(),
+            analysis_cache=MagicMock(),
+            thumbnail_cache=MagicMock(),
+            analysis_config=MagicMock(),
+            app_config=Config(cache={"directory": str(tmp_path / "cache")}),
+        )
+        pipeline._phase_cluster = MagicMock(return_value=[])
+        pipeline._phase_filter = MagicMock(return_value=[])
+
+        def fail_during_analysis(_candidates):
+            pipeline.tracker.start_phase(PipelinePhase.ANALYZING, 1)
+            raise RuntimeError("analysis failed")
+
+        pipeline._analyze_with_cache_batch = MagicMock(side_effect=fail_during_analysis)
+
+        with pytest.raises(RuntimeError, match="analysis failed"):
+            pipeline.run_analysis([])
+
+        assert pipeline.tracker.progress.phase is PipelinePhase.ANALYZING
+        assert pipeline.tracker.progress.operational_event is not None
+        assert pipeline.tracker.progress.operational_event.phase is OperationalPhase.ANALYSIS
+
+    def test_pipeline_closes_analysis_services_once_after_success(self, tmp_path: Path):
+        """The successful no-cache path has the same one-batch teardown ownership."""
+        from immich_memories.analysis.smart_pipeline import SmartPipeline
+
+        pipeline = SmartPipeline(
+            client=MagicMock(),
+            analysis_cache=MagicMock(),
+            thumbnail_cache=MagicMock(),
+            analysis_config=MagicMock(),
+            app_config=Config(cache={"directory": str(tmp_path / "cache")}),
+        )
+        pipeline._phase_cluster = MagicMock(return_value=[])
+        pipeline._phase_filter = MagicMock(return_value=[])
+        pipeline._analyze_with_cache_batch = MagicMock(return_value=[])
+        pipeline.analyzer.close = MagicMock()
+        pipeline.previewer.close = MagicMock()
+
+        assert pipeline.run_analysis([]) == []
+
+        pipeline.analyzer.close.assert_called_once()
+        pipeline.previewer.close.assert_called_once()
+
 
 class TestUnifiedPhotoBudget:
     """Photo rendering should always use unified budget, never legacy render-all."""
@@ -172,11 +481,22 @@ class TestUnifiedPhotoBudget:
         mock_unified.assert_called_once()
 
     def test_ui_sets_target_duration_seconds(self):
-        """UI _build_generation_params should set target_duration_seconds."""
+        """UI generation receives total runtime and the exact Step 2 plan."""
+        from immich_memories.processing.timeline_budget import TimelinePlan
         from immich_memories.ui.pages._step4_generate import _build_generation_params
 
         state = MagicMock()
         state.target_duration = 5  # 5 minutes
+        state.target_duration_seconds = 300.0
+        state.timeline_plan = TimelinePlan(
+            target_duration=300.0,
+            content_budget=285.0,
+            title_budget=15.0,
+            title_duration=3.5,
+            ending_duration=7.0,
+            divider_duration=2.0,
+            max_dividers=2,
+        )
         state.generation_options = {}
         state.selected_person = None
         state.date_range = None
@@ -198,3 +518,4 @@ class TestUnifiedPhotoBudget:
             params = _build_generation_params(state, [], MagicMock())
 
         assert params.target_duration_seconds == 300  # 5 min * 60
+        assert params.timeline_plan is state.timeline_plan

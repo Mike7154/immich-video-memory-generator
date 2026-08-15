@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from immich_memories.processing.probe_cache import ProbeCache
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +28,15 @@ def _build_audio_filter_graph(
     matches the video frame count exactly — prevents cumulative drift.
     """
     audio_format = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
-    loudnorm = ",loudnorm=I=-16:TP=-1.5:LRA=11" if normalize_audio else ""
+    # WHY: Single-pass loudnorm can emit NaN samples for short silent inputs
+    # (common for generated photo clips). AAC rejects those samples with EINVAL.
+    # Replace only non-finite output with digital silence, then undo loudnorm's
+    # internal high-rate resampling so every transition receives stable 48 kHz.
+    loudnorm = (
+        f",loudnorm=I=-16:TP=-1.5:LRA=11,aeval='if(isnan(val(ch)),0,val(ch))':c=same,{audio_format}"
+        if normalize_audio
+        else ""
+    )
     # WHY: lowpass=300 on top of segment-wise reversal creates a warm "mumble" —
     # you hear people talking but can't understand words. The reversal destroys
     # phoneme order; the lowpass removes remaining high-freq consonant artifacts.
@@ -73,13 +86,19 @@ def _build_audio_filter_graph(
     return ";".join(filter_parts)
 
 
-def _probe_max_audio_bitrate(clips: list) -> str:
+def _probe_max_audio_bitrate(clips: list, *, probe_cache: ProbeCache | None = None) -> str:
     """Probe clips for highest audio bitrate. Returns e.g. "256k".
 
     Falls back to 192k if probing fails (reasonable for iPhone/modern cameras).
     """
     max_bitrate = 0
     for clip in clips:
+        if probe_cache is not None:
+            from immich_memories.processing.probe_cache import ProbeError
+
+            with contextlib.suppress(OSError, ProbeError, ValueError):
+                max_bitrate = max(max_bitrate, probe_cache.get(clip.path).audio_bitrate)
+            continue
         try:
             result = subprocess.run(  # noqa: S603, S607
                 [
@@ -124,6 +143,7 @@ def extract_and_mix_audio(
     privacy_mode: bool = False,
     pre_extracted_audio: list[Path] | None = None,
     video_duration: float | None = None,
+    probe_cache: ProbeCache | None = None,
 ) -> None:
     """Extract audio from clips and mix with crossfade transitions.
 
@@ -139,7 +159,7 @@ def extract_and_mix_audio(
     reading audio from the original clip files — avoids a redundant decode pass
     and guarantees audio/video timing alignment.
     """
-    audio_bitrate = _probe_max_audio_bitrate(clips)
+    audio_bitrate = _probe_max_audio_bitrate(clips, probe_cache=probe_cache)
     logger.info(f"Audio output bitrate: {audio_bitrate} (matched to source max)")
 
     # WHY: Segment-wise reversal reverses audio in 200ms chunks, destroying
@@ -272,8 +292,15 @@ def _cleanup_temp_files(paths: list[Path]) -> None:
         p.with_suffix(".raw.wav").unlink(missing_ok=True)
 
 
-def _probe_duration(path: Path) -> float:
+def _probe_duration(path: Path, *, probe_cache: ProbeCache | None = None) -> float:
     """Get actual duration of a media file via ffprobe."""
+    if probe_cache is not None:
+        from immich_memories.processing.probe_cache import ProbeError
+
+        try:
+            return probe_cache.get(path).duration_seconds
+        except (OSError, ProbeError, ValueError):
+            return 0.0
     result = subprocess.run(  # noqa: S603, S607
         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
         capture_output=True,

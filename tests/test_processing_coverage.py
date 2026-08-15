@@ -13,6 +13,7 @@ from immich_memories.processing.assembly_config import (
     AssemblyClip,
     AssemblySettings,
     TransitionType,
+    standalone_assembly_encoding_plan,
 )
 from immich_memories.processing.clips import (
     ClipExtractor,
@@ -26,17 +27,11 @@ from immich_memories.processing.ffmpeg_prober import FFmpegProber
 from immich_memories.processing.hardware import HWAccelBackend, HWAccelCapabilities
 from immich_memories.processing.hdr_utilities import (
     _check_zscale_available,
-    _crf_to_vt_quality,
-    _encoder_args_cpu,
-    _encoder_args_macos,
-    _encoder_args_nvenc,
     _get_colorspace_filter,
     _get_dominant_hdr_type,
-    _get_gpu_encoder_args,
     _get_hdr_conversion_filter,
     _get_hdr_to_hdr_filter,
     _get_sdr_to_hdr_filter,
-    _hdr_color_args,
     has_any_hdr_clip,
     quality_to_crf,
 )
@@ -679,12 +674,14 @@ class TestEnhanceWithLlm:
     """Lines 255-303: LLM scoring with cache."""
 
     def test_cache_hit_skips_llm(self, tmp_path):
+        from immich_memories.config_loader import Config
         from immich_memories.config_models import PhotoConfig
         from immich_memories.photos.photo_pipeline import _enhance_with_llm
 
         asset = _make_asset(id="cached-001")
         scored = [(asset, 0.5)]
         config = PhotoConfig()
+        app_config = Config(llm={"model": "qwen-test"}, content_analysis={"enabled": True})
 
         mock_cache = MagicMock()
         mock_cache.get_asset_scores_batch.return_value = {"cached-001": {"combined_score": 0.95}}
@@ -695,18 +692,25 @@ class TestEnhanceWithLlm:
             return_value=mock_cache,
         ):
             result = _enhance_with_llm(
-                scored, config, tmp_path, MagicMock(), db_path=tmp_path / "db.sqlite"
+                scored,
+                config,
+                tmp_path,
+                MagicMock(),
+                db_path=tmp_path / "db.sqlite",
+                app_config=app_config,
             )
 
         assert result[0][1] == 0.95
 
     def test_cache_miss_calls_llm(self, tmp_path):
+        from immich_memories.config_loader import Config
         from immich_memories.config_models import PhotoConfig
         from immich_memories.photos.photo_pipeline import _enhance_with_llm
 
         asset = _make_asset(id="uncached-001")
         scored = [(asset, 0.5)]
         config = PhotoConfig()
+        app_config = Config(llm={"model": "qwen-test"}, content_analysis={"enabled": True})
 
         mock_cache = MagicMock()
         mock_cache.get_asset_scores_batch.return_value = {}
@@ -722,7 +726,12 @@ class TestEnhanceWithLlm:
             ),
         ):
             result = _enhance_with_llm(
-                scored, config, tmp_path, MagicMock(), db_path=tmp_path / "db.sqlite"
+                scored,
+                config,
+                tmp_path,
+                MagicMock(),
+                db_path=tmp_path / "db.sqlite",
+                app_config=app_config,
             )
 
         assert result[0][1] == 0.85
@@ -754,7 +763,7 @@ class TestLlmScorePhoto:
 
         assert result == 0.92
 
-    def test_falls_back_to_meta_score_on_llm_error(self, tmp_path):
+    def test_llm_error_is_not_reported_as_a_semantic_score(self, tmp_path):
         from immich_memories.config_models import PhotoConfig
         from immich_memories.photos.photo_pipeline import _llm_score_photo
 
@@ -777,7 +786,7 @@ class TestLlmScorePhoto:
                 thumbnail_fn=MagicMock(return_value=b"\xff"),
             )
 
-        assert result == 0.6
+        assert result is None
 
     def test_falls_back_to_full_download(self, tmp_path):
         from immich_memories.config_models import PhotoConfig
@@ -811,7 +820,7 @@ class TestLlmScorePhoto:
 
         assert result == 0.88
 
-    def test_download_failure_returns_meta_score(self, tmp_path):
+    def test_download_failure_is_not_reported_as_a_semantic_score(self, tmp_path):
         from immich_memories.config_models import PhotoConfig
         from immich_memories.photos.photo_pipeline import _llm_score_photo
 
@@ -824,7 +833,7 @@ class TestLlmScorePhoto:
         result = _llm_score_photo(
             asset, 0.3, config, tmp_path, fail_download, None, thumbnail_fn=None
         )
-        assert result == 0.3
+        assert result is None
 
 
 class TestRenderSinglePhoto:
@@ -923,6 +932,10 @@ class TestStreamRenderToMp4:
                 "immich_memories.photos.photo_pipeline.render_ken_burns_streaming",
                 return_value=[img],
             ),
+            patch(
+                "immich_memories.processing.hdr_utilities.check_zscale_available",
+                return_value=True,
+            ),
         ):
             _stream_render_to_mp4(img, params, output, 100, 100, gain_map_hdr=True, peak_nits=1200)
 
@@ -1000,7 +1013,9 @@ class TestParseResolutionFromStream:
     """Pure parsing logic — no subprocess needed."""
 
     def setup_method(self):
-        self.prober = FFmpegProber(settings=AssemblySettings())
+        self.prober = FFmpegProber(
+            settings=AssemblySettings(encoding_plan=standalone_assembly_encoding_plan())
+        )
 
     def test_landscape_no_rotation(self):
         stream = {"width": 1920, "height": 1080}
@@ -1051,7 +1066,9 @@ class TestPickResolutionTier:
     """Pure logic — resolution tier selection from counts."""
 
     def setup_method(self):
-        self.prober = FFmpegProber(settings=AssemblySettings())
+        self.prober = FFmpegProber(
+            settings=AssemblySettings(encoding_plan=standalone_assembly_encoding_plan())
+        )
         self.res_4k = (3840, 2160)
         self.res_1080p = (1920, 1080)
         self.res_720p = (1280, 720)
@@ -1103,7 +1120,9 @@ class TestDetectMaxFramerate:
     """Framerate rounding to common values."""
 
     def setup_method(self):
-        self.prober = FFmpegProber(settings=AssemblySettings())
+        self.prober = FFmpegProber(
+            settings=AssemblySettings(encoding_plan=standalone_assembly_encoding_plan())
+        )
 
     def test_60fps_round(self, tmp_path):
         clip = AssemblyClip(path=tmp_path / "a.mp4", duration=5.0)
@@ -1133,17 +1152,25 @@ class TestEstimateDuration:
     """Duration estimation with transition overlap."""
 
     def test_no_clips(self):
-        prober = FFmpegProber(settings=AssemblySettings())
+        prober = FFmpegProber(
+            settings=AssemblySettings(encoding_plan=standalone_assembly_encoding_plan())
+        )
         assert prober.estimate_duration([]) == 0.0
 
     def test_single_clip(self, tmp_path):
-        prober = FFmpegProber(settings=AssemblySettings(transition=TransitionType.CROSSFADE))
+        prober = FFmpegProber(
+            settings=AssemblySettings(
+                encoding_plan=standalone_assembly_encoding_plan(),
+                transition=TransitionType.CROSSFADE,
+            )
+        )
         clip = AssemblyClip(path=tmp_path / "a.mp4", duration=10.0)
         assert prober.estimate_duration([clip]) == 10.0
 
     def test_crossfade_overlap(self, tmp_path):
         prober = FFmpegProber(
             settings=AssemblySettings(
+                encoding_plan=standalone_assembly_encoding_plan(),
                 transition=TransitionType.CROSSFADE,
                 transition_duration=0.5,
             )
@@ -1153,7 +1180,12 @@ class TestEstimateDuration:
         assert prober.estimate_duration(clips) == 14.0
 
     def test_cut_no_overlap(self, tmp_path):
-        prober = FFmpegProber(settings=AssemblySettings(transition=TransitionType.CUT))
+        prober = FFmpegProber(
+            settings=AssemblySettings(
+                encoding_plan=standalone_assembly_encoding_plan(),
+                transition=TransitionType.CUT,
+            )
+        )
         clips = [AssemblyClip(path=tmp_path / f"{i}.mp4", duration=5.0) for i in range(3)]
         assert prober.estimate_duration(clips) == 15.0
 
@@ -1257,8 +1289,9 @@ class TestSdrToHdrFilter:
         f = _get_sdr_to_hdr_filter("pq", "bt709", has_zscale=True)
         assert "smpte2084" in f
 
-    def test_no_zscale_returns_empty(self):
-        assert _get_sdr_to_hdr_filter("hlg", "bt709", has_zscale=False) == ""
+    def test_no_zscale_fails_closed(self):
+        with pytest.raises(RuntimeError, match="zscale"):
+            _get_sdr_to_hdr_filter("hlg", "bt709", has_zscale=False)
 
     def test_display_p3_source(self):
         f = _get_sdr_to_hdr_filter("hlg", "smpte432", has_zscale=True)
@@ -1283,8 +1316,9 @@ class TestHdrToHdrFilter:
     def test_same_type_returns_empty(self):
         assert _get_hdr_to_hdr_filter("hlg", "hlg", has_zscale=True) == ""
 
-    def test_no_zscale_returns_empty(self):
-        assert _get_hdr_to_hdr_filter("hlg", "pq", has_zscale=False) == ""
+    def test_no_zscale_fails_closed(self):
+        with pytest.raises(RuntimeError, match="zscale"):
+            _get_hdr_to_hdr_filter("hlg", "pq", has_zscale=False)
 
 
 class TestGetHdrConversionFilter:
@@ -1327,121 +1361,6 @@ class TestQualityToCrf:
         assert quality_to_crf("ultra") == 12
 
 
-class TestCrfToVtQuality:
-    def test_crf_12(self):
-        assert _crf_to_vt_quality(12) == 66
-
-    def test_crf_18(self):
-        assert _crf_to_vt_quality(18) == 54
-
-    def test_clamps_low(self):
-        assert _crf_to_vt_quality(51) == 20
-
-    def test_clamps_high(self):
-        assert _crf_to_vt_quality(0) == 90
-
-
-class TestHdrColorArgs:
-    def test_returns_expected_args(self):
-        args = _hdr_color_args("arib-std-b67")
-        assert args == [
-            "-colorspace",
-            "bt2020nc",
-            "-color_primaries",
-            "bt2020",
-            "-color_trc",
-            "arib-std-b67",
-        ]
-
-
-class TestEncoderArgsMacos:
-    def test_sdr_mode(self):
-        args = _encoder_args_macos(18, preserve_hdr=False, color_trc="arib-std-b67")
-        assert "hevc_videotoolbox" in args
-        assert "-pix_fmt" not in args
-
-    def test_hdr_mode(self):
-        args = _encoder_args_macos(12, preserve_hdr=True, color_trc="arib-std-b67")
-        assert "p010le" in args
-        assert "bt2020" in args
-
-
-class TestEncoderArgsNvenc:
-    def test_available(self):
-        # WHY: subprocess.run checks for hevc_nvenc encoder
-        with patch("immich_memories.processing.hdr_utilities.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout="hevc_nvenc available")
-            args = _encoder_args_nvenc(18, preserve_hdr=False, color_trc="arib-std-b67")
-
-        assert args is not None
-        assert "hevc_nvenc" in args
-
-    def test_not_available(self):
-        with patch("immich_memories.processing.hdr_utilities.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout="libx264 only")
-            args = _encoder_args_nvenc(18, preserve_hdr=False, color_trc="arib-std-b67")
-
-        assert args is None
-
-    def test_hdr_adds_color_args(self):
-        with patch("immich_memories.processing.hdr_utilities.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout="hevc_nvenc")
-            args = _encoder_args_nvenc(12, preserve_hdr=True, color_trc="smpte2084")
-
-        assert "p010le" in args
-        assert "bt2020" in args
-
-
-class TestEncoderArgsCpu:
-    def test_sdr_uses_libx264(self):
-        args = _encoder_args_cpu(18, preserve_hdr=False, color_trc="arib-std-b67", hdr_type="hlg")
-        assert "libx264" in args
-
-    def test_hdr_hlg_uses_libx265(self):
-        args = _encoder_args_cpu(12, preserve_hdr=True, color_trc="arib-std-b67", hdr_type="hlg")
-        assert "libx265" in args
-        assert "yuv420p10le" in args
-
-    def test_hdr_pq_x265_params(self):
-        args = _encoder_args_cpu(12, preserve_hdr=True, color_trc="smpte2084", hdr_type="pq")
-        x265_param = [a for a in args if "transfer=smpte2084" in a]
-        assert len(x265_param) == 1
-
-
-class TestGetGpuEncoderArgs:
-    def test_darwin_uses_videotoolbox(self):
-        with patch("immich_memories.processing.hdr_utilities.sys") as mock_sys:
-            mock_sys.platform = "darwin"
-            args = _get_gpu_encoder_args(crf=18)
-        assert "hevc_videotoolbox" in args
-
-    def test_linux_nvidia(self):
-        with (
-            patch("immich_memories.processing.hdr_utilities.sys") as mock_sys,
-            patch("immich_memories.processing.hdr_utilities.subprocess.run") as mock_run,
-        ):
-            mock_sys.platform = "linux"
-            mock_run.return_value = MagicMock(stdout="hevc_nvenc")
-            args = _get_gpu_encoder_args(crf=18)
-        assert "hevc_nvenc" in args
-
-    def test_linux_cpu_fallback(self):
-        with (
-            patch("immich_memories.processing.hdr_utilities.sys") as mock_sys,
-            patch("immich_memories.processing.hdr_utilities.subprocess.run") as mock_run,
-        ):
-            mock_sys.platform = "linux"
-            mock_run.return_value = MagicMock(stdout="libx264 libx265")
-            args = _get_gpu_encoder_args(crf=18, preserve_hdr=True, hdr_type="hlg")
-        assert "libx265" in args
-
-    def test_pq_color_trc(self):
-        with patch("immich_memories.processing.hdr_utilities.sys") as mock_sys:
-            mock_sys.platform = "darwin"
-            args = _get_gpu_encoder_args(crf=18, preserve_hdr=True, hdr_type="pq")
-        assert "smpte2084" in args
-
-
 class TestCheckZscaleAvailable:
     def setup_method(self):
         # WHY: check_zscale_available caches its result — reset between tests
@@ -1469,6 +1388,12 @@ class TestZscaleFallbackBehavior:
     """When zscale is unavailable, photo rendering falls back to SDR."""
 
     def setup_method(self):
+        import immich_memories.processing.hdr_utilities as hdr_mod
+
+        hdr_mod._zscale_cache = None
+
+    def teardown_method(self):
+        """Do not leak a mocked FFmpeg capability into unrelated tests."""
         import immich_memories.processing.hdr_utilities as hdr_mod
 
         hdr_mod._zscale_cache = None

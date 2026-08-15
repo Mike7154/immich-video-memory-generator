@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
+
 import click
 
 from immich_memories.timeperiod import (
@@ -12,6 +14,19 @@ from immich_memories.timeperiod import (
     from_period,
     parse_date,
 )
+
+
+def _parse_birthday(value: str) -> date:
+    """Parse the birthday option's documented MM/DD forms before generic dates."""
+    for candidate, date_format in (
+        (value, "%m/%d/%Y"),
+        (f"{value}/2000", "%m/%d/%Y"),
+    ):
+        try:
+            return datetime.strptime(candidate, date_format).date()
+        except ValueError:
+            continue
+    return parse_date(value)
 
 
 def _resolve_manual_dates(
@@ -47,6 +62,7 @@ def resolve_date_range(
     month: int | None = None,
     hemisphere: str = "north",
     years_back: int | None = None,
+    on_this_day_target: date | None = None,
 ) -> DateRange | list[DateRange]:
     """Resolve date range from command line options.
 
@@ -56,9 +72,23 @@ def resolve_date_range(
     """
     if memory_type:
         default_range = _resolve_memory_type_dates(
-            memory_type, year, season, month, hemisphere, years_back
+            memory_type,
+            year,
+            season,
+            month,
+            hemisphere,
+            years_back,
+            on_this_day_target,
         )
-        return _resolve_manual_dates(start, end, period) or default_range
+        manual_range = _resolve_manual_dates(start, end, period)
+        if manual_range:
+            return manual_range
+        if memory_type == "person_spotlight" and birthday:
+            try:
+                return birthday_year(_parse_birthday(birthday), year)
+            except ValueError as e:
+                raise click.UsageError(str(e))
+        return default_range
 
     manual = _resolve_manual_dates(start, end, period)
     if manual:
@@ -67,7 +97,7 @@ def resolve_date_range(
     if year:
         if birthday:
             try:
-                return birthday_year(parse_date(birthday), year)
+                return birthday_year(_parse_birthday(birthday), year)
             except ValueError as e:
                 raise click.UsageError(str(e))
         return calendar_year(year)
@@ -89,6 +119,7 @@ def _resolve_memory_type_dates(
     month: int | None,
     hemisphere: str,
     years_back: int | None = None,
+    on_this_day_target: date | None = None,
 ) -> DateRange | list[DateRange]:
     """Resolve date ranges from memory type preset."""
     from immich_memories.memory_types.date_builders import (
@@ -112,9 +143,10 @@ def _resolve_memory_type_dates(
         return build_month(month, year)
 
     if memory_type == "on_this_day":
-        from datetime import date
-
-        return build_on_this_day(date.today(), years_back=years_back)
+        return build_on_this_day(
+            on_this_day_target or date.today(),
+            years_back=years_back,
+        )
 
     # Types that use calendar year: year_in_review, person_spotlight, multi_person
     if not year:
@@ -144,7 +176,9 @@ def default_duration_for_type(
     """Get default duration in seconds for a memory type.
 
     Date-range based types scale with span (1 month = 60s, 1 year = 600s).
-    Fixed types: on_this_day (45s), trip (35s/day), person without range (120s).
+    Trip dates provide an editorial estimate; discovered media later applies
+    the capacity cap. Other fixed types: on_this_day (45s), person without
+    range (120s).
     """
     if not memory_type:
         return None
@@ -152,8 +186,10 @@ def default_duration_for_type(
     if memory_type == "on_this_day":
         return 45.0
     if memory_type == "trip" and date_range is not None:
+        from immich_memories.planning.auto_duration import trip_editorial_duration_seconds
+
         days = max(1, (date_range.end - date_range.start).days + 1)
-        return float(max(60, min(600, days * 35)))
+        return trip_editorial_duration_seconds(days)
     if memory_type in ("person_spotlight", "multi_person"):
         if date_range is None:
             return 120.0

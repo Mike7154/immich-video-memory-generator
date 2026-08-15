@@ -24,6 +24,10 @@ immich-memories ui
 
 This opens a web interface at `http://localhost:8080`.
 
+Authentication is disabled by default. If the UI binds beyond loopback, anyone who can reach the
+port can use it. Enable authentication before exposing it. The UI is single-user,
+single-replica; run one instance.
+
 ### First-Time Setup
 
 1. Enter your Immich server URL (e.g., `https://photos.example.com`)
@@ -41,6 +45,29 @@ This opens a web interface at `http://localhost:8080`.
 - **Test Connection**: Verifies your credentials work
 - **Save Config**: Saves settings for future sessions
 - **Preflight Check**: Tests all dependencies (FFmpeg, etc.)
+
+Immich Memories supports **Immich v2 and v3**. Leave API selection on its default:
+
+```yaml
+immich:
+  api_version: auto  # auto | v2 | v3
+```
+
+`auto` detects the server major version at runtime and selects the right API contract. You do not
+need to choose a version for each run. Explicit `v2` and `v3` are manual troubleshooting
+overrides—escape hatches for unusual proxies or deployments where version detection is wrong;
+each one forces that contract.
+
+The app normalizes v2 duration strings and v3 millisecond durations to seconds, selects the
+correct upload fields before sending a generated video, and sends timezone-aware asset search
+dates accepted by both majors.
+
+To test detection and authentication without generating or uploading anything, run the read-only
+check:
+
+```bash
+immich-memories config test
+```
 
 ### Time Period Selection
 
@@ -71,12 +98,24 @@ An expandable "Cache Management" panel at the bottom of Step 1 shows disk usage 
 
 ### Target Duration
 
-The suggested duration scales with your time period:
+For trip memories, **Auto** is the default after discovery. It starts at 30 seconds plus 10 seconds
+per active day, bounded to 60–300 seconds when there is enough media. It then checks usable
+excerpts—not raw source lengths—and shortens sparse trips rather than producing filler. A dense
+seven-day trip is about 1:40; a dense 12-day trip is 2:30. Switch to **Manual** for an exact target.
+
+Other memory types use preset durations that scale with their time period:
 - Full year: 10 minutes
 - Half year: 6 minutes
 - Quarter: 4 minutes
 - Month: 2 minutes
 - Less than a month: 1 minute
+
+The target is the finished video's duration, including the opening, dividers, ending, and
+transition overlap. The selector reserves those seconds before choosing media. If normal quality
+and photo-balance filters leave the timeline short, it backfills from unused eligible clips and
+may relax the photo ratio before giving up. It does not relax hard safety, date, person, or
+duplicate constraints. Final duration can vary by less than one transition because video is cut on
+frame boundaries.
 
 ---
 
@@ -86,7 +125,7 @@ After clicking "Next: Review Clips", you'll see all available videos.
 
 ### Summary Metrics
 
-- **Selected Clips**: How many videos are selected
+- **Selected Clips**: How many reviewed media items are checked
 - **Total Duration**: Combined length of all video content
 - **Target Duration**: Your goal for the final compilation
 
@@ -98,26 +137,41 @@ After clicking "Next: Review Clips", you'll see all available videos.
 | **Clips needed** | Auto-calculated based on target duration |
 | **HDR clips only** | Only use HDR videos (if available) |
 | **Prioritize favorites** | Include favorite videos first |
-| **Max non-favorites** | Limit non-favorite videos to this percentage (default: 25%) |
-| **Analyze all videos** | Slower but more thorough analysis |
+| **Preferred max non-favorites** | Favor this percentage; Auto may exceed it to fill the video |
+
+Analysis depth is chosen once in Step 1:
+
+- **Auto (recommended):** LLM-analyzes every eligible clip when at most 60 clips need fresh
+  analysis. Larger libraries use a time-balanced shortlist. Current-model cache hits do not count
+  toward that limit.
+- **Fast:** Uses the time-balanced shortlist and reserves LLM analysis for favorites.
+- **Thorough:** LLM-analyzes every eligible clip, unconditionally.
+
+Current cache results appear directly on clip cards. Cache entries from an unknown or different
+model are stale: the app ignores them and starts fresh analysis.
 
 #### Understanding "Max Non-Favorites"
 
-When you have a short time period with many videos, you don't want the compilation filled with random clips. The "Max non-favorites" slider limits how many non-favorite videos can be included.
+When you have a short time period with many videos, you don't want the compilation filled with random clips. The non-favorite slider sets a preference, not a destructive cap.
 
 For example, with 25% max:
 - If you select 20 clips total
-- At most 5 will be non-favorites
-- At least 15 will be favorites (if available)
+- The selector tries to keep non-favorites near 5
+- If the favorites cannot fill the timeline, eligible non-favorites are added instead of leaving it short
 
 ### The Analysis Pipeline
 
 When you click "Analyze", the system runs 4 phases:
 
 1. **Clustering**: Groups similar videos together (avoids duplicates)
-2. **Filtering**: Applies your preferences (HDR, favorites, etc.)
-3. **Analyzing**: Downloads and scores each video
+2. **Filtering**: Applies hard eligibility and builds a cost-bounded deep-analysis shortlist
+3. **Analyzing**: Deeply scores the shortlist; checked leftovers retain cached/metadata fallback segments
 4. **Refining**: Picks final clips and optimal segments
+
+Photos follow the same rule: every checked photo gets a metadata score, a distributed shortlist
+gets VLM scoring, and the enhanced results are merged back into the full pool. The final selector
+prefers two photos per day, balanced photo and non-favorite ratios, and temporal spacing. If those
+preferences leave a duration hole, it relaxes them in stages while keeping hard exclusions intact.
 
 ### During Analysis
 
@@ -156,13 +210,26 @@ After reviewing your clips, this step configures how the final video gets assemb
 | **Date overlay** | Checkbox to burn date text into the video | Off |
 | **Keep intermediate files** | Saves temporary files for debugging | Off |
 
+The table above describes the UI. For CLI and scheduled runs, omitting `--resolution` uses
+`output.resolution` from your config; pass `--resolution auto` explicitly to match the source
+clips. Output quality comes from the configured CRF (or the `quality` shorthand when CRF is not
+set) for software H.264/H.265 and Apple VideoToolbox. Other hardware backends retain their
+existing quality policies. On Apple, `encoder_preset` controls speed/effort, not image quality.
+
 ### Music
 
 Three options for background music:
 
 - **None**: No background music.
 - **Upload file**: Upload your own MP3, M4A, or WAV file. Volume slider controls how loud the music plays relative to original clip audio.
-- **AI Generated**: Generates a soundtrack based on the mood of your clips. The pipeline supports ACE-Step (recommended, higher quality) and MusicGen as backends, with automatic fallback. Both require a GPU server configured in your settings. You can generate 1-3 versions and pick the best one.
+- **AI Generated**: Generates a soundtrack based on the mood of your clips. ACE-Step supports direct local generation on Apple Silicon/CUDA and a hosted REST server. In local mode it automatically uses the configured ACE-Step server if the local package is unavailable. MusicGen is an alternative generator when ACE-Step is disabled, and can also provide remote Demucs stem separation. You can generate 1-3 versions and pick the best one.
+
+For ACE-Step v0.1.8 on a machine with at least 20GB of GPU/unified memory, use
+`model_variant: "acestep-v15-xl-turbo"` with `lm_model_size: "4B"`. These select two different
+components: the XL 4B audio model and the 4B planning model. In hosted `api` mode, select both on
+the ACE-Step server; the app cannot replace an already-loaded server model. Avoid unattended
+`xl-sft`/`xl-base` use on v0.1.8 until DCW is explicitly disabled for those non-turbo models or the
+upstream model-aware API fix is released.
 
 Both upload and AI options include a volume slider (0-100%).
 
@@ -232,6 +299,8 @@ From here you can:
 - Verify your Immich URL is correct (include `https://`)
 - Check your API key is valid
 - Ensure Immich server is running
+- Run the read-only `immich-memories config test` check. It reports the resolved `v2` or `v3`
+  API contract on success.
 
 ### No Videos Found
 
@@ -243,7 +312,7 @@ From here you can:
 ### Slow Analysis
 
 **Analysis taking too long**
-- Disable "Analyze all videos" for faster processing
+- Choose **Fast** analysis depth for the smallest LLM workload
 - Video analysis is cached - subsequent runs are faster
 - Check if hardware acceleration is enabled (`immich-memories hardware`)
 

@@ -18,11 +18,14 @@ Most users only need these options:
 immich:
   url: "https://photos.example.com"
   api_key: "${IMMICH_API_KEY}"
+  api_version: auto  # auto | v2 | v3
 
 # ── Output ────────────────────────────────────────────────
 output:
   directory: "~/Videos/Memories"
   resolution: "1080p"            # 720p, 1080p, 4k
+  codec: h265                     # Preserve HDR; use h264 for maximum compatibility
+  hdr_mode: auto                  # Preserve HLG/PQ when present; otherwise output SDR
 
 defaults:
   target_duration_seconds: 600   # 10-3600 seconds
@@ -51,6 +54,39 @@ scoring_priority:
 ```
 
 That's it. Everything else has sane defaults.
+
+With `codec: h265` and `hdr_mode: auto`, detected HLG or PQ material produces a 10-bit HDR video;
+SDR clips, photos, and titles are converted to the same HDR transfer during assembly. H.264 is
+always SDR. If you select `codec: h264`, detected HDR is tone-mapped to SDR even when
+`hdr_mode: auto` is set. Use H.264 when broad playback compatibility matters more than HDR.
+
+`target_duration_seconds` applies to the complete result, including titles and the time removed by
+overlapping fades. When eligible material exists, the optimizer backfills unused clips before
+accepting a short result. The encoded duration may differ by less than one transition because cuts
+land on video frame boundaries.
+
+## Immich API compatibility
+
+Immich Memories supports **Immich v2 and v3**. `auto` is the default runtime policy: the app
+detects the server major and selects the matching API contract. You do not choose a version for
+each run.
+
+Explicit `v2` and `v3` values are manual troubleshooting escape hatches for proxies or unusual
+deployments that break version detection. An override forces that contract; it is not a normal
+upgrade step.
+
+The compatibility layer converts v2 duration strings and v3 millisecond durations to seconds,
+uses version-specific upload fields, and sends timezone-aware search dates accepted by v3. Check
+the configured connection and resolved API contract without generating or uploading anything:
+
+```bash
+immich-memories config test
+```
+
+This check is read-only.
+
+`auto` is a runtime detection policy, not a switch you set before each generation. Use `v2` or
+`v3` only to diagnose a deployment that prevents detection, then return to `auto`.
 
 ## Clip pacing
 

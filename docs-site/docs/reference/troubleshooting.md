@@ -14,6 +14,38 @@ ConnectionError: Cannot connect to Immich at https://photos.example.com
 - Verify your API key is correct: **Immich > Account Settings > API Keys**.
 - Make sure Immich is actually reachable from wherever you're running this tool. If you're in Docker, `localhost` means the container, not your host machine: use the host's IP or Docker network hostname.
 
+Run the read-only compatibility check before changing anything:
+
+```bash
+immich-memories config test
+```
+
+It checks authentication and reports the resolved Immich API contract. It does not search,
+generate, create an album, or upload a video.
+
+## Immich v2/v3 Version Mismatch
+
+Immich Memories supports Immich v2 and v3. The normal configuration is:
+
+```yaml
+immich:
+  api_version: auto  # auto | v2 | v3
+```
+
+`auto` detects the server major at runtime; you do not pick one for each run. If a reverse proxy
+hides or rewrites `/api/server/version`, use `v2` or `v3` as a manual troubleshooting escape hatch.
+The override forces that contract, so match the real server major and return to `auto` once
+detection works.
+
+Do not flip the override as part of a routine v2-to-v3 upgrade. `auto` is runtime detection; the
+manual values exist to diagnose broken version discovery.
+
+The compatibility layer handles the known v2-to-v3 differences: duration strings versus integer
+milliseconds, version-specific upload fields, and the UTC offset on search dates. The read-only
+`immich-memories config test` reports the server version and authentication errors; it does not test
+uploads. If a v3 upload fails, keep the error shown by the command doing the upload and check the
+relevant Immich server logs. API keys are redacted.
+
 ## No Videos Found
 
 - Check the person name matches exactly what Immich has. Face recognition names are case-sensitive.

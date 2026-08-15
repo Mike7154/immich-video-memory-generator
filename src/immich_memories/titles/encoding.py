@@ -1,115 +1,64 @@
 """Video encoding utilities and resolution helpers for title screens.
 
 This module provides:
-- GPU-accelerated encoder argument selection (VideoToolbox, NVENC, libx265 fallback)
+- Encoding arguments derived from the resolved output plan
 - Resolution lookups for different orientations (landscape, portrait, square)
 - HLG/HDR colorspace metadata for concat compatibility
 """
 
 from __future__ import annotations
 
-import contextlib
-import logging
+from immich_memories.processing.clip_encoder import encoder_args_for_plan
+from immich_memories.processing.encoding_plan import EncodingPlan, HdrTransfer, OutputCodec
+from immich_memories.processing.hdr_utilities import (
+    _get_colorspace_filter,
+    _get_hdr_conversion_filter,
+)
 
-logger = logging.getLogger(__name__)
+
+def standalone_title_encoding_plan() -> EncodingPlan:
+    """Return the explicit SDR/H.264 contract for standalone title commands."""
+    return EncodingPlan(
+        codec=OutputCodec.H264,
+        encoder="libx264",
+        encoder_args=("-preset", "fast", "-crf", "17"),
+        target_transfer=HdrTransfer.NONE,
+        tone_map_to_sdr=False,
+        pixel_format="yuv420p",
+        container="mp4",
+        crf=17,
+    )
 
 
-def _get_gpu_encoder_args(hdr: bool = True) -> list[str]:
-    """Get GPU-accelerated encoder arguments for title screen video.
+def title_encoder_args(plan: EncodingPlan) -> list[str]:
+    """Build title-video FFmpeg arguments from an already-resolved plan."""
+    return encoder_args_for_plan(plan)
 
-    When hdr=True, outputs 10-bit HEVC with HLG (bt2020/arib-std-b67)
-    colorspace metadata for clean concatenation with HDR source clips.
-    When hdr=False, outputs 8-bit video without HDR metadata for SDR sources.
 
-    This is the SINGLE source of truth for title screen encoding.
-    All title video creation paths must call this function.
-
-    Args:
-        hdr: If True, use 10-bit HLG HDR encoding. If False, use 8-bit SDR.
-    """
-    import subprocess
-    import sys
-
-    color_args: list[str] = []
-    if hdr:
-        color_args = [
-            "-color_primaries",
-            "bt2020",
-            "-color_trc",
-            "arib-std-b67",
-            "-colorspace",
-            "bt2020nc",
-        ]
-
-    hdr_pix_fmt_hw = "p010le"  # 10-bit for hardware encoders
-    hdr_pix_fmt_sw = "yuv420p10le"  # 10-bit for software encoder
-    sdr_pix_fmt = "yuv420p"  # 8-bit for SDR
-
-    # WHY: H.264 instead of HEVC for title intermediates. Titles are re-encoded
-    # once during final assembly, so the intermediate codec doesn't matter — only
-    # quality retention and encoding speed. H.264 is 3-5x faster than HEVC on all
-    # hardware (VideoToolbox, NVENC, CPU) and universally available. At CRF 17-18
-    # quality easily survives one more transcode.
-
-    # macOS: VideoToolbox H.264 (GPU accelerated, ~3x faster than HEVC VT)
-    if sys.platform == "darwin":
-        return [
-            "-c:v",
-            "h264_videotoolbox",
-            "-q:v",
-            "55",
-            "-pix_fmt",
-            hdr_pix_fmt_hw if hdr else sdr_pix_fmt,
-            *color_args,
-        ]
-
-    # Check for NVIDIA NVENC H.264
-    with contextlib.suppress(Exception):
-        probe = subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=black:s=16x16:d=0.01",
-                "-c:v",
-                "h264_nvenc",
-                "-f",
-                "null",
-                "-",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
+def title_color_filter(plan: EncodingPlan, *, rgb_input: bool = True) -> str:
+    """Convert rendered SDR/RGB title pixels to the plan's exact transfer."""
+    target = plan.target_transfer.value if plan.hdr else "sdr"
+    parts: list[str] = []
+    if rgb_input:
+        # WHY: HDR Taichi frames arrive as rgb48le. Preserve their bit depth
+        # and chroma until zscale applies the SDR-to-HLG/PQ transfer; an 8-bit
+        # yuv420p intermediate would create banding in a nominal Main10 title.
+        parts.append("format=yuv444p16le" if plan.hdr else "format=yuv420p")
+    conversion = _get_hdr_conversion_filter(
+        "sdr",
+        target,
+        source_primaries="bt709",
+        required=True,
+    )
+    if conversion:
+        parts.append(conversion.removeprefix(","))
+    parts.extend(
+        (
+            _get_colorspace_filter(target).removeprefix(","),
+            f"format={plan.pixel_format}",
         )
-        if probe.returncode == 0:
-            return [
-                "-c:v",
-                "h264_nvenc",
-                "-preset",
-                "p4",
-                "-rc",
-                "constqp",
-                "-qp",
-                "18",
-                "-pix_fmt",
-                hdr_pix_fmt_hw if hdr else sdr_pix_fmt,
-                *color_args,
-            ]
-
-    # Fallback to CPU libx264 (fast on any hardware, even integrated GPUs)
-    return [
-        "-c:v",
-        "libx264",
-        "-crf",
-        "17",
-        "-preset",
-        "fast",
-        "-pix_fmt",
-        hdr_pix_fmt_sw if hdr else sdr_pix_fmt,
-        *color_args,
-    ]
+    )
+    return ",".join(parts)
 
 
 # Standard resolutions for each orientation

@@ -6,6 +6,7 @@ import contextlib
 import logging
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,9 +15,11 @@ from immich_memories.security import sanitize_filename
 
 if TYPE_CHECKING:
     from immich_memories.analysis.smart_pipeline import PipelineConfig
+    from immich_memories.analysis.unified_analyzer import UnifiedSegmentAnalyzer
     from immich_memories.api.immich import SyncImmichClient
     from immich_memories.api.models import VideoClipInfo
     from immich_memories.cache.database import VideoAnalysisCache
+    from immich_memories.cache.video_cache import CacheBatch, VideoDownloadCache
     from immich_memories.config_models import AnalysisConfig, CacheConfig, ContentAnalysisConfig
 
 logger = logging.getLogger(__name__)
@@ -32,11 +35,46 @@ class PreviewBuilder:
         cache_config: CacheConfig,
         analysis_config: AnalysisConfig,
         content_analysis_config: ContentAnalysisConfig,
+        video_cache: VideoDownloadCache | None = None,
+        hardware_enabled: bool = True,
     ):
         self.client = client
         self._cache_config = cache_config
         self._analysis_config = analysis_config
         self._content_analysis_config = content_analysis_config
+        self._video_cache = video_cache
+        self._hardware_enabled = hardware_enabled
+        self._cache_batch: CacheBatch | None = None
+        self._legacy_analyzer: UnifiedSegmentAnalyzer | None = None
+        self._owns_legacy_analyzer = False
+        self._legacy_analyzer_provider: Callable[[], UnifiedSegmentAnalyzer] | None = None
+
+    def bind_cache_batch(self, batch: CacheBatch | None) -> None:
+        """Use the SmartPipeline-owned batch for download requests in this run."""
+        self._cache_batch = batch
+
+    def bind_legacy_analyzer(self, analyzer: UnifiedSegmentAnalyzer | None) -> None:
+        """Bind ClipAnalyzer's reusable service for legacy fallback analysis."""
+        self._release_owned_legacy_analyzer()
+        self._legacy_analyzer = analyzer
+        self._owns_legacy_analyzer = False
+        self._legacy_analyzer_provider = None
+
+    def bind_legacy_analyzer_provider(
+        self, provider: Callable[[], UnifiedSegmentAnalyzer] | None
+    ) -> None:
+        """Use the ClipAnalyzer-owned service even when legacy analysis runs first."""
+        self._release_owned_legacy_analyzer()
+        self._legacy_analyzer = None
+        self._legacy_analyzer_provider = provider
+
+    def _release_owned_legacy_analyzer(self) -> None:
+        if self._owns_legacy_analyzer and self._legacy_analyzer is not None:
+            with contextlib.suppress(Exception):
+                self._legacy_analyzer.reset_for_video()
+            with contextlib.suppress(Exception):
+                self._legacy_analyzer.clear_cache(release_audio_analyzer=True)
+        self._owns_legacy_analyzer = False
 
     def find_cached_preview(self, asset_id: str, start: float, end: float) -> str | None:
         """Find or build a preview for a cached clip from the video cache."""
@@ -47,7 +85,7 @@ class PreviewBuilder:
         if stable_preview.exists():
             return str(stable_preview)
 
-        pipeline_preview_dir = Path.home() / ".cache" / "immich-memories" / "previews"
+        pipeline_preview_dir = c_config.cache_path / "previews"
         for p in pipeline_preview_dir.glob(f"*{asset_id[:8]}*"):
             if p.exists():
                 return str(p)
@@ -83,15 +121,19 @@ class PreviewBuilder:
 
     def download_clip_video(self, clip: VideoClipInfo) -> tuple[Path, Path | None]:
         """Download clip video, returning (video_path, temp_file_or_None)."""
-        from immich_memories.cache.video_cache import VideoDownloadCache
-
         c_config = self._cache_config
         if c_config.video_cache_enabled:
-            video_cache = VideoDownloadCache(
-                cache_dir=c_config.video_cache_path,
-                max_size_gb=c_config.video_cache_max_size_gb,
-                max_age_days=c_config.video_cache_max_age_days,
-            )
+            video_cache = self._cache_batch or self._video_cache
+            if video_cache is None:
+                from immich_memories.cache.video_cache import VideoDownloadCache
+
+                # Standalone PreviewBuilder callers retain bounded one-off cache
+                # semantics; SmartPipeline always injects its shared instance.
+                video_cache = VideoDownloadCache(
+                    cache_dir=c_config.video_cache_path,
+                    max_size_gb=c_config.video_cache_max_size_gb,
+                    max_age_days=c_config.video_cache_max_age_days,
+                )
             video_path = video_cache.download_or_get(self.client, clip.asset)
             return video_path, None
 
@@ -111,9 +153,7 @@ class PreviewBuilder:
         config: PipelineConfig,
         analysis_cache: VideoAnalysisCache,
     ) -> tuple[float, float, float]:
-        """Run legacy analysis using UnifiedSegmentAnalyzer (visual + silence boundaries)."""
-        import gc
-
+        """Run legacy analysis using a bound or standalone reusable analyzer."""
         from immich_memories.analysis.scoring import SceneScorer
         from immich_memories.analysis.unified_analyzer import UnifiedSegmentAnalyzer
         from immich_memories.config_models import AudioContentConfig
@@ -122,47 +162,62 @@ class PreviewBuilder:
         min_segment = a_config.min_segment_duration
         max_segment = a_config.max_segment_duration
 
-        scorer = SceneScorer(
-            content_analysis_config=self._content_analysis_config,
-            analysis_config=a_config,
-        )
-        analyzer = UnifiedSegmentAnalyzer(
-            scorer=scorer,
-            min_segment_duration=min_segment,
-            max_segment_duration=max_segment,
-            audio_content_config=AudioContentConfig(),
-            analysis_config=a_config,
-        )
-        segments = analyzer.analyze(analysis_video, video_duration=video_duration)
+        analyzer = self._legacy_analyzer
+        if analyzer is None:
+            if self._legacy_analyzer_provider is not None:
+                analyzer = self._legacy_analyzer_provider()
+            else:
+                scorer = SceneScorer(
+                    content_analysis_config=self._content_analysis_config,
+                    analysis_config=a_config,
+                )
+                analyzer = UnifiedSegmentAnalyzer(
+                    scorer=scorer,
+                    min_segment_duration=min_segment,
+                    max_segment_duration=max_segment,
+                    audio_content_config=AudioContentConfig(),
+                    analysis_config=a_config,
+                )
+                self._owns_legacy_analyzer = True
+            self._legacy_analyzer = analyzer
 
-        if not segments:
-            duration = clip.duration_seconds or 10
-            return 0.0, min(duration, config.avg_clip_duration), 0.0
+        try:
+            segments = analyzer.analyze(
+                analysis_video,
+                video_duration=video_duration,
+                enable_content_analysis=False,
+                enable_audio_content_analysis=False,
+            )
 
-        best = segments[0]  # Sorted by score, best first
-        segment_duration = max(min_segment, min(best.end_time - best.start_time, max_segment))
+            if not segments:
+                duration = clip.duration_seconds or 10
+                return 0.0, min(duration, config.avg_clip_duration), 0.0
 
-        start = best.start_time
-        end = start + segment_duration
-        score = best.total_score
+            best = segments[0]  # Sorted by score, best first
+            segment_duration = max(min_segment, min(best.end_time - best.start_time, max_segment))
 
-        if end > video_duration:
-            end = video_duration
-            start = max(0, end - segment_duration)
+            start = best.start_time
+            end = start + segment_duration
+            score = best.total_score
 
-        # Silence adjustment is handled by UnifiedSegmentAnalyzer's boundary detection
+            if end > video_duration:
+                end = video_duration
+                start = max(0, end - segment_duration)
 
-        moments = [seg.to_moment_score() for seg in segments]
-        analysis_cache.save_analysis(
-            asset=clip.asset, video_info=clip, perceptual_hash=None, segments=moments
-        )
+            moments = [seg.to_moment_score() for seg in segments]
+            analysis_cache.save_analysis(
+                asset=clip.asset, video_info=clip, perceptual_hash=None, segments=moments
+            )
 
-        del segments, moments
-        analyzer.clear_cache()
-        del analyzer
-        gc.collect()
+            return start, end, score
+        finally:
+            analyzer.reset_for_video()
 
-        return start, end, score
+    def close(self) -> None:
+        """Release only standalone legacy resources; bound services belong to ClipAnalyzer."""
+        self._release_owned_legacy_analyzer()
+        self._legacy_analyzer = None
+        self._legacy_analyzer_provider = None
 
     def extract_and_log_preview(
         self,
@@ -202,7 +257,7 @@ class PreviewBuilder:
         import subprocess
         import time
 
-        preview_dir = Path.home() / ".cache" / "immich-memories" / "previews"
+        preview_dir = self._cache_config.cache_path / "previews"
         preview_dir.mkdir(parents=True, exist_ok=True)
 
         MAX_PREVIEWS = 20
@@ -266,7 +321,7 @@ class PreviewBuilder:
             f"(duration: {duration:.1f}s, video: {video_duration:.1f}s)"
         )
 
-        encoder_args = _get_fast_encoder_args()
+        encoder_args = _get_fast_encoder_args(hardware_enabled=self._hardware_enabled)
 
         cmd = [
             "ffmpeg",

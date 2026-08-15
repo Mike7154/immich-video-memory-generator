@@ -18,11 +18,29 @@ def register_config_commands(main: click.Group) -> None:
     @click.option("--url", "-u", type=str, help="Immich server URL")
     @click.option("--api-key", "-k", type=str, help="Immich API key")
     @click.option("--show", "-s", is_flag=True, help="Show current configuration")
+    @click.argument("action", required=False, type=click.Choice(["test"]))
     @click.pass_context
-    def config(ctx: click.Context, url: str | None, api_key: str | None, show: bool) -> None:
+    def config(
+        ctx: click.Context,
+        url: str | None,
+        api_key: str | None,
+        show: bool,
+        action: str | None,
+    ) -> None:
         """Configure Immich connection settings."""
         cfg = ctx.obj["config"]
         config_path = Config.get_default_path()
+
+        if action == "test":
+            from immich_memories.preflight import CheckStatus, check_immich
+
+            result = check_immich(cfg)
+            details = f": {result.details}" if result.details else ""
+            if result.status is CheckStatus.OK:
+                print_success(f"{result.message}{details}")
+                return
+            print_error(f"{result.message}{details}")
+            ctx.exit(1)
 
         if show:
             # Display current config
@@ -77,6 +95,7 @@ def register_config_commands(main: click.Group) -> None:
                     with SyncImmichClient(
                         base_url=new_url,
                         api_key=new_api_key,
+                        api_version=cfg.immich.api_version,
                     ) as client:
                         user = client.get_current_user()
                         print_success(f"Connected! Logged in as: {user.name or user.email}")
@@ -98,6 +117,7 @@ def register_config_commands(main: click.Group) -> None:
         with SyncImmichClient(
             base_url=cfg.immich.url,
             api_key=cfg.immich.api_key,
+            api_version=cfg.immich.api_version,
         ) as client:
             people_list = client.get_all_people()
 
@@ -127,6 +147,7 @@ def register_config_commands(main: click.Group) -> None:
         with SyncImmichClient(
             base_url=cfg.immich.url,
             api_key=cfg.immich.api_key,
+            api_version=cfg.immich.api_version,
         ) as client:
             years_list = client.get_available_years()
 
@@ -143,6 +164,7 @@ def register_config_commands(main: click.Group) -> None:
         Checks:
         - Immich server connection and API key
         - LLM availability (Ollama or OpenAI-compatible)
+        - Semantic audio analysis (PANNs or energy fallback)
         - Hardware acceleration
         """
         from immich_memories.preflight import CheckStatus, run_preflight_checks

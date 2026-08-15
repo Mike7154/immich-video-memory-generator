@@ -9,7 +9,7 @@ Covers uncovered branches in:
 from __future__ import annotations
 
 import tempfile
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -849,10 +849,58 @@ class TestRenderingServiceInit:
                 animated_background=True,
                 content_clip_path=fake_clip,
             )
-            mock_extract.assert_called_once_with(fake_clip, 100, 100)
+            from immich_memories.processing.encoding_plan import HdrTransfer
+
+            mock_extract.assert_called_once_with(fake_clip, 100, 100, HdrTransfer.NONE)
             mock_create.assert_called_once()
             # background_image should be the extracted frame
             assert mock_create.call_args.kwargs["background_image"] is not None
+
+    def test_pil_fallback_uses_the_resolved_hdr_transfer(self):
+        """The static fallback must not decode an HLG clip as ordinary SDR RGB."""
+        from immich_memories.processing.encoding_plan import (
+            EncodingPlan,
+            HdrTransfer,
+            OutputCodec,
+        )
+        from immich_memories.titles.generator import TitleScreenConfig
+        from immich_memories.titles.rendering_service import RenderingService
+        from immich_memories.titles.styles import TitleStyle
+
+        plan = EncodingPlan(
+            codec=OutputCodec.H265,
+            encoder="hevc_videotoolbox",
+            encoder_args=("-q:v", "75"),
+            target_transfer=HdrTransfer.HLG,
+            tone_map_to_sdr=False,
+            pixel_format="p010le",
+            container="mp4",
+        )
+        service = RenderingService(TitleScreenConfig(use_gpu_rendering=False, encoding_plan=plan))
+        clip = Path("/tmp/hlg.mp4")
+
+        with (
+            patch("immich_memories.titles.rendering_service.create_title_video"),
+            patch.object(
+                service,
+                "_extract_blurred_frame",
+                return_value=np.zeros((100, 100, 3)),
+            ) as extract,
+        ):
+            service.create_title_video(
+                title="HLG",
+                subtitle=None,
+                style=TitleStyle(name="test"),
+                output_path=Path("/tmp/out.mp4"),
+                width=100,
+                height=100,
+                duration=1.0,
+                fps=30.0,
+                animated_background=True,
+                content_clip_path=clip,
+            )
+
+        extract.assert_called_once_with(clip, 100, 100, HdrTransfer.HLG)
 
 
 class TestExtractBlurredFrame:
@@ -1660,7 +1708,7 @@ class TestSearchServiceMetadata:
         assert payload["size"] == 50
 
     @pytest.mark.asyncio
-    async def test_search_metadata_with_filters(self):
+    async def test_search_metadata_normalizes_naive_dates_and_preserves_filters(self):
         from immich_memories.api.models import AssetType
         from immich_memories.api.search_service import SearchService
 
@@ -1676,13 +1724,88 @@ class TestSearchServiceMetadata:
             asset_type=AssetType.VIDEO,
             taken_after=taken_after,
             taken_before=taken_before,
+            page=3,
+            size=25,
         )
 
         payload = mock_request.call_args.kwargs["json"]
-        assert payload["personIds"] == ["p1"]
-        assert payload["type"] == "VIDEO"
-        assert "takenAfter" in payload
-        assert "takenBefore" in payload
+        assert payload == {
+            "page": 3,
+            "size": 25,
+            "withExif": True,
+            "withPeople": True,
+            "personIds": ["p1"],
+            "type": "VIDEO",
+            "takenAfter": "2024-01-01T00:00:00+00:00",
+            "takenBefore": "2024-12-31T00:00:00+00:00",
+        }
+        assert datetime.fromisoformat(payload["takenAfter"]).tzinfo is UTC
+        assert datetime.fromisoformat(payload["takenBefore"]).tzinfo is UTC
+
+    @pytest.mark.asyncio
+    async def test_search_metadata_converts_aware_dates_to_the_same_utc_instant(self):
+        from immich_memories.api.search_service import SearchService
+
+        mock_request = AsyncMock(
+            return_value={"assets": {"total": 0, "count": 0, "items": [], "nextPage": None}}
+        )
+        svc = SearchService(mock_request)
+        taken_after = datetime(
+            2024,
+            6,
+            1,
+            12,
+            30,
+            tzinfo=timezone(timedelta(hours=2)),
+        )
+        taken_before = datetime(
+            2024,
+            6,
+            30,
+            18,
+            tzinfo=timezone(timedelta(hours=-5)),
+        )
+
+        await svc.search_metadata(
+            taken_after=taken_after,
+            taken_before=taken_before,
+        )
+
+        payload = mock_request.call_args.kwargs["json"]
+        assert payload["takenAfter"] == "2024-06-01T10:30:00+00:00"
+        assert payload["takenBefore"] == "2024-06-30T23:00:00+00:00"
+        assert datetime.fromisoformat(payload["takenAfter"]) == taken_after.astimezone(UTC)
+        assert datetime.fromisoformat(payload["takenBefore"]) == taken_before.astimezone(UTC)
+
+    @pytest.mark.asyncio
+    async def test_search_metadata_normalizes_inclusive_date_boundaries(self):
+        from immich_memories.api.models import AssetType
+        from immich_memories.api.search_service import SearchService
+
+        mock_request = AsyncMock(
+            return_value={"assets": {"total": 0, "count": 0, "items": [], "nextPage": None}}
+        )
+        svc = SearchService(mock_request)
+
+        await svc.search_metadata(
+            person_ids=["person-1"],
+            asset_type=AssetType.VIDEO,
+            taken_after=date(2025, 1, 1),
+            taken_before=date(2025, 1, 31),
+            page=2,
+            size=40,
+        )
+
+        assert mock_request.call_args.kwargs["json"] == {
+            "page": 2,
+            "size": 40,
+            "withExif": True,
+            "withPeople": True,
+            "personIds": ["person-1"],
+            "type": "VIDEO",
+            "takenAfter": "2025-01-01T00:00:00+00:00",
+            "takenBefore": "2025-01-31T23:59:59.999999+00:00",
+        }
 
 
 def _make_asset(asset_id: str, created: str, is_live: bool = False) -> dict:

@@ -56,6 +56,7 @@ def score_photos(
     db_path: Path | None = None,
     app_config: Any = None,
     thumbnail_fn: Any = None,
+    provider_circuit: Any = None,
 ) -> list[tuple[Asset, float]]:
     """Score photos (metadata + LLM) without rendering.
 
@@ -65,27 +66,34 @@ def score_photos(
     if not assets:
         return []
 
-    # Phase 1: Fast metadata scoring (no I/O)
-    scored = [(a, score_photo(a, config)) for a in assets]
+    # Phase 1: Fast metadata scoring (no I/O). Keep this complete pool so the
+    # final optimizer can use unshortlisted photos when preferred media is sparse.
+    metadata_scored = [(a, score_photo(a, config)) for a in assets]
 
-    # Pre-cap with temporal distribution
+    # Cap only the expensive semantic-scoring shortlist.
     max_photos = _compute_max_photos(video_clip_count, config.max_ratio)
-    shortlist_size = min(len(scored), max_photos * 3)
-    if len(scored) > shortlist_size:
-        scored = _select_distributed(scored, shortlist_size)
+    shortlist_size = min(len(metadata_scored), max_photos * 3)
+    shortlist = metadata_scored
+    if len(shortlist) > shortlist_size:
+        shortlist = _select_distributed(shortlist, shortlist_size)
 
     # Phase 2: LLM scoring on shortlist (uses thumbnails, not full downloads)
-    scored = _enhance_with_llm(
-        scored,
+    enhanced = _enhance_with_llm(
+        shortlist,
         config,
         work_dir,
         download_fn,
         db_path=db_path,
         app_config=app_config,
         thumbnail_fn=thumbnail_fn,
+        provider_circuit=provider_circuit,
     )
+    enhanced_scores = {asset.id: score for asset, score in enhanced}
 
-    return scored
+    return [
+        (asset, enhanced_scores.get(asset.id, metadata_score))
+        for asset, metadata_score in metadata_scored
+    ]
 
 
 def score_and_select_photos(
@@ -100,6 +108,7 @@ def score_and_select_photos(
     clip_dates: list[str] | None = None,
     memory_type: str | None = None,
     transition_duration: float = 0.5,
+    provider_circuit: Any = None,
 ) -> PhotoSelectionResult:
     """Score photos and select within unified budget.
 
@@ -116,6 +125,7 @@ def score_and_select_photos(
         work_dir=work_dir,
         download_fn=download_fn,
         thumbnail_fn=thumbnail_fn,
+        provider_circuit=provider_circuit,
     )
 
     if not scored:
@@ -168,6 +178,7 @@ def render_photo_clips(
     db_path: Path | None = None,
     app_config: Any = None,
     thumbnail_fn: Any = None,
+    provider_circuit: Any = None,
 ) -> list[AssemblyClip]:
     """Convert photo assets to animated video clips for assembly.
 
@@ -187,6 +198,7 @@ def render_photo_clips(
         db_path=db_path,
         app_config=app_config,
         thumbnail_fn=thumbnail_fn,
+        provider_circuit=provider_circuit,
     )
     if not scored:
         return []
@@ -260,12 +272,21 @@ def _enhance_with_llm(
     db_path: Path | None = None,
     app_config: Any = None,
     thumbnail_fn: Any = None,
+    provider_circuit: Any = None,
 ) -> list[tuple[Asset, float]]:
     """Check cache first, then LLM-score uncached photos."""
 
+    if app_config is None or not app_config.content_analysis.enabled or not app_config.llm.model:
+        return scored
+
     cache = _get_score_cache(db_path) if db_path else None
     asset_ids = [a.id for a, _ in scored]
-    cached = cache.get_asset_scores_batch(asset_ids) if cache else {}
+    model_version = app_config.llm.model
+    cached = (
+        cache.get_asset_scores_batch(asset_ids, model_version=model_version)
+        if cache and model_version
+        else {}
+    )
 
     cache_hits = 0
     enhanced: list[tuple[Asset, float]] = []
@@ -285,16 +306,19 @@ def _enhance_with_llm(
             download_fn,
             app_config,
             thumbnail_fn=thumbnail_fn,
+            provider_circuit=provider_circuit,
         )
-        enhanced.append((asset, llm_score))
+        effective_score = llm_score if llm_score is not None else meta_score
+        enhanced.append((asset, effective_score))
 
-        # Store in cache
-        if cache:
+        # Only successful semantic results belong to the configured model.
+        if cache and llm_score is not None and model_version:
             cache.save_asset_score(
                 asset_id=asset.id,
                 asset_type="photo",
                 metadata_score=meta_score,
-                combined_score=llm_score,
+                combined_score=effective_score,
+                model_version=model_version,
             )
 
     if cache_hits:
@@ -311,13 +335,17 @@ def _llm_score_photo(
     download_fn: Any,
     app_config: Any,
     thumbnail_fn: Any = None,
-) -> float:
+    provider_circuit: Any = None,
+) -> float | None:
     """Score a photo with VLM using a lightweight thumbnail.
 
     Uses Immich thumbnail API (~100 KB) instead of downloading the full
     HEIC (5-15 MB). Falls back to full download if no thumbnail_fn.
     """
     from immich_memories.photos.scoring import score_photo_with_llm
+
+    if provider_circuit is not None and not provider_circuit.available:
+        return None
 
     thumb_path = work_dir / f"{asset.id}_thumb.jpg"
 
@@ -332,9 +360,15 @@ def _llm_score_photo(
 
     if thumb_path.exists():
         try:
-            return score_photo_with_llm(thumb_path, meta_score, config, app_config)
+            return score_photo_with_llm(
+                thumb_path,
+                meta_score,
+                config,
+                app_config,
+                provider_circuit=provider_circuit,
+            )
         except (OSError, RuntimeError, ValueError):
-            return meta_score
+            return None
 
     # Fallback: download full file (old behavior)
     ext = Path(asset.original_file_name).suffix if asset.original_file_name else ".jpg"
@@ -343,15 +377,21 @@ def _llm_score_photo(
         try:
             download_fn(asset.id, raw_path)
         except (OSError, RuntimeError, ValueError):
-            return meta_score
+            return None
 
     try:
         from immich_memories.photos.animator import prepare_photo_source
 
         prepared = prepare_photo_source(raw_path, work_dir)
-        return score_photo_with_llm(prepared.path, meta_score, config, app_config)
+        return score_photo_with_llm(
+            prepared.path,
+            meta_score,
+            config,
+            app_config,
+            provider_circuit=provider_circuit,
+        )
     except (OSError, RuntimeError, ValueError):
-        return meta_score
+        return None
 
 
 def _get_score_cache(db_path: Path):

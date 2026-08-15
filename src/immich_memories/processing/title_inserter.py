@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
@@ -13,7 +14,9 @@ from immich_memories.processing.assembly_config import (
     AssemblySettings,
     TransitionType,
 )
+from immich_memories.processing.encoding_plan import HdrTransfer
 from immich_memories.processing.ffmpeg_prober import FFmpegProber
+from immich_memories.processing.hdr_utilities import _get_colorspace_filter
 from immich_memories.processing.scaling_utilities import aggregate_mood_from_clips
 
 logger = logging.getLogger(__name__)
@@ -31,6 +34,12 @@ class TitleInserter:
     def __init__(self, settings: AssemblySettings, prober: FFmpegProber) -> None:
         self.settings = settings
         self.prober = prober
+
+    @staticmethod
+    def _divider_limit(title_settings: Any) -> int | None:
+        """Return only a real timeline cap; MagicMock/standalone callers remain uncapped."""
+        value = getattr(title_settings, "max_dividers", None)
+        return max(0, value) if isinstance(value, int) else None
 
     # ------------------------------------------------------------------
     # Pre-render first clip for title background
@@ -55,15 +64,14 @@ class TitleInserter:
         if not clips:
             return None
 
-        import subprocess
-
         from immich_memories.processing.assembly_engine import (
             create_assembly_context,
         )
-        from immich_memories.processing.hdr_utilities import _get_gpu_encoder_args
+        from immich_memories.processing.clip_encoder import encoder_args_for_plan
         from immich_memories.processing.streaming_assembler import _make_decoder
 
-        output_path = output_dir / "first_clip_processed.mp4"
+        plan = self.settings.encoding_plan
+        output_path = output_dir / f"first_clip_processed.{plan.container}"
         ctx = create_assembly_context(self.settings, self.prober, clips, target_w, target_h)
 
         # WHY: _make_decoder applies the EXACT same filter chain as the
@@ -82,16 +90,7 @@ class TitleInserter:
             hdr_type=hdr_type,
         )
 
-        preserve_hdr = hdr_type is not None
-        try:
-            encoder_args = _get_gpu_encoder_args(
-                crf=12,
-                preserve_hdr=preserve_hdr,
-                hdr_type=hdr_type or "hlg",
-            )
-        except (OSError, subprocess.SubprocessError) as e:
-            logger.debug("GPU encoder probe failed, using libx264: %s", e)
-            encoder_args = ["-c:v", "libx264", "-crf", "12"]
+        encoder_args = encoder_args_for_plan(plan)
 
         pix_fmt = "yuv420p10le" if hdr_type else "rgb24"
         # WHY: rawvideo pipe strips color metadata — must tag input explicitly
@@ -103,7 +102,7 @@ class TitleInserter:
                 "-color_primaries",
                 "bt2020",
                 "-color_trc",
-                "arib-std-b67",
+                ("smpte2084" if plan.target_transfer is HdrTransfer.PQ else "arib-std-b67"),
                 "-colorspace",
                 "bt2020nc",
             ]
@@ -113,6 +112,7 @@ class TitleInserter:
             "-s", f"{target_w}x{target_h}", "-r", str(fps),
             *input_color_args,
             "-i", "pipe:0",
+            "-vf", _get_colorspace_filter(hdr_type or "sdr").removeprefix(","),
             *encoder_args,
             "-an", "-movflags", "+faststart",
             str(output_path),
@@ -165,7 +165,6 @@ class TitleInserter:
         target_w: int,
         target_h: int,
         fps: int,
-        hdr: bool,
     ) -> Any:
         """Build TitleScreenConfig from assembly parameters."""
         from immich_memories.titles import TitleScreenConfig
@@ -174,7 +173,8 @@ class TitleInserter:
         max_dim = max(target_w, target_h)
         resolution_tier = "4k" if max_dim >= 2160 else "1080p" if max_dim >= 1080 else "720p"
         logger.info(
-            f"Generating title screens ({target_w}x{target_h}, {'HDR' if hdr else 'SDR'}, {fps}fps)"
+            f"Generating title screens ({target_w}x{target_h}, "
+            f"{'HDR' if self.settings.encoding_plan.hdr else 'SDR'}, {fps}fps)"
         )
         return TitleScreenConfig(
             enabled=True,
@@ -190,7 +190,7 @@ class TitleInserter:
             resolution_width=target_w,
             resolution_height=target_h,
             fps=float(fps),
-            hdr=hdr,
+            encoding_plan=self.settings.encoding_plan,
             title_override=title_settings.title_override,
             subtitle_override=title_settings.subtitle_override,
         )
@@ -295,14 +295,13 @@ class TitleInserter:
         if not clips:
             return None
 
-        import subprocess
-
         from immich_memories.processing.assembly_engine import create_assembly_context
-        from immich_memories.processing.hdr_utilities import _get_gpu_encoder_args
+        from immich_memories.processing.clip_encoder import encoder_args_for_plan
         from immich_memories.processing.streaming_assembler import _make_decoder
 
         clip = clips[-1]
-        output_path = output_dir / "last_clip_processed.mp4"
+        plan = self.settings.encoding_plan
+        output_path = output_dir / f"last_clip_processed.{plan.container}"
         ctx = create_assembly_context(self.settings, self.prober, clips, target_w, target_h)
 
         decoder = _make_decoder(
@@ -317,16 +316,7 @@ class TitleInserter:
             hdr_type=hdr_type,
         )
 
-        preserve_hdr = hdr_type is not None
-        try:
-            encoder_args = _get_gpu_encoder_args(
-                crf=12,
-                preserve_hdr=preserve_hdr,
-                hdr_type=hdr_type or "hlg",
-            )
-        except (OSError, subprocess.SubprocessError) as e:
-            logger.debug("GPU encoder probe failed, using libx264: %s", e)
-            encoder_args = ["-c:v", "libx264", "-crf", "12"]
+        encoder_args = encoder_args_for_plan(plan)
 
         pix_fmt = "yuv420p10le" if hdr_type else "rgb24"
         input_color_args: list[str] = []
@@ -337,7 +327,7 @@ class TitleInserter:
                 "-color_primaries",
                 "bt2020",
                 "-color_trc",
-                "arib-std-b67",
+                ("smpte2084" if plan.target_transfer is HdrTransfer.PQ else "arib-std-b67"),
                 "-colorspace",
                 "bt2020nc",
             ]
@@ -347,6 +337,7 @@ class TitleInserter:
             "-s", f"{target_w}x{target_h}", "-r", str(fps),
             *input_color_args,
             "-i", "pipe:0",
+            "-vf", _get_colorspace_filter(hdr_type or "sdr").removeprefix(","),
             *encoder_args,
             "-an", "-movflags", "+faststart",
             str(output_path),
@@ -502,7 +493,9 @@ class TitleInserter:
         if progress_callback:
             progress_callback(0.05, "Generating year dividers...")
 
-        for _, year in year_changes:
+        limit = self._divider_limit(title_settings)
+        planned_changes = year_changes if limit is None else year_changes[1 : limit + 1]
+        for _, year in planned_changes:
             if year not in year_divider_paths:
                 divider = generator.generate_year_divider(year)
                 year_divider_paths[year] = divider.path
@@ -518,12 +511,19 @@ class TitleInserter:
         """Interleave clips with year divider screens."""
         result: list[AssemblyClip] = []
         current_year: int | None = None
+        inserted = 0
+        limit = self._divider_limit(title_settings)
         for clip in clips:
             clip_date = self.parse_clip_date(clip)
             if clip_date:
                 if (
-                    current_year is None or clip_date.year != current_year
+                    (limit is current_year is None)
+                    or (current_year is not None and clip_date.year != current_year)
                 ) and clip_date.year in year_divider_paths:
+                    if limit is not None and inserted >= limit:
+                        current_year = clip_date.year
+                        result.append(clip)
+                        continue
                     result.append(
                         AssemblyClip(
                             path=year_divider_paths[clip_date.year],
@@ -533,6 +533,7 @@ class TitleInserter:
                             is_title_screen=True,
                         )
                     )
+                    inserted += 1
                 current_year = clip_date.year
             result.append(clip)
         return result
@@ -554,7 +555,12 @@ class TitleInserter:
         if progress_callback:
             progress_callback(0.05, "Generating month dividers...")
 
-        for _, month, year in month_changes:
+        limit = self._divider_limit(title_settings)
+        planned_changes = month_changes
+        if limit is not None:
+            planned_changes = month_changes[1 : limit + 1]
+
+        for _, month, year in planned_changes:
             key = (year, month)
             if key not in month_divider_paths:
                 is_birthday = (
@@ -580,6 +586,8 @@ class TitleInserter:
         """Interleave clips with month divider screens."""
         result: list[AssemblyClip] = []
         current_month: tuple[int, int] | None = None
+        inserted = 0
+        limit = self._divider_limit(title_settings)
 
         for clip in clips:
             clip_date = self.parse_clip_date(clip)
@@ -593,6 +601,7 @@ class TitleInserter:
                     and current_month is not None
                     and month_key != current_month
                     and month_key in month_divider_paths
+                    and (limit is None or inserted < limit)
                 ):
                     result.append(
                         AssemblyClip(
@@ -603,6 +612,7 @@ class TitleInserter:
                             is_title_screen=True,
                         )
                     )
+                    inserted += 1
                 current_month = month_key
             result.append(clip)
         return result
@@ -648,16 +658,23 @@ class TitleInserter:
         prev_lat: float | None = None
         prev_lon: float | None = None
         threshold_km = 30.0
+        inserted = 0
+        limit = self._divider_limit(title_settings)
 
         for clip in clips:
             if clip.latitude is not None and clip.longitude is not None:
                 if prev_lat is not None and prev_lon is not None:
                     dist = haversine_km(prev_lat, prev_lon, clip.latitude, clip.longitude)
-                    if dist > threshold_km and clip.location_name:
+                    if (
+                        dist > threshold_km
+                        and clip.location_name
+                        and (limit is None or inserted < limit)
+                    ):
                         card = self.make_location_card_clip(
                             clip.location_name, location_card_cache, generator, title_settings
                         )
                         result.append(card)
+                        inserted += 1
                         logger.info(f"Location card: {clip.location_name} (dist={dist:.0f}km)")
                 prev_lat = clip.latitude
                 prev_lon = clip.longitude
@@ -713,7 +730,7 @@ class TitleInserter:
         target_w, target_h = resolve_target_resolution(self.settings, self.prober, clips)
         detected_fps = self.prober.detect_max_framerate(clips)
         ctx = create_assembly_context(self.settings, self.prober, clips, target_w, target_h)
-        hdr_type = ctx.hdr_type if self.settings.preserve_hdr else None
+        hdr_type = ctx.hdr_type if self.settings.encoding_plan.hdr else None
         return target_w, target_h, detected_fps, hdr_type
 
     def assemble_with_titles(
@@ -748,11 +765,7 @@ class TitleInserter:
             return assemble_fn(clips, output_path, progress_callback)
 
         target_w, target_h, detected_fps, hdr_type = self._resolve_assembly_params(clips)
-        source_has_hdr = hdr_type is not None
-
-        title_config = self._build_title_config(
-            title_settings, target_w, target_h, detected_fps, source_has_hdr
-        )
+        title_config = self._build_title_config(title_settings, target_w, target_h, detected_fps)
 
         title_output_dir = output_path.parent / ".title_screens"
         title_output_dir.mkdir(parents=True, exist_ok=True)

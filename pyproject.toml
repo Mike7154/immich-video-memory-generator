@@ -31,16 +31,16 @@ classifiers = [
 dependencies = [
     "httpx>=0.27",
     "pydantic>=2.0",
-    "pydantic-settings>=2.0",
-    "nicegui>=3.9.0",  # CVE-2026-33332 fixed in 3.9.0
+    "pydantic-settings>=2.14.2",
+    "nicegui>=3.12.0",
     "moviepy>=1.0.3",
-    "scenedetect[opencv]>=0.6",
+    "scenedetect>=0.6",  # OpenCV is already a direct dependency below
     "opencv-python>=4.9",
     "videohash>=3.0",
     "pyyaml>=6.0",
-    "click>=8.1",
+    "click>=8.3.3",
     "rich>=13.0",
-    "pillow>=12.1.1",
+    "pillow>=12.3.0",
     "pillow-heif>=1.0",
     "numpy>=1.24",
     "imagehash>=4.3",
@@ -75,7 +75,7 @@ audio-ml = [
 ]
 # OIDC authentication (only needed for SSO login)
 auth = [
-    "authlib>=1.3",
+    "authlib>=1.6.12",
 ]
 # Local Demucs stem separation (in-process, no API server needed)
 # Model cache: ~/.cache/torch/hub/ (~80MB for htdemucs)
@@ -84,12 +84,13 @@ demucs = [
 ]
 # Local ACE-Step music generation (in-process, no API server needed)
 # ⚠️  NOT a pip extra — ACE-Step is not published on PyPI.
-#     Install manually: pip install 'ace-step @ git+https://github.com/ace-step/ACE-Step.git'
-#     See docs-site/docs/music/ace-step.md for setup instructions.
+#     Install the tested v0.1.8 tag with --no-deps, then its inference-only
+#     dependencies. The upstream UI set conflicts with this app's Starlette.
+#     See docs-site/docs/create/pipeline/audio-and-music.md for setup instructions.
 # GPU-accelerated title rendering with Taichi
 # Supports: Metal (macOS), CUDA (NVIDIA), Vulkan, OpenGL, CPU fallback
 gpu = [
-    "taichi>=1.7.0",
+    "taichi>=1.7.0; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'arm64')",
     "freetype-py>=2.4",  # SDF font rendering
 ]
 # All cross-platform optional features
@@ -111,7 +112,7 @@ all-mac = [
     "immich-memories[gpu]",
 ]
 dev = [
-    "pytest>=7.0",
+    "pytest>=9.0.3",
     "pytest-cov>=4.0",
     "pytest-asyncio>=0.21",
     "pytest-benchmark>=5.2.3",
@@ -169,8 +170,6 @@ include = [
 
 # Semantic Release Configuration
 [tool.semantic_release]
-version_toml = ["pyproject.toml:tool.semantic_release.version"]
-version = "0.2.0"
 tag_format = "v{version}"
 branch = "main"
 build_command = "uv build"
@@ -225,6 +224,23 @@ major_version_zero = true
 # Only resolve dependencies for the current platform to avoid cross-platform issues
 # with platform-specific packages like pyobjc
 environments = ["sys_platform == 'darwin'", "sys_platform == 'linux'", "sys_platform == 'win32'"]
+# Security floors for transitive dependencies audited by the CI dev environment.
+# Keep these as constraints instead of pretending they are direct application imports.
+constraint-dependencies = [
+    "aiohttp>=3.14.3",
+    "cryptography>=50.0.0",
+    "gitpython>=3.1.58",
+    "idna>=3.15",
+    "joserfc>=1.6.8",
+    "lxml>=6.1.0",
+    "lxml-html-clean>=0.4.5",
+    "python-engineio>=4.13.2",
+    "python-multipart>=0.0.31",
+    "python-socketio>=5.16.2",
+    "starlette>=1.3.1",
+    "urllib3>=2.7.0",
+    "yt-dlp>=2026.7.4",
+]
 
 [tool.ruff]
 target-version = "py311"
@@ -305,6 +321,7 @@ module = [
     "immich_memories.cache.*",
     # Optional audio dependencies
     "soundfile.*",
+    "demucs.*",
     "acestep.*",
     "loguru.*",
     # SDF font rendering
@@ -390,6 +407,11 @@ disable_error_code = ["valid-type", "misc", "call-arg"]
 module = ["immich_memories.audio.mixer_class"]
 disable_error_code = ["assignment"]
 
+# Local Demucs backend imports its optional package lazily at runtime.
+[[tool.mypy.overrides]]
+module = ["immich_memories.audio.generators.demucs_local"]
+disable_error_code = ["import-not-found"]
+
 # Video cache with Immich client compatibility
 [[tool.mypy.overrides]]
 module = ["immich_memories.cache.video_cache"]
@@ -463,12 +485,9 @@ ignore_missing_imports = true
 [tool.complexipy]
 paths = ["src"]
 max_complexity_allowed = 15
-exclude = [
-    "src/immich_memories/_version.py",
-    "src/immich_memories/cli/",              # Click decorators inflate complexity scores
-    "src/immich_memories/titles/taichi_*",    # GPU kernel compilation is inherently complex
-    "src/immich_memories/titles/sdf_*",       # SDF font rendering kernels
-]
+# complexipy 5.2 matches exclusions by basename, not path or glob.
+# Reviewed over-threshold CLI/Taichi functions remain visible in the snapshot.
+exclude = ["_version.py"]
 
 # Dependency hygiene
 [tool.deptry]

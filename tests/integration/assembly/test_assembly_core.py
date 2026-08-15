@@ -36,19 +36,36 @@ def _get_resolution(probe_data: dict) -> tuple[int, int]:
 
 def _make_settings(**overrides):
     """Create AssemblySettings with sensible test defaults (no config fallback)."""
-    from immich_memories.processing.assembly_config import AssemblySettings, TransitionType
+    from immich_memories.processing.assembly_config import (
+        AssemblySettings,
+        TransitionType,
+        standalone_assembly_encoding_plan,
+    )
 
     defaults = {
+        "encoding_plan": standalone_assembly_encoding_plan(28),
         "transition": TransitionType.CROSSFADE,
         "transition_duration": 0.3,
-        "output_crf": 28,
-        "preserve_hdr": False,
         "auto_resolution": False,
         "target_resolution": (1280, 720),
         "normalize_clip_audio": False,
     }
     defaults.update(overrides)
     return AssemblySettings(**defaults)
+
+
+def _hlg_plan():
+    from immich_memories.processing.encoding_plan import EncodingPlan, HdrTransfer, OutputCodec
+
+    return EncodingPlan(
+        codec=OutputCodec.H265,
+        encoder="libx265",
+        encoder_args=("-preset", "ultrafast", "-crf", "28"),
+        target_transfer=HdrTransfer.HLG,
+        tone_map_to_sdr=False,
+        pixel_format="yuv420p10le",
+        container="mp4",
+    )
 
 
 def _make_clip(path: Path, duration: float = 3.0, **kwargs):
@@ -701,24 +718,6 @@ class TestHDRUtilities:
         clips = [_make_clip(test_clip_720p)]
         assert has_any_hdr_clip(clips) is False
 
-    def test_get_gpu_encoder_args_returns_list(self):
-        """_get_gpu_encoder_args returns a non-empty list of strings."""
-        from immich_memories.processing.hdr_utilities import _get_gpu_encoder_args
-
-        args = _get_gpu_encoder_args(crf=23, preserve_hdr=False)
-        assert isinstance(args, list)
-        assert len(args) > 0
-        assert all(isinstance(a, str) for a in args)
-
-    def test_get_gpu_encoder_args_hdr(self):
-        """_get_gpu_encoder_args with preserve_hdr includes HDR flags."""
-        from immich_memories.processing.hdr_utilities import _get_gpu_encoder_args
-
-        args = _get_gpu_encoder_args(crf=18, preserve_hdr=True, hdr_type="hlg")
-        args_str = " ".join(args)
-        # Should include HEVC/x265 and color metadata
-        assert "hevc" in args_str or "libx265" in args_str
-
     def test_get_hdr_conversion_filter_same_type(self):
         """Same source and target HDR type returns empty string."""
         from immich_memories.processing.hdr_utilities import _get_hdr_conversion_filter
@@ -727,12 +726,21 @@ class TestHDRUtilities:
         assert result == ""
 
     def test_get_hdr_conversion_filter_sdr_to_hlg(self):
-        """SDR to HLG conversion returns a filter (may be empty if no zscale)."""
-        from immich_memories.processing.hdr_utilities import _get_hdr_conversion_filter
+        """Required SDR-to-HLG conversion either runs or fails closed."""
+        from immich_memories.processing.hdr_utilities import (
+            RequiredColorConversionUnavailable,
+            _get_hdr_conversion_filter,
+            check_zscale_available,
+        )
 
-        result = _get_hdr_conversion_filter(None, "hlg")
-        # Result depends on zscale availability, but should not crash
-        assert isinstance(result, str)
+        if not check_zscale_available():
+            with pytest.raises(RequiredColorConversionUnavailable):
+                _get_hdr_conversion_filter(None, "hlg", required=True)
+            return
+
+        result = _get_hdr_conversion_filter(None, "hlg", required=True)
+        assert "zscale=" in result
+        assert "t=arib-std-b67" in result
 
 
 # ===================================================================
@@ -747,7 +755,7 @@ class TestAssemblyContext:
         """SDR context has yuv420p pixel format and empty colorspace filter."""
         from immich_memories.processing.assembly_engine import create_assembly_context
 
-        settings = _make_settings(preserve_hdr=False)
+        settings = _make_settings()
         prober = _make_prober(settings)
         clips = [_make_clip(test_clip_720p)]
 
@@ -756,7 +764,8 @@ class TestAssemblyContext:
         assert ctx.target_w == 1280
         assert ctx.target_h == 720
         assert ctx.pix_fmt == "yuv420p"
-        assert ctx.colorspace_filter == ""
+        assert ctx.hdr_type == "sdr"
+        assert "colorspace=bt709" in ctx.colorspace_filter
 
     def test_resolve_target_resolution_explicit(self, test_clip_720p):
         """Explicit target_resolution is used directly."""
@@ -1131,27 +1140,27 @@ class TestClipEncoderExtra:
         """resolve_encode_hdr for SDR clip returns hlg default and empty filter."""
         from immich_memories.processing.clip_encoder import ClipEncoder
 
-        settings = _make_settings(preserve_hdr=False)
+        settings = _make_settings()
         prober = _make_prober(settings)
         encoder = ClipEncoder(settings, prober, _noop_face_center)
 
         clip = _make_clip(test_clip_720p)
         hdr_type, colorspace = encoder.resolve_encode_hdr(clip)
-        assert hdr_type == "hlg"
-        assert colorspace == ""
+        assert hdr_type == "sdr"
+        assert "colorspace=bt709" in colorspace
 
     def test_resolve_encode_hdr_enabled(self, test_clip_720p):
-        """resolve_encode_hdr with preserve_hdr=True probes clip and returns filter."""
+        """An explicit HLG plan probes and converts an SDR clip."""
         from immich_memories.processing.clip_encoder import ClipEncoder
 
-        settings = _make_settings(preserve_hdr=True)
+        settings = _make_settings(encoding_plan=_hlg_plan())
         prober = _make_prober(settings)
         encoder = ClipEncoder(settings, prober, _noop_face_center)
 
         clip = _make_clip(test_clip_720p)
         hdr_type, colorspace = encoder.resolve_encode_hdr(clip)
-        # SDR clip with preserve_hdr still gets hlg default and colorspace filter
         assert hdr_type == "hlg"
+        assert "zscale" in colorspace
         assert "setparams" in colorspace
 
     def test_trim_segment_reencode(self, test_clip_720p, tmp_path):
@@ -1250,7 +1259,7 @@ class TestFilterBuilderExtra:
         from immich_memories.processing.ffmpeg_runner import AssemblyContext
         from immich_memories.processing.filter_builder import FilterBuilder
 
-        settings = _make_settings(preserve_hdr=True)
+        settings = _make_settings(encoding_plan=_hlg_plan())
         prober = _make_prober(settings)
         fb = FilterBuilder(settings, prober, _noop_face_center)
 
@@ -1269,11 +1278,11 @@ class TestFilterBuilderExtra:
         assert result == ""
 
     def test_get_clip_hdr_conversion_no_hdr(self, test_clip_720p):
-        """get_clip_hdr_conversion returns empty when preserve_hdr is False."""
+        """An SDR plan does not convert an SDR clip just because context is malformed."""
         from immich_memories.processing.ffmpeg_runner import AssemblyContext
         from immich_memories.processing.filter_builder import FilterBuilder
 
-        settings = _make_settings(preserve_hdr=False)
+        settings = _make_settings()
         prober = _make_prober(settings)
         fb = FilterBuilder(settings, prober, _noop_face_center)
 
@@ -1563,6 +1572,42 @@ class TestTitleInserterExtra:
         assert (2024, 1) in result
         assert (2024, 3) in result
 
+    def test_planned_month_dividers_ignore_clip_threshold(
+        self, test_clip_720p, test_clip_720p_b
+    ) -> None:
+        """A finalized plan renders every selected month after the opening month."""
+        from dataclasses import dataclass
+
+        from immich_memories.processing.assembly_config import TitleScreenSettings
+        from immich_memories.processing.title_inserter import TitleInserter
+
+        inserter = TitleInserter(_make_settings(), _make_prober(_make_settings()))
+
+        @dataclass
+        class FakeDivider:
+            path: Path
+
+        class FakeGenerator:
+            def generate_month_divider(self, month, year, is_birthday_month=False):
+                return FakeDivider(path=test_clip_720p_b)
+
+        clips = [
+            _make_clip(test_clip_720p, date="2026-05-05"),
+            _make_clip(test_clip_720p_b, date="2026-06-05"),
+            _make_clip(test_clip_720p, date="2026-07-05"),
+        ]
+        title_settings = TitleScreenSettings(
+            show_month_dividers=True,
+            month_divider_threshold=99,
+            max_dividers=2,
+        )
+
+        paths = inserter.generate_month_dividers(
+            clips, FakeGenerator(), title_settings, progress_callback=None
+        )
+
+        assert set(paths) == {(2026, 6), (2026, 7)}
+
     def test_generate_month_dividers_disabled(self, test_clip_720p):
         """generate_month_dividers returns empty when dividers disabled."""
         from immich_memories.processing.assembly_config import TitleScreenSettings
@@ -1661,61 +1706,3 @@ class TestHDRUtilitiesExtra:
 
         result = _check_zscale_available()
         assert isinstance(result, bool)
-
-    def test_hdr_color_args(self):
-        """_hdr_color_args returns correct FFmpeg color args."""
-        from immich_memories.processing.hdr_utilities import _hdr_color_args
-
-        args = _hdr_color_args("arib-std-b67")
-        assert "-colorspace" in args
-        assert "bt2020nc" in args
-        assert "arib-std-b67" in args
-
-    def test_encoder_args_macos_sdr(self):
-        """_encoder_args_macos SDR mode excludes HDR flags."""
-        import sys
-
-        if sys.platform != "darwin":
-            pytest.skip("macOS-only test")
-
-        from immich_memories.processing.hdr_utilities import _encoder_args_macos
-
-        args = _encoder_args_macos(crf=23, preserve_hdr=False, color_trc="arib-std-b67")
-        args_str = " ".join(args)
-        assert "hevc_videotoolbox" in args_str
-        assert "p010le" not in args_str
-
-    def test_encoder_args_macos_hdr(self):
-        """_encoder_args_macos HDR mode includes p010le and color metadata."""
-        import sys
-
-        if sys.platform != "darwin":
-            pytest.skip("macOS-only test")
-
-        from immich_memories.processing.hdr_utilities import _encoder_args_macos
-
-        args = _encoder_args_macos(crf=18, preserve_hdr=True, color_trc="arib-std-b67")
-        args_str = " ".join(args)
-        assert "hevc_videotoolbox" in args_str
-        assert "p010le" in args_str
-        assert "bt2020" in args_str
-
-    def test_encoder_args_cpu_sdr(self):
-        """CPU fallback SDR uses libx264."""
-        from immich_memories.processing.hdr_utilities import _encoder_args_cpu
-
-        args = _encoder_args_cpu(
-            crf=23, preserve_hdr=False, color_trc="arib-std-b67", hdr_type="hlg"
-        )
-        assert "-c:v" in args
-        assert "libx264" in args
-
-    def test_encoder_args_cpu_hdr(self):
-        """CPU fallback HDR uses libx265 with x265-params."""
-        from immich_memories.processing.hdr_utilities import _encoder_args_cpu
-
-        args = _encoder_args_cpu(
-            crf=18, preserve_hdr=True, color_trc="arib-std-b67", hdr_type="hlg"
-        )
-        assert "libx265" in args
-        assert "-x265-params" in args

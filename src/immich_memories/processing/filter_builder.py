@@ -58,16 +58,22 @@ class FilterBuilder:
 
     def _build_hdr_conversion(self, i: int, ctx: AssemblyContext) -> str:
         """Build HDR conversion filter for a clip if needed."""
-        if not self.settings.preserve_hdr or ctx.clip_hdr_types[i] == ctx.hdr_type:
+        plan = self.settings.encoding_plan
+        source_hdr = ctx.clip_hdr_types[i]
+        target_hdr = plan.target_transfer.value if plan.hdr else "sdr"
+        if source_hdr == target_hdr or (source_hdr is None and target_hdr == "sdr"):
             return ""
         source_pri = ctx.clip_primaries[i] if i < len(ctx.clip_primaries) else None
         hdr_conversion = _get_hdr_conversion_filter(
-            ctx.clip_hdr_types[i], ctx.hdr_type, source_primaries=source_pri
+            source_hdr,
+            target_hdr,
+            source_primaries=source_pri,
+            required=True,
         )
         if hdr_conversion:
             logger.info(
                 f"Converting clip {i} from {ctx.clip_hdr_types[i]} "
-                f"(primaries={source_pri}) to {ctx.hdr_type}"
+                f"(primaries={source_pri}) to {target_hdr}"
             )
         return hdr_conversion
 
@@ -323,15 +329,4 @@ class FilterBuilder:
 
     def get_clip_hdr_conversion(self, i: int, ctx: AssemblyContext) -> str:
         """Return HDR conversion filter string for clip i, or empty string."""
-        if not self.settings.preserve_hdr or ctx.clip_hdr_types[i] == ctx.hdr_type:
-            return ""
-        source_pri = ctx.clip_primaries[i] if i < len(ctx.clip_primaries) else None
-        hdr_conversion = _get_hdr_conversion_filter(
-            ctx.clip_hdr_types[i], ctx.hdr_type, source_primaries=source_pri
-        )
-        if hdr_conversion:
-            logger.info(
-                f"Converting clip {i} from {ctx.clip_hdr_types[i]} "
-                f"(primaries={source_pri}) to {ctx.hdr_type}"
-            )
-        return hdr_conversion
+        return self._build_hdr_conversion(i, ctx)

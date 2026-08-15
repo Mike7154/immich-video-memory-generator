@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import subprocess
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from immich_memories.operations.phases import PhaseEvent
 from immich_memories.tracking.models import PhaseStats, RunMetadata
 from immich_memories.tracking.run_database import RunDatabase
 from immich_memories.tracking.run_id import generate_run_id
 from immich_memories.tracking.system_info import capture_system_info
 
 if TYPE_CHECKING:
+    from immich_memories.processing.output_contract import OutputProbe
     from immich_memories.timeperiod import DateRange
 
 logger = logging.getLogger(__name__)
@@ -49,6 +52,12 @@ class RunTracker:
         self._phase_start_time: float | None = None
         self._phase_items_total: int = 0
 
+    def _require_started(self) -> RunMetadata:
+        """Return the owned run or reject mutation by an unstarted tracker."""
+        if self._run is None:
+            raise RuntimeError("Run not started")
+        return self._run
+
     def start_run(
         self,
         person_name: str | None = None,
@@ -57,7 +66,10 @@ class RunTracker:
         target_duration_seconds: int = 600,
         memory_type: str | None = None,
         memory_key: str | None = None,
+        memory_category: str | None = None,
+        memory_people: tuple[str, ...] = (),
         source: str = "manual",
+        automation_attempt_id: str | None = None,
     ) -> str:
         """Start tracking a new run.
 
@@ -68,7 +80,10 @@ class RunTracker:
             target_duration_seconds: Target video duration in seconds.
             memory_type: Memory preset type (year_in_review, trip, etc.).
             memory_key: Deterministic dedup fingerprint.
+            memory_category: Detector category used for automation variety.
+            memory_people: Person identities used for automation variety.
             source: How the run was triggered ("manual", "scheduled", "auto").
+            automation_attempt_id: Durable parent automation attempt identity.
 
         Returns:
             The run ID.
@@ -80,13 +95,16 @@ class RunTracker:
             except (OSError, subprocess.SubprocessError, RuntimeError) as e:
                 logger.warning(f"Failed to capture system info: {e}")
 
-        self._run = RunMetadata(
+        run = RunMetadata(
             run_id=self.run_id,
-            created_at=datetime.now(),
+            created_at=datetime.now(tz=UTC),
             status="running",
             memory_type=memory_type,
             memory_key=memory_key,
+            memory_category=memory_category,
+            memory_people=memory_people,
             source=source,
+            automation_attempt_id=automation_attempt_id,
             person_name=person_name,
             person_id=person_id,
             date_range_start=date_range.start.date() if date_range else None,
@@ -95,7 +113,8 @@ class RunTracker:
             system_info=system_info,
         )
 
-        self.db.save_run(self._run)
+        self.db.save_run(run)
+        self._run = run
         logger.info(f"Started run {self.run_id}")
 
         return self.run_id
@@ -111,12 +130,13 @@ class RunTracker:
             phase_name: Name of the phase.
             total_items: Expected number of items to process.
         """
+        self._require_started()
         # Complete previous phase if any
         if self._current_phase:
             self.complete_phase()
 
         self._current_phase = phase_name
-        self._phase_start = datetime.now()
+        self._phase_start = datetime.now(tz=UTC)
         self._phase_start_time = time.time()
         self._phase_items_total = total_items
 
@@ -135,10 +155,11 @@ class RunTracker:
             errors: List of error dictionaries.
             extra_metrics: Additional phase-specific metrics.
         """
+        self._require_started()
         if not self._current_phase or not self._phase_start:
             return
 
-        now = datetime.now()
+        now = datetime.now(tz=UTC)
         duration = time.time() - (self._phase_start_time or time.time())
 
         if items_processed is None:
@@ -177,11 +198,26 @@ class RunTracker:
         Args:
             items_processed: Number of items processed so far.
         """
+        self._require_started()
         # This is for logging/debugging - actual stats saved on complete
         if self._current_phase:
             logger.debug(
                 f"Phase {self._current_phase}: {items_processed}/{self._phase_items_total}"
             )
+
+    def record_phase_event(self, event: PhaseEvent) -> bool:
+        """Record one public phase without letting stale telemetry move backwards."""
+        self._require_started()
+        try:
+            updated = self.db.update_operational_phase(self.run_id, event)
+        except (OSError, RuntimeError, sqlite3.Error):
+            logger.warning("Could not persist operational phase '%s'", event.phase.value)
+            return False
+        if updated and self._run is not None:
+            self._run.last_phase = event.phase
+        elif not updated:
+            logger.warning("Ignored backward operational phase '%s'", event.phase.value)
+        return updated
 
     def complete_run(
         self,
@@ -201,11 +237,12 @@ class RunTracker:
         Returns:
             The completed RunMetadata.
         """
+        self._require_started()
         # Complete any pending phase
         if self._current_phase:
             self.complete_phase()
 
-        now = datetime.now()
+        now = datetime.now(tz=UTC)
 
         # Get output file info
         output_size_bytes = 0
@@ -238,9 +275,81 @@ class RunTracker:
 
         # Save metadata JSON alongside video
         if output_path and run:
-            self._save_metadata_json(Path(output_path).parent, run)
+            self._mirror_metadata_sidecar(run, Path(output_path).parent)
 
         return self._run or run  # type: ignore
+
+    def complete_artifact(
+        self,
+        output_path: Path | str,
+        probe: OutputProbe,
+        warnings: list[str],
+        *,
+        delivery_requested: bool = False,
+        delivery_album: str | None = None,
+        clips_analyzed: int = 0,
+        clips_selected: int = 0,
+        errors_count: int = 0,
+    ) -> RunMetadata:
+        """Complete a validated local artifact without probing or attempting delivery."""
+        self._require_started()
+        if self._current_phase:
+            self.complete_phase()
+
+        output_path = Path(output_path)
+        run = self.db.complete_artifact(
+            run_id=self.run_id,
+            completed_at=datetime.now(tz=UTC),
+            output_path=str(output_path),
+            output_size_bytes=probe.size_bytes,
+            output_duration_seconds=probe.duration_seconds,
+            delivery_requested=delivery_requested,
+            delivery_album=delivery_album,
+            warnings=warnings,
+            clips_analyzed=clips_analyzed,
+            clips_selected=clips_selected,
+            errors_count=errors_count,
+        )
+        self._run = run
+        self._mirror_metadata_sidecar(run, output_path.parent)
+        logger.info("Completed artifact for run %s", self.run_id)
+        return run
+
+    def mark_delivery_pending(self, error: str, *, attempted: bool = True) -> RunMetadata:
+        """Record one failed Immich call and refresh durable metadata."""
+        self._require_started()
+        self.db.mark_delivery_pending(self.run_id, error, attempted=attempted)
+        return self._reload_and_refresh_sidecar()
+
+    def mark_delivered(self, asset_id: str) -> RunMetadata:
+        """Record one successful Immich call and refresh durable metadata."""
+        self._require_started()
+        self.db.mark_delivered(self.run_id, asset_id)
+        return self._reload_and_refresh_sidecar()
+
+    def _reload_and_refresh_sidecar(self) -> RunMetadata:
+        """Reload the current run and mirror it beside its completed artifact."""
+        run = self.db.get_run(self.run_id)
+        if run is None:
+            raise RuntimeError(f"Run disappeared from database: {self.run_id}")
+        self._run = run
+        self._mirror_metadata_sidecar(run)
+        return run
+
+    def _mirror_metadata_sidecar(
+        self,
+        run: RunMetadata,
+        output_dir: Path | None = None,
+    ) -> None:
+        """Best-effort mirror of authoritative database state beside an artifact."""
+        if output_dir is None:
+            if not run.output_path:
+                return
+            output_dir = Path(run.output_path).parent
+        try:
+            self._save_metadata_json(output_dir, run)
+        except Exception:  # WHY: a diagnostic mirror cannot change pipeline lifecycle
+            logger.warning("Failed to refresh run metadata sidecar")
 
     def fail_run(self, error: str, errors_count: int = 1) -> None:
         """Mark run as failed.
@@ -249,11 +358,18 @@ class RunTracker:
             error: Error message.
             errors_count: Total errors encountered.
         """
+        self._require_started()
+        run = self.db.get_run(self.run_id)
+        if run is not None and run.status == "completed":
+            logger.warning(
+                "Run %s is already completed; preserving durable artifact state", self.run_id
+            )
+            return
         # Complete any pending phase
         if self._current_phase:
             self.complete_phase(errors=[{"error": error}])
 
-        now = datetime.now()
+        now = datetime.now(tz=UTC)
 
         self.db.update_run_status(
             run_id=self.run_id,
@@ -266,10 +382,11 @@ class RunTracker:
 
     def cancel_run(self) -> None:
         """Mark run as cancelled."""
+        self._require_started()
         if self._current_phase:
             self.complete_phase()
 
-        now = datetime.now()
+        now = datetime.now(tz=UTC)
 
         self.db.update_run_status(
             run_id=self.run_id,
@@ -325,8 +442,8 @@ class RunTracker:
             metadata_path = output_dir / "run_metadata.json"
             metadata_path.write_text(run.to_json())
             logger.debug(f"Saved run metadata to {metadata_path}")
-        except (OSError, ValueError) as e:
-            logger.warning(f"Failed to save run metadata: {e}")
+        except (OSError, ValueError):
+            logger.warning("Failed to refresh run metadata sidecar")
 
     @property
     def current_run(self) -> RunMetadata | None:
