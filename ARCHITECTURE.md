@@ -102,12 +102,15 @@ src/immich_memories/
 │   ├── preview_builder.py      # PreviewBuilder: preview segment extraction
 │   ├── progress.py             # Progress tracking helpers
 │   ├── trip_detection.py       # GPS-based trip detection (clustering, geocoding)
-│   ├── unified_analyzer.py     # UnifiedSegmentAnalyzer (all methods merged, no mixins)
+│   ├── unified_analyzer.py     # UnifiedSegmentAnalyzer (composes SpeechAnalysisService)
+│   ├── speech_analysis.py      # SpeechAnalysisService: PANNs audio-content + VAD speech boundaries
 │   ├── unified_budget.py       # Unified photo+video budget selection (merge-then-fit)
 │   ├── segment_generation.py   # Boundary detection, candidate segment generation
+│   ├── boundary_placement.py   # Where a cut may land: protected-range gaps, edge selection
 │   ├── content_analyzer.py     # LLM-based content analysis
 │   ├── llm_response_parser.py  # Content analysis response parsing
 │   ├── _content_providers.py   # Content analysis provider helpers
+│   ├── request_heartbeat.py    # RequestHeartbeat: periodic log line for long-outstanding HTTP calls
 │   ├── analyzer_factory.py     # Analyzer factory
 │   ├── analyzer_models.py      # Analyzer data models
 │   ├── duplicates.py           # Duplicate/near-duplicate detection
@@ -171,6 +174,14 @@ src/immich_memories/
 │       ├── ace_step_backend.py # ACE-Step lib/API (generation)
 │       ├── ace_step_captions.py # Dense caption templates
 │       └── demucs_local.py     # Local Demucs stem separation (in-process)
+│
+├── speech/                     # Voice activity for clip boundaries (optional `speech` extra)
+│   ├── vad.py                  # extract_audio_16k, silence_gaps, select_detector
+│   ├── fireredvad.py           # FireRedSpeechDetector: vendored AED ONNX + Kaldi fbank/CMVN
+│   ├── boundary_scoring.py     # BoundaryWeights, candidates_from_gaps, best_boundary
+│   ├── turn_detection.py       # SmartTurnDetector (weighted 0.0; deps in no extra)
+│   ├── models.py               # SpeechRegion, BoundaryCandidate
+│   └── bundled_models/         # fireredvad_aed.onnx (2.4 MB, Apache-2.0) — no runtime download
 │
 ├── titles/                     # Title screen generation
 │   ├── generator.py            # TitleScreenGenerator (composes 3 services)
@@ -321,6 +332,8 @@ SmartPipeline.run_analysis()           (Phases 1-3: videos only)
                                via UnifiedSegmentAnalyzer:
                                ├── boundary detection
                                ├── candidate generation
+                               ├── protected-range adjustment
+                               │     speech/ VAD regions ∪ non-speech PANNs events
                                ├── visual + LLM scoring
                                └── best segment selection
 

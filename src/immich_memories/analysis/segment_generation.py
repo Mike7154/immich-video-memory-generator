@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from immich_memories.analysis.analyzer_models import CutPoint
+from immich_memories.analysis.boundary_placement import (
+    cap_end_to_gap,
+    protected_gaps,
+    select_segment_boundaries,
+)
 from immich_memories.analysis.scenes import SceneDetector
 from immich_memories.analysis.silence_detection import detect_silence_gaps
 
@@ -350,82 +355,14 @@ def generate_fallback_segments(
     return candidates
 
 
-def merge_buffered_ranges(
-    protected_ranges: list[tuple[float, float]],
-    video_duration: float,
-    buffer: float = 0.3,
-) -> list[tuple[float, float]]:
-    """Buffer and merge overlapping protected audio ranges.
-
-    Args:
-        protected_ranges: Raw protected ranges from audio analysis.
-        video_duration: Total video duration.
-        buffer: Buffer to add around each range (seconds).
-
-    Returns:
-        Merged list of buffered ranges.
-    """
-    buffered = [
-        (max(0, start - buffer), min(video_duration, end + buffer))
-        for start, end in protected_ranges
-    ]
-
-    merged: list[tuple[float, float]] = []
-    for start, end in sorted(buffered):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
-
-
-def nudge_segment_for_speech(
-    start: float,
-    end: float,
-    merged_ranges: list[tuple[float, float]],
-    video_duration: float,
-) -> tuple[float, float, bool]:
-    """Nudge a single segment's boundaries away from speech ranges.
-
-    Args:
-        start: Segment start time.
-        end: Segment end time.
-        merged_ranges: Merged protected audio ranges.
-        video_duration: Total video duration.
-
-    Returns:
-        Tuple of (new_start, new_end, was_adjusted).
-    """
-    new_start, new_end = start, end
-    was_adjusted = False
-
-    for range_start, range_end in merged_ranges:
-        start_inside = range_start <= new_start < range_end
-        end_inside = range_start < new_end <= range_end
-
-        if start_inside and end_inside:
-            continue  # Entirely inside -- can't avoid
-
-        if start_inside and not end_inside:
-            nudge = min(2.0, new_start - range_start + 0.1)
-            new_start = max(0, new_start - nudge)
-            was_adjusted = True
-
-        if end_inside and not start_inside:
-            nudge = min(2.0, range_end - new_end + 0.1)
-            new_end = min(video_duration, new_end + nudge)
-            was_adjusted = True
-
-    return new_start, new_end, was_adjusted
-
-
 def adjust_candidates_for_audio(
     candidates: list[tuple[CutPoint, CutPoint]],
     audio_result: AudioAnalysisResult,
     video_duration: float,
     min_segment_duration: float,
     proportional_max: float,
-    max_adjustment: float = 5.0,
+    *,
+    min_silence_ms: int,
 ) -> list[tuple[CutPoint, CutPoint]]:
     """Adjust candidate segment boundaries to avoid cutting during protected audio events.
 
@@ -435,7 +372,8 @@ def adjust_candidates_for_audio(
         video_duration: Total video duration.
         min_segment_duration: Minimum segment duration.
         proportional_max: Max segment duration for this source.
-        max_adjustment: Maximum adjustment per boundary in seconds.
+        min_silence_ms: `SpeechConfig.min_silence_ms`, the pause width the VAD
+            split on -- sets how far each protected range may be widened.
 
     Returns:
         Adjusted list of candidate segments.
@@ -443,18 +381,18 @@ def adjust_candidates_for_audio(
     if not audio_result.protected_ranges:
         return candidates
 
-    merged_ranges = merge_buffered_ranges(
-        audio_result.protected_ranges,
-        video_duration,
-    )
-    logger.info(f"     Buffered+merged ranges: {[(f'{s:.2f}-{e:.2f}') for s, e in merged_ranges]}")
+    gaps = protected_gaps(audio_result.protected_ranges, video_duration, min_silence_ms)
 
     adjusted: list[tuple[CutPoint, CutPoint]] = []
     adjustments_made = 0
 
     for start_cp, end_cp in candidates:
-        new_start, new_end, was_adjusted = nudge_segment_for_speech(
-            start_cp.time, end_cp.time, merged_ranges, video_duration
+        new_start, new_end, was_adjusted = select_segment_boundaries(
+            start_cp.time,
+            end_cp.time,
+            gaps,
+            video_duration,
+            min_segment_duration,
         )
 
         if was_adjusted:
@@ -463,14 +401,17 @@ def adjust_candidates_for_audio(
                 f"     Adjusted: {start_cp.time:.2f}s-{end_cp.time:.2f}s -> {new_start:.2f}s-{new_end:.2f}s"
             )
 
-        # Enforce proportional max
+        # Enforce proportional max -- prefer a real gap at or before the cap over
+        # the raw arithmetic cutoff, which can itself land inside speech.
         if new_end - new_start > proportional_max:
+            cap_time = new_start + proportional_max
+            capped_end = cap_end_to_gap(new_start, cap_time, gaps, min_segment_duration)
             logger.info(
                 f"     Trimming oversized segment {new_start:.2f}s-{new_end:.2f}s "
                 f"({new_end - new_start:.1f}s) to proportional max {proportional_max:.1f}s "
-                f"(source={video_duration:.1f}s)"
+                f"(source={video_duration:.1f}s), snapped end to {capped_end:.2f}s"
             )
-            new_end = new_start + proportional_max
+            new_end = capped_end
 
         if new_end - new_start >= min_segment_duration:
             adj_start = CutPoint(time=new_start, is_visual=start_cp.is_visual, is_audio=True)

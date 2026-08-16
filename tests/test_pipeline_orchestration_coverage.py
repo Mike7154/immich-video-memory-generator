@@ -13,6 +13,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from immich_memories.analysis.analyzer_models import CutPoint, ScoredSegment
+from immich_memories.analysis.boundary_placement import (
+    merge_buffered_ranges,
+    speech_buffer_seconds,
+)
 from immich_memories.analysis.segment_generation import (
     classify_segment_events,
     collect_mixed_boundary_candidates,
@@ -20,8 +24,6 @@ from immich_memories.analysis.segment_generation import (
     detect_visual_boundaries,
     generate_candidate_segments,
     generate_fallback_segments,
-    merge_buffered_ranges,
-    nudge_segment_for_speech,
     score_segment_audio,
 )
 from immich_memories.analysis.smart_pipeline import (
@@ -345,99 +347,6 @@ class TestUnifiedAnalyzerProportionalMaxSegment:
         assert result == min(15.0 * 1.15, 40.0)
 
 
-class TestAudioContentAnalysisBranches:
-    """Lines 200, 510-512: _run_audio_content_analysis returns None on disable/fail."""
-
-    def test_returns_none_when_disabled(self):
-        analyzer = _make_analyzer(audio_content_enabled=False)
-        result = analyzer._run_audio_content_analysis(Path("/fake.mp4"), 10.0)
-        assert result is None
-
-    def test_returns_none_when_analysis_returns_none(self):
-        analyzer = _make_analyzer(audio_content_enabled=True)
-        analyzer._analyze_audio_content = MagicMock(return_value=None)
-        result = analyzer._run_audio_content_analysis(Path("/fake.mp4"), 10.0)
-        assert result is None
-
-    def test_analyze_audio_content_catches_import_error(self):
-        """Lines 510-512: exception in _analyze_audio_content returns None."""
-        analyzer = _make_analyzer(audio_content_enabled=True)
-        # WHY: AudioContentAnalyzer import/init is an external ML dependency
-        mock_audio_analyzer = MagicMock()
-        mock_audio_analyzer.analyze.side_effect = RuntimeError("no panns")
-        analyzer._audio_analyzer = mock_audio_analyzer
-        result = analyzer._analyze_audio_content(Path("/fake.mp4"), 10.0)
-        assert result is None
-
-    def test_analyze_audio_content_caches_result(self):
-        """Lines 493, 507: cache hit returns previously stored result."""
-        analyzer = _make_analyzer(audio_content_enabled=True)
-        cached = AudioAnalysisResult(audio_score=0.9)
-        analyzer._audio_analysis_cache["/fake.mp4"] = cached
-        result = analyzer._analyze_audio_content(Path("/fake.mp4"), 10.0)
-        assert result is cached
-
-
-class TestFixBoundaryInRange:
-    """Lines 258, 260-264: _fix_boundary_in_range nudges or reports unfixable."""
-
-    def test_start_boundary_nudged_before_range(self):
-        analyzer = _make_analyzer()
-        new_val, was_adj, was_unfix = analyzer._fix_boundary_in_range(
-            value=5.0,
-            label="START",
-            range_start=4.0,
-            range_end=6.0,
-            clamp_low=0.0,
-            clamp_high=10.0,
-        )
-        assert was_adj
-        assert not was_unfix
-        assert new_val < 4.0
-
-    def test_end_boundary_nudged_after_range(self):
-        analyzer = _make_analyzer()
-        new_val, was_adj, was_unfix = analyzer._fix_boundary_in_range(
-            value=5.5,
-            label="END",
-            range_start=5.0,
-            range_end=6.0,
-            clamp_low=0.0,
-            clamp_high=10.0,
-        )
-        assert was_adj
-        assert not was_unfix
-        assert new_val > 6.0
-
-    def test_boundary_at_edge_is_unfixable(self):
-        """When nudge distance is ~0, it's unfixable."""
-        analyzer = _make_analyzer()
-        new_val, was_adj, was_unfix = analyzer._fix_boundary_in_range(
-            value=0.005,
-            label="START",
-            range_start=0.0,
-            range_end=1.0,
-            clamp_low=0.0,
-            clamp_high=10.0,
-        )
-        assert was_unfix
-        assert not was_adj
-
-    def test_boundary_outside_range_unchanged(self):
-        analyzer = _make_analyzer()
-        new_val, was_adj, was_unfix = analyzer._fix_boundary_in_range(
-            value=10.0,
-            label="START",
-            range_start=2.0,
-            range_end=5.0,
-            clamp_low=0.0,
-            clamp_high=20.0,
-        )
-        assert not was_adj
-        assert not was_unfix
-        assert new_val == 10.0
-
-
 class TestFixBestSegmentBoundaries:
     """Lines 294, 302, 307, 316-317: boundary adjustment + re-trim."""
 
@@ -706,39 +615,6 @@ class TestMergeBufferedRanges:
         assert result[-1][1] == 20.0
 
 
-class TestNudgeSegmentForSpeech:
-    """Lines 408-416: nudge start/end out of protected ranges."""
-
-    def test_start_inside_range_nudged_earlier(self):
-        new_s, new_e, adj = nudge_segment_for_speech(
-            start=2.5,
-            end=6.0,
-            merged_ranges=[(2.0, 3.0)],
-            video_duration=10.0,
-        )
-        assert adj
-        assert new_s < 2.5
-
-    def test_end_inside_range_nudged_later(self):
-        new_s, new_e, adj = nudge_segment_for_speech(
-            start=0.0,
-            end=2.5,
-            merged_ranges=[(2.0, 3.0)],
-            video_duration=10.0,
-        )
-        assert adj
-        assert new_e > 2.5
-
-    def test_entirely_inside_no_adjustment(self):
-        new_s, new_e, adj = nudge_segment_for_speech(
-            start=2.2,
-            end=2.8,
-            merged_ranges=[(2.0, 3.0)],
-            video_duration=10.0,
-        )
-        assert not adj
-
-
 class TestAdjustCandidatesForAudio:
     """Lines 443, 460-461, 467-472, 475-480, 488: adjust_candidates_for_audio paths."""
 
@@ -747,7 +623,9 @@ class TestAdjustCandidatesForAudio:
 
         audio_result = AudioAnalysisResult(protected_ranges=[])
         candidates = [(CutPoint(0.0, True, True), CutPoint(5.0, True, True))]
-        result = adjust_candidates_for_audio(candidates, audio_result, 10.0, 2.0, 8.0)
+        result = adjust_candidates_for_audio(
+            candidates, audio_result, 10.0, 2.0, 8.0, min_silence_ms=200
+        )
         assert result == candidates
 
     def test_oversized_segment_trimmed_to_proportional_max(self):
@@ -759,7 +637,9 @@ class TestAdjustCandidatesForAudio:
         candidates = [
             (CutPoint(3.5, True, True), CutPoint(15.0, True, True)),
         ]
-        result = adjust_candidates_for_audio(candidates, audio_result, 20.0, 2.0, 6.0)
+        result = adjust_candidates_for_audio(
+            candidates, audio_result, 20.0, 2.0, 6.0, min_silence_ms=200
+        )
         assert len(result) >= 1
         for start_cp, end_cp in result:
             assert end_cp.time - start_cp.time <= 6.0 + 0.01
@@ -778,8 +658,45 @@ class TestAdjustCandidatesForAudio:
         candidates = [
             (CutPoint(3.0, True, True), CutPoint(5.0, True, True)),
         ]
-        result = adjust_candidates_for_audio(candidates, audio_result, 10.0, 3.0, 15.0)
+        result = adjust_candidates_for_audio(
+            candidates, audio_result, 10.0, 3.0, 15.0, min_silence_ms=200
+        )
         assert len(result) >= 1
+
+
+class TestBufferPreservesVadPauses:
+    """The buffer must not undo the splits FireRedVAD deliberately made.
+
+    FireRedVAD closes a region after `min_silence_ms` of silence. A buffer of
+    half that pause or more re-merges the regions, and a candidate landing
+    inside the resulting blob can no longer be nudged anywhere -- the original
+    full-duration-clip bug.
+    """
+
+    def test_pause_wider_than_min_silence_survives_the_merge(self):
+        ranges = [(1.0, 2.0), (2.3, 3.3)]
+
+        merged = merge_buffered_ranges(ranges, 10.0, speech_buffer_seconds(200))
+
+        assert len(merged) == 2
+
+    def test_candidate_spanning_the_pause_is_nudged_out_of_both_ranges(self):
+        from immich_memories.analysis.segment_generation import adjust_candidates_for_audio
+
+        audio_result = AudioAnalysisResult(protected_ranges=[(1.0, 2.0), (2.3, 3.3)])
+        candidates = [(CutPoint(1.5, True, True), CutPoint(2.8, True, True))]
+
+        result = adjust_candidates_for_audio(
+            candidates, audio_result, 10.0, 0.5, 8.0, min_silence_ms=200
+        )
+
+        start_cp, end_cp = result[0]
+        assert start_cp.time < 1.0
+        assert end_cp.time > 3.3
+
+    def test_buffer_stays_under_half_the_configured_pause(self):
+        for min_silence_ms in (50, 200, 500, 2000):
+            assert speech_buffer_seconds(min_silence_ms) * 2 < min_silence_ms / 1000.0
 
 
 class TestClassifySegmentEvents:

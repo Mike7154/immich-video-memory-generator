@@ -73,6 +73,19 @@ audio-ml = [
     "torch>=2.0",
     "panns-inference>=0.1",
 ]
+# Speech boundary detection (VAD)
+# FireRedVAD's ONNX weights are vendored in speech/bundled_models/ -- no
+# runtime download, no torch.
+# smart-turn-v3 (speech/turn_detection.py) additionally needs huggingface-hub
+# and transformers, which are deliberately NOT listed: its contribution is
+# weighted zero (see speech/boundary_scoring.py) and nothing in src/ imports
+# it, so shipping ~500 MB of transformers in the Docker image would buy
+# nothing. `pip install transformers huggingface-hub` re-enables it; without
+# them SmartTurnDetector returns a neutral 0.5.
+speech = [
+    "onnxruntime>=1.17",
+    "kaldi-native-fbank>=1.20",
+]
 # OIDC authentication (only needed for SSO login)
 auth = [
     "authlib>=1.6.12",
@@ -101,6 +114,7 @@ all = [
     "immich-memories[auth]",
     "immich-memories[demucs]",
     "immich-memories[gpu]",
+    "immich-memories[speech]",
 ]
 # All features for macOS (includes Apple Vision framework)
 all-mac = [
@@ -110,6 +124,7 @@ all-mac = [
     "immich-memories[demucs]",
     "immich-memories[mac]",
     "immich-memories[gpu]",
+    "immich-memories[speech]",
 ]
 dev = [
     "pytest>=9.0.3",
@@ -315,6 +330,16 @@ module = [
     # PANNs / PyTorch (optional for audio content analysis)
     "torch.*",
     "panns_inference.*",
+    # FireRedVAD's ONNX runtime + feature extractor (optional, speech extra)
+    "onnxruntime",
+    "onnxruntime.*",
+    "kaldi_native_fbank",
+    "kaldi_native_fbank.*",
+    # smart-turn's Hub download + log-mel extractor (not in any extra)
+    "transformers",
+    "transformers.*",
+    "huggingface_hub",
+    "huggingface_hub.*",
     # Taichi (GPU rendering)
     "taichi.*",
     # Not-yet-implemented modules
@@ -447,9 +472,9 @@ disable_error_code = ["union-attr", "arg-type"]
 module = ["immich_memories.titles.rendering_service"]
 disable_error_code = ["assignment", "misc", "attr-defined", "arg-type"]
 
-# Unified analyzer with complex audio analysis
+# Speech/audio-content analysis service (dynamic AudioContentAnalyzer typing)
 [[tool.mypy.overrides]]
-module = ["immich_memories.analysis.unified_analyzer"]
+module = ["immich_memories.analysis.speech_analysis"]
 disable_error_code = ["var-annotated", "assignment", "attr-defined"]
 
 # Title generator with optional Taichi imports
@@ -530,6 +555,7 @@ DEP001 = [
     "yaml", "acestep", "soundfile", "scipy",            # Optional deps imported conditionally
     "torchaudio", "demucs", "torchcodec", "loguru",      # Optional: local audio pipeline
     "mlx",                                              # Optional: Apple Silicon ACE-Step path
+    "transformers", "huggingface_hub",                  # Optional: smart-turn, off by default
     "PIL", "av", "freetype", "streamlit",               # Alt package names (Pillow→PIL, pyav→av)
     "starlette",                                        # Transitive via nicegui→fastapi→starlette
 ]

@@ -78,13 +78,13 @@ class TestResetForVideo:
             audio_content_config=AudioContentConfig(),
             analysis_config=AnalysisConfig(),
         )
-        analyzer._audio_analysis_cache["first-video"] = MagicMock()
+        analyzer._speech_analysis._audio_analysis_cache["first-video"] = MagicMock()
 
         analyzer.reset_for_video()
 
-        assert analyzer._audio_analysis_cache == {}
+        assert analyzer._speech_analysis._audio_analysis_cache == {}
         assert analyzer.content_analyzer is content_analyzer
-        assert analyzer._audio_analyzer is audio_analyzer
+        assert analyzer._speech_analysis._audio_analyzer is audio_analyzer
         scorer.release_capture.assert_called_once()
 
 
@@ -624,6 +624,8 @@ class TestCreateUnifiedAnalyzerFromConfig:
         assert isinstance(analyzer, UnifiedSegmentAnalyzer)
         assert analyzer.min_segment_duration == config.analysis.min_segment_duration
         assert analyzer.max_segment_duration == config.analysis.max_segment_duration
+        # config.speech must reach the analyzer the same way config.audio_content does.
+        assert analyzer._speech_analysis.speech_config is config.speech
 
     def test_creates_analyzer_with_content_analysis(self):
         """Should create analyzer with content analysis when enabled."""
@@ -679,3 +681,88 @@ class TestScoreVisualExcludesAudio:
         # Visual score = weighted average of face, motion, stability ONLY
         expected = (0.9 * 0.35 + 0.6 * 0.20 + 0.3 * 0.15) / (0.35 + 0.20 + 0.15)
         assert abs(result["total"] - expected) < 0.001
+
+
+class TestBestSegmentOverlapHandling:
+    def test_boundary_does_not_land_in_a_second_overlapping_range(self):
+        from immich_memories.analysis.boundary_placement import (
+            gaps_between,
+            select_segment_boundaries,
+        )
+
+        ranges = [(1.0, 10.0), (8.0, 15.0)]
+        gaps = gaps_between(ranges, video_duration=20.0)
+
+        start, end, _ = select_segment_boundaries(
+            start=5.0, end=12.0, gaps=gaps, video_duration=20.0, min_segment_duration=1.0
+        )
+
+        assert not any(lo < start < hi for lo, hi in ranges)
+        assert not any(lo < end < hi for lo, hi in ranges)
+
+
+def _boundary_fixing_analyzer(**kwargs) -> UnifiedSegmentAnalyzer:
+    """Analyzer wired for `_fix_best_segment_boundaries` and nothing else."""
+    from immich_memories.config_models import SpeechConfig
+
+    # WHY: SceneScorer opens the video with OpenCV; the boundary-fixing pass
+    # never touches it, so a stand-in keeps the test off the filesystem.
+    return UnifiedSegmentAnalyzer(
+        scorer=MagicMock(),
+        audio_content_config=AudioContentConfig(),
+        analysis_config=AnalysisConfig(),
+        speech_config=SpeechConfig(min_silence_ms=200),
+        **kwargs,
+    )
+
+
+class TestBestSegmentUsesTheSameSafetyBufferAsCandidates:
+    def test_best_segment_pass_honours_the_protected_range_buffer(self):
+        """Step 3b inverts the *buffered* protected ranges; step 5 used to invert
+        the raw ones. Its gaps were therefore strictly wider, and it could park a
+        cut in the 100 ms pause between 6.0s and 6.1s -- a pause the buffer
+        deliberately closes because the VAD only splits on 200 ms of silence.
+        """
+        from immich_memories.analysis.boundary_placement import speech_buffer_seconds
+        from immich_memories.audio.audio_models import AudioAnalysisResult
+
+        ranges = [(2.0, 6.0), (6.1, 30.0)]
+        # max_segment_duration=40 keeps the proportional-max cap out of the way.
+        analyzer = _boundary_fixing_analyzer(min_segment_duration=2.0, max_segment_duration=40.0)
+        best = ScoredSegment(start_time=7.0, end_time=32.0)
+
+        analyzer._fix_best_segment_boundaries(
+            best, AudioAnalysisResult(events=[], protected_ranges=ranges), 40.0
+        )
+
+        buffer = speech_buffer_seconds(200)
+        for lo, hi in ranges:
+            assert not lo - buffer < best.start_time < hi + buffer
+            assert not lo - buffer < best.end_time < hi + buffer
+
+
+class TestBestSegmentProportionalMax:
+    def test_proportional_max_cap_lands_on_a_gap_not_mid_utterance(self):
+        """The cap on the shipping path was raw arithmetic: start + proportional_max.
+
+        The end escapes forward to the 29.5-30.5s silence, which makes the
+        segment 28s against a 15s ceiling. Capping at 2.0 + 15.0 = 17.0s puts
+        the shipped cut in the middle of a 21-second utterance. The only silence
+        at or before the cap is the 7.5-8.5s pause, so that is where it goes --
+        the same rule the candidate pass has followed since the cap was fixed
+        there.
+        """
+        from immich_memories.audio.audio_models import AudioAnalysisResult
+
+        # Buffered by 80 ms these merge to (4.0, 7.5), (8.5, 29.5), (30.5, 40.0).
+        ranges = [(4.08, 7.42), (8.58, 29.42), (30.58, 40.0)]
+        analyzer = _boundary_fixing_analyzer(min_segment_duration=2.0, max_segment_duration=15.0)
+        best = ScoredSegment(start_time=2.0, end_time=20.0)
+
+        analyzer._fix_best_segment_boundaries(
+            best, AudioAnalysisResult(events=[], protected_ranges=ranges), 40.0
+        )
+
+        assert best.end_time == 8.0
+        assert best.duration <= 15.0
+        assert not any(lo < best.end_time < hi for lo, hi in ranges)
