@@ -228,3 +228,44 @@ def test_looping_transcript_is_discarded_by_the_transcriber():
     )
 
     assert transcriber.transcribe(_audio()) is None
+
+
+def test_strip_non_speech_markers_removes_asterisk_annotations():
+    """Real output: whisper labelled crowd noise rather than inventing speech."""
+    assert strip_non_speech_markers("*bruits de foule*") == ""
+
+
+def test_strip_non_speech_markers_removes_music_notes():
+    """Real output: whisper wraps sung content in music notes."""
+    assert strip_non_speech_markers("♪ I'm a champion ♪ ♪ Champion ♪") == ""
+
+
+def test_strip_non_speech_markers_keeps_speech_around_an_annotation():
+    assert strip_non_speech_markers("*rires* Tu fais quoi ?") == "Tu fais quoi ?"
+
+
+def test_punctuation_only_transcript_is_discarded():
+    """Real output: on digital silence whisper returns '...' at confidence 0.83.
+
+    The marker stripper leaves it alone (no brackets), the loop detector sees no
+    words, and min_confidence no longer catches it by accident.
+    """
+    model = FakeModel(segments=[FakeSegment("...", 0.83)])
+    transcriber = WhisperCppTranscriber(
+        TranscriptionConfig(enabled=True, languages=["fr"], min_confidence=0.0), model=model
+    )
+
+    assert transcriber.transcribe(_audio()) is None
+
+
+def test_defaults_match_the_measured_operating_point():
+    """base produced "- Dear." and "La papa." where medium produced whole sentences.
+
+    The confidence floor defaults to 0.0 because it is inverted on this audio:
+    correct transcripts measured 0.63-0.71, fluent nonsense 0.84-0.95.
+    """
+    config = TranscriptionConfig()
+
+    assert config.model == "medium"
+    assert config.min_confidence == 0.0
+    assert config.min_voiced_seconds == 1.0, "the voice-activity gate still filters"

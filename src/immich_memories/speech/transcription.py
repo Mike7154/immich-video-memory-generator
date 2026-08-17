@@ -21,9 +21,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# whisper.cpp writes its non-speech annotations in brackets or parentheses:
-# [Music], [BLANK_AUDIO], (sighs). A result made of nothing else is not speech.
-_MARKER_RE = re.compile(r"[\[(][^\])]*[\])]")
+# whisper.cpp writes its non-speech annotations several ways, all found in real
+# output: [Music], [BLANK_AUDIO], (sighs), *bruits de foule* for crowd noise, and
+# sung content wrapped in music notes. A result made of nothing else is not speech.
+_MARKER_RE = re.compile(r"[\[(][^\])]*[\])]|\*[^*]*\*|♪[^♪]*♪")
 
 # Below this, repetition is normal speech: "Merci, merci." and "No. No!" are real
 # utterances from the library, not loops.
@@ -115,6 +116,16 @@ def _has_stuttered_word(words: list[str]) -> bool:
     return False
 
 
+def _has_words(text: str) -> bool:
+    """Punctuation alone is not speech.
+
+    Real output: on digital silence whisper returns "..." at confidence 0.83. The
+    marker stripper leaves it (no brackets), the loop detector sees no words, and
+    the confidence floor no longer catches it.
+    """
+    return bool(re.search(r"\w", text))
+
+
 def _mean_probability(segments: list) -> float:
     """Unweighted mean of the per-segment token probabilities.
 
@@ -181,7 +192,7 @@ class WhisperCppTranscriber:
             return None
 
         text = strip_non_speech_markers(" ".join(segment.text for segment in segments))
-        if not text:
+        if not _has_words(text):
             return None
 
         if is_repetition_loop(text):
