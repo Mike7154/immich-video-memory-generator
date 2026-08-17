@@ -285,6 +285,62 @@ pause or more would merge the regions back together and undo the split.
 
 Set `enabled: false` to turn voice activity off entirely — there is no alternative engine.
 
+## Transcription
+
+```yaml
+transcription:
+  enabled: false                 # Transcribe speech in the top candidate clips
+  languages: []                  # Languages your library contains, e.g. [fr, en]
+  model: base                    # tiny / base / small / medium / large, or a path
+  min_voiced_seconds: 1.0        # Voice activity required before transcribing
+  min_confidence: 0.6            # Mean token probability floor
+  use_gpu: true                  # Metal on macOS; Linux wheels are CPU-only
+```
+
+Requires the `transcribe` extra (`uv sync --extra transcribe`, included in `all` and `all-mac`)
+and `speech.enabled: true` — voice activity is what decides whether a clip is transcribed at all,
+so with speech off there is no gate and nothing is transcribed.
+
+`languages` is the one setting you have to fill in. Leave it empty and nothing is transcribed,
+which is deliberate: automatic detection across all 99 languages put French audio in Japanese and
+in German on both attempts, and a transcript in the wrong language is worse than no transcript.
+One entry forces that language and skips detection entirely. Several restrict detection to those
+languages, so the model chooses between the two or three your library actually contains instead of
+guessing among 99.
+
+Transcripts are stored on the top five candidate segments of each video and **do not affect any
+score**. Nothing reads them yet.
+
+Unlike the FireRedVAD weights, which ship inside the package, whisper models are downloaded from
+HuggingFace on first use (~148 MB for `base`, ~75 MB for `tiny`). In Docker, mount the model
+directory as a volume or every container start downloads it again.
+
+### What the gate can and cannot catch
+
+Measured over 80 clips and 282 candidate segments from a real family library:
+
+| | |
+|---|---|
+| Clips with no voice activity at all | 9% |
+| Candidate segments declined before reaching whisper | 71% |
+| Whisper calls saved by reusing overlapping candidates | 46% |
+| Cost per segment considered | ~0.1 s |
+
+`min_voiced_seconds` does most of the filtering. Transcripts that survive are also checked for
+repetition loops — whisper emitting one phrase several times over — which arrive at confidence
+0.90 and above and so are invisible to `min_confidence`.
+
+`min_confidence` almost never fires: of 102 transcripts, none scored between 0.60 and 0.62.
+Confidence does **not** track correctness. On noisy audio — children, distance from the
+microphone, several people at once — whisper produces fluent nonsense at 0.90+ alongside correct
+speech, and raising the floor discards the good with the bad. A larger model does not fix this:
+`small` declined more segments including correct ones, still produced confident nonsense, and ran
+about ten times slower.
+
+The signal that would separate the two is `no_speech_prob`, and whisper.cpp does not expose it:
+the getter exists in the C API but neither the CLI's JSON output nor the Python bindings surface
+it. Treat transcripts as best-effort hints, not as facts.
+
 ## Title screens
 
 ```yaml

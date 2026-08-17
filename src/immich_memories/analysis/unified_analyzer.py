@@ -34,12 +34,18 @@ from immich_memories.analysis.segment_generation import (
     merge_boundaries,
     score_segment_audio,
 )
+from immich_memories.analysis.segment_transcription import transcribe_top_segments
 from immich_memories.analysis.speech_analysis import SpeechAnalysisService
 
 if TYPE_CHECKING:
     from immich_memories.analysis.content_analyzer import ContentAnalyzer
     from immich_memories.audio.audio_models import AudioAnalysisResult
-    from immich_memories.config_models import AnalysisConfig, AudioContentConfig, SpeechConfig
+    from immich_memories.config_models import (
+        AnalysisConfig,
+        AudioContentConfig,
+        SpeechConfig,
+        TranscriptionConfig,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +104,7 @@ class UnifiedSegmentAnalyzer:
         analysis_config: AnalysisConfig,
         speech_config: SpeechConfig | None = None,
         speech_analysis: SpeechAnalysisService | None = None,
+        transcription_config: TranscriptionConfig | None = None,
     ):
         """Initialize the unified analyzer.
 
@@ -141,6 +148,7 @@ class UnifiedSegmentAnalyzer:
             speech_config=speech_config,
             audio_content_enabled=audio_content_enabled,
             audio_analyzer=audio_analyzer,
+            transcription_config=transcription_config,
         )
 
         self._scene_detector = SceneDetector(analysis_config=analysis_config)
@@ -369,6 +377,9 @@ class UnifiedSegmentAnalyzer:
             enable_audio_content_analysis=audio_available,
         )
         scored_segments.sort(key=lambda s: s.total_score, reverse=True)
+
+        # Step 4a-half: independent of content analysis by design.
+        transcribe_top_segments(self._speech_analysis, scored_segments, audio_video)
 
         if enable_content_analysis:
             self._run_llm_scoring(
