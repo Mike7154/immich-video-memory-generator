@@ -80,7 +80,9 @@ class UnifiedSegmentAnalyzer:
         content_analyzer: ContentAnalyzer | None = None,
         min_segment_duration: float = 2.0,
         max_segment_duration: float = 15.0,
-        silence_threshold_db: float = -30.0,
+        # -40.0, not -30.0: this argument was always passed from config, so -40.0
+        # is the threshold that runs. The constructor default was stale.
+        silence_threshold_db: float = -40.0,
         min_silence_duration: float = 0.3,
         cut_point_merge_tolerance: float = 0.5,
         content_weight: float = 0.0,
@@ -350,6 +352,13 @@ class UnifiedSegmentAnalyzer:
         logger.info(
             f"Step 4a: Visual scoring {len(candidates)} candidates (faces, motion, stability, duration)"
         )
+        # One decision for the whole scoring flow. Audio participates only when
+        # analysis actually produced something; enabled-but-absent is the same as
+        # off, and must stay the same in both the initial pass and the LLM
+        # rescoring of the top candidates, or the top 5 get scored on a different
+        # basis from everything they are ranked against.
+        audio_available = audio_content_enabled and bool(audio_content_result)
+
         scored_segments = self._score_segments_visual_only(
             visual_video,
             candidates,
@@ -357,7 +366,7 @@ class UnifiedSegmentAnalyzer:
             audio_content_result,
             video_duration,
             enable_content_analysis=enable_content_analysis,
-            enable_audio_content_analysis=audio_content_enabled,
+            enable_audio_content_analysis=audio_available,
         )
         scored_segments.sort(key=lambda s: s.total_score, reverse=True)
 
@@ -365,7 +374,7 @@ class UnifiedSegmentAnalyzer:
             self._run_llm_scoring(
                 scored_segments,
                 audio_video,
-                enable_audio_content_analysis=audio_content_enabled,
+                enable_audio_content_analysis=audio_available,
             )
 
         if scored_segments:
@@ -668,10 +677,17 @@ class UnifiedSegmentAnalyzer:
                 segment.visual_score = visual_scores.get("total", 0.0)
             except (OSError, subprocess.SubprocessError, RuntimeError, ValueError, TypeError) as e:
                 logger.warning(f"Visual scoring failed: {e}")
-                segment.visual_score = 0.5  # Neutral fallback
+                # Not 0.5: the ceiling for a segment with no faces is exactly
+                # (motion_weight + stability_weight) / visual_weight = 0.500, so a
+                # neutral fallback outranked every genuinely-scored landscape shot.
+                segment.visual_score = 0.0
 
-            # Score using audio content analysis (if available)
-            if audio_content_result and enable_audio_content_analysis:
+            # Audio only votes when it actually has something to say. Leaving the
+            # ScoredSegment default of 0.5 in place while still applying
+            # audio_content_weight meant a video whose audio analysis failed
+            # outscored one with real speech, which measures around 0.32.
+            audio_available = audio_content_result is not None and enable_audio_content_analysis
+            if audio_content_result is not None and audio_available:
                 audio_score_info = score_segment_audio(
                     segment.start_time, segment.end_time, audio_content_result
                 )
@@ -691,7 +707,7 @@ class UnifiedSegmentAnalyzer:
             segment.total_score = self._compute_total_score(
                 segment,
                 enable_content_analysis=enable_content_analysis,
-                enable_audio_content_analysis=enable_audio_content_analysis,
+                enable_audio_content_analysis=audio_available,
             )
             scored.append(segment)
 
