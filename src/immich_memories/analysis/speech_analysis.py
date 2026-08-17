@@ -16,13 +16,15 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from immich_memories.audio.audio_models import SPEECH_EVENT_CLASS
-from immich_memories.config_models import SpeechConfig
+from immich_memories.config_models import SpeechConfig, TranscriptionConfig
 from immich_memories.speech.models import SpeechRegion
+from immich_memories.speech.transcription import select_transcriber
 from immich_memories.speech.vad import VAD_SAMPLE_RATE, extract_audio_16k, select_detector
 
 if TYPE_CHECKING:
     from immich_memories.audio.audio_models import AudioAnalysisResult, AudioEvent
     from immich_memories.config_models import AudioContentConfig
+    from immich_memories.speech.transcription import Transcriber, Transcript
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,11 @@ def non_speech_protected_ranges(
     ]
 
 
+def voiced_seconds(regions: list[SpeechRegion], start: float, end: float) -> float:
+    """Total voice-activity time inside [start, end]."""
+    return sum(max(0.0, min(region.end, end) - max(region.start, start)) for region in regions)
+
+
 class SpeechAnalysisService:
     """Audio-content (PANNs) and VAD speech-boundary analysis.
 
@@ -74,6 +81,8 @@ class SpeechAnalysisService:
         speech_config: SpeechConfig | None = None,
         audio_content_enabled: bool = False,
         audio_analyzer: object | None = None,
+        transcription_config: TranscriptionConfig | None = None,
+        transcriber: Transcriber | None = None,
     ):
         """Initialize the speech analysis service.
 
@@ -82,6 +91,8 @@ class SpeechAnalysisService:
             speech_config: SpeechConfig controlling VAD-derived protected ranges.
             audio_content_enabled: Enable audio content analysis (laughter detection).
             audio_analyzer: Pre-built PANNs analyzer, or None to lazy-create.
+            transcription_config: TranscriptionConfig controlling speech transcription.
+            transcriber: Pre-built transcriber, or None to select one from config.
         """
         self._audio_content_config = audio_content_config
         self.speech_config = speech_config or SpeechConfig()
@@ -90,6 +101,13 @@ class SpeechAnalysisService:
         self._audio_analyzer = audio_analyzer  # Injected or lazy-created
         self._audio_analysis_cache: dict[str, AudioAnalysisResult] = {}
         self._vad_audio_cache: dict[str, np.ndarray | None] = {}
+        self._vad_regions_cache: dict[str, list[SpeechRegion]] = {}
+        self.transcription_config = transcription_config or TranscriptionConfig()
+        self._transcriber = (
+            transcriber
+            if transcriber is not None
+            else select_transcriber(self.transcription_config)
+        )
 
     def clear_cache(self, release_audio_analyzer: bool = False) -> None:
         """Clear internal caches to free memory.
@@ -100,6 +118,7 @@ class SpeechAnalysisService:
         """
         self._audio_analysis_cache.clear()
         self._vad_audio_cache.clear()
+        self._vad_regions_cache.clear()
         if release_audio_analyzer and self._audio_analyzer is not None:
             if hasattr(self._audio_analyzer, "cleanup"):
                 self._audio_analyzer.cleanup()
@@ -109,6 +128,7 @@ class SpeechAnalysisService:
         """Release current-video state while retaining reusable configuration and models."""
         self._audio_analysis_cache.clear()
         self._vad_audio_cache.clear()
+        self._vad_regions_cache.clear()
 
     def run_audio_content_analysis(
         self,
@@ -256,12 +276,12 @@ class SpeechAnalysisService:
         if not self.speech_config.enabled or self._speech_detector is None:
             return result
 
-        audio = self.extract_audio_cached(video_path)
-        if audio is None:
+        regions = self.detect_regions_cached(video_path)
+        if not regions:
             return result
 
-        regions = self._speech_detector.detect(audio, VAD_SAMPLE_RATE)
-        if not regions:
+        audio = self.extract_audio_cached(video_path)
+        if audio is None:
             return result
 
         duration = video_duration or (len(audio) / VAD_SAMPLE_RATE)
@@ -290,3 +310,59 @@ class SpeechAnalysisService:
         if cache_key not in self._vad_audio_cache:
             self._vad_audio_cache[cache_key] = extract_audio_16k(video_path)
         return self._vad_audio_cache[cache_key]
+
+    def detect_regions_cached(self, video_path: Path) -> list[SpeechRegion]:
+        """VAD regions for a video, computed once and reused.
+
+        Both boundary placement and the transcription gate need them; running
+        FireRedVAD twice over one cached array buys nothing.
+        """
+        cache_key = str(video_path)
+        if cache_key not in self._vad_regions_cache:
+            audio = self.extract_audio_cached(video_path)
+            if audio is None or self._speech_detector is None:
+                self._vad_regions_cache[cache_key] = []
+            else:
+                self._vad_regions_cache[cache_key] = self._speech_detector.detect(
+                    audio, VAD_SAMPLE_RATE
+                )
+        return self._vad_regions_cache[cache_key]
+
+    def transcribe_segment(self, video_path: Path, start: float, end: float) -> Transcript | None:
+        """Transcribe one segment, or decline.
+
+        Declining is the common case and is not an error: no transcriber
+        configured, too little voice activity, or a result the post-ASR gate
+        rejected. Nothing downstream scores on the outcome either way.
+
+        The transcriber receives a slice of the cached 16 kHz array, never the
+        whole video, so whisper is only ever asked what was said and never when.
+        """
+        if self._transcriber is None or not self.speech_config.enabled:
+            return None
+
+        regions = self.detect_regions_cached(video_path)
+        voiced = voiced_seconds(regions, start, end)
+        if voiced < self.transcription_config.min_voiced_seconds:
+            logger.debug(
+                "Skipping transcription of %.1fs-%.1fs: %.2fs voiced (floor %.2fs)",
+                start,
+                end,
+                voiced,
+                self.transcription_config.min_voiced_seconds,
+            )
+            return None
+
+        audio = self.extract_audio_cached(video_path)
+        if audio is None:
+            return None
+
+        segment_audio = audio[int(start * VAD_SAMPLE_RATE) : int(end * VAD_SAMPLE_RATE)]
+        if segment_audio.size == 0:
+            return None
+
+        try:
+            return self._transcriber.transcribe(segment_audio)
+        except (RuntimeError, ValueError, OSError) as exc:
+            logger.warning("Transcription failed for %s: %s", video_path.name, exc)
+            return None
