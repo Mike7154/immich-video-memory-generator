@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal
@@ -90,6 +91,45 @@ def _run_ffmpeg_check(args: list[str]) -> tuple[bool, str]:
 def _check_ffmpeg_encoder(encoder: str) -> bool:
     success, output = _run_ffmpeg_check(["-hide_banner", "-encoders"])
     return success and encoder in output
+
+
+# Extra input-side args a hardware encoder needs to accept a software frame in a probe.
+_PROBE_UPLOAD_ARGS: dict[str, list[str]] = {
+    "vaapi": [
+        "-init_hw_device",
+        "vaapi=va",
+        "-filter_hw_device",
+        "va",
+        "-vf",
+        "format=nv12,hwupload",
+    ],
+    "qsv": [
+        "-init_hw_device",
+        "qsv=hw",
+        "-filter_hw_device",
+        "hw",
+        "-vf",
+        "hwupload=extra_hw_frames=8,format=qsv",
+    ],
+}
+
+
+def _probe_ffmpeg_encode(encoder_args: list[str], *, upload: str | None = None) -> bool:
+    """Encode one synthetic frame; the only proof a hardware encoder actually has a device.
+
+    `ffmpeg -encoders` lists NVENC/QSV/VAAPI on any build compiled with them (Debian's is),
+    so a listing check alone selects NVENC on every GPU-less Docker host (#343).
+    """
+    args = [
+        "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-f", "lavfi", "-i", "testsrc=size=64x64:rate=1",
+        *_PROBE_UPLOAD_ARGS.get(upload or "", []),
+        "-frames:v", "1", *encoder_args, "-f", "null", "-",
+    ]  # fmt: skip
+    success, output = _run_ffmpeg_check(args)
+    if not success:
+        logger.info("Hardware encoder probe failed for %s: %s", encoder_args, output.strip()[-200:])
+    return success
 
 
 def _check_ffmpeg_decoder(decoder: str) -> bool:
@@ -338,12 +378,34 @@ def print_hardware_info(capabilities: HWAccelCapabilities) -> None:
     print()
 
 
+_SOFTWARE_FAST_ARGS = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28"]
+_HARDWARE_FAST_ARGS = {
+    HWAccelBackend.NVIDIA: ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "constqp", "-qp", "28"],
+    HWAccelBackend.VAAPI: ["-c:v", "h264_vaapi", "-qp", "28"],
+    HWAccelBackend.QSV: ["-c:v", "h264_qsv", "-preset", "veryfast"],
+}
+
+
+def fast_encoder_args(*, hardware_enabled: bool = True) -> list[str]:
+    """Speed-first encoder args for analysis/preview temp files.
+
+    Uses the probed backend from `detect_hardware_acceleration()` — never a bare
+    `ffmpeg -encoders` listing, which advertises NVENC/VAAPI/QSV on GPU-less boxes (#343).
+    """
+    if not hardware_enabled:
+        return _SOFTWARE_FAST_ARGS.copy()
+    if sys.platform == "darwin":
+        return ["-c:v", "h264_videotoolbox", "-q:v", "65"]  # lower quality is fine for temp files
+    backend = detect_hardware_acceleration().backend
+    return list(_HARDWARE_FAST_ARGS.get(backend, _SOFTWARE_FAST_ARGS))
+
+
 # ---------------------------------------------------------------------------
 # Re-export detect_hardware_acceleration from the backends module so that
 # existing ``from immich_memories.processing.hardware import ...`` keeps working.
 # ---------------------------------------------------------------------------
 
-from immich_memories.processing._hardware_backends import (  # noqa: E402, F401
+from immich_memories.processing.hardware_detection import (  # noqa: E402, F401
     detect_hardware_acceleration,
 )
 
@@ -351,6 +413,7 @@ __all__ = [
     "HWAccelBackend",
     "HWAccelCapabilities",
     "detect_hardware_acceleration",
+    "fast_encoder_args",
     "get_ffmpeg_encoder",
     "get_ffmpeg_hwaccel_args",
     "get_ffmpeg_scale_filter",
