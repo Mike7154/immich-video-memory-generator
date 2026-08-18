@@ -23,9 +23,12 @@ _PROMPT_HEAD = """Describe what you see in this image."""
 
 _PROMPT_TAIL = """Return JSON with these fields:
 - description: What is happening in this scene?
-- category: What is this mainly of? Exactly one of: people, animal, landscape, object.
-  Use "people" if any person is visible, even partly. Use "landscape" only for a wide
-  outdoor view, never for a close-up of a thing. Use "object" for anything else.
+- category: What is this mainly of? Exactly one of: people, animal, landscape, object, screen.
+  Use "screen" if the subject is a phone, watch, computer or TV display, a screenshot,
+  or a document or form -- even when a person is holding or wearing the device.
+  Use "people" if a person is the subject. Use "animal" only for a live animal, not a
+  toy, figurine, drawing or photo of one. Use "landscape" only for a wide outdoor view,
+  never for a close-up of a thing. Use "object" for anything else.
 - subjects: What is in frame? (short lowercase nouns, e.g. ["child", "dog", "beach"])
 - emotion: What is the mood? (one word: happy, calm, excited, playful, joyful, peaceful)
 - interestingness: How memorable is this moment? (0.0 to 1.0)
@@ -72,6 +75,8 @@ def build_content_analysis_prompt(transcript: str | None = None) -> str:
     sections.append(_PROMPT_TAIL)
     return "\n\n".join(sections)
 
+
+MAX_LIST = 10
 
 CONTENT_ANALYSIS_PROMPT = build_content_analysis_prompt()
 
@@ -375,7 +380,6 @@ class ContentAnalyzer:
             ContentAnalysis instance.
         """
         MAX_STR = 500
-        MAX_LIST = 10
         description = str(data.get("description", ""))[:MAX_STR]
         activities = [str(a)[:MAX_STR] for a in data.get("activities", [])[:MAX_LIST]]
         subjects = [str(s)[:MAX_STR] for s in data.get("subjects", [])[:MAX_LIST]]
@@ -488,6 +492,23 @@ class ContentAnalyzer:
         setting_match = re.search(r'"setting"\s*:\s*"([^"]+)"', text)
         if setting_match:
             result.setting = setting_match.group(1)
+
+        # WHY: the subject policy decides on the category alone, so a response that
+        # reaches this path without one silently drops out of the filter. Sampled
+        # against the live model every response was well-formed and carried a
+        # category, so this is insurance rather than a fix for something observed --
+        # but the two fields it adds are the two the policy cannot work without.
+        category_match = re.search(r'"category"\s*:\s*"([^"]+)"', text)
+        if category_match:
+            result.category = category_match.group(1)
+
+        subjects_match = re.search(r'"subjects"\s*:\s*\[([^\]]*)\]', text)
+        if subjects_match:
+            result.subjects = [
+                item.strip().strip('"').strip("'")
+                for item in subjects_match.group(1).split(",")
+                if item.strip().strip('"').strip("'")
+            ][:MAX_LIST]
 
         if result.description or result.emotion:
             desc_preview = result.description[:50] if result.description else "(none)"

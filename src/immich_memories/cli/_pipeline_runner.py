@@ -396,10 +396,12 @@ def run_pipeline_and_generate(
         thumbnail_cache=thumbnail_cache,
     )
 
+    all_candidates = _drop_reencoded_sources(all_candidates, config=config)
     all_candidates = _apply_subject_policy(
         all_candidates,
         config=config,
         content_budget_seconds=timeline_plan.content_budget,
+        photo_assets=photo_assets,
     )
 
     # Phase 4: Unified selection (videos + photos compete together)
@@ -664,8 +666,44 @@ def _merge_photos_into_pool(
     return analyzed_videos + photo_candidates
 
 
+def _drop_reencoded_sources(candidates: list, *, config: Config) -> list:
+    """Drop messaging re-encodes: small, and with no camera EXIF to vouch for them."""
+    from immich_memories.analysis.source_quality import is_usable_source
+
+    floor = config.analysis.min_source_short_side
+    if floor <= 0:
+        return candidates
+
+    kept = [
+        c
+        for c in candidates
+        if is_usable_source(
+            width=c.clip.width or c.clip.asset.width or 0,
+            height=c.clip.height or c.clip.asset.height or 0,
+            has_camera_exif=_has_camera_exif(c.clip.asset),
+            min_short_side=floor,
+        )
+    ]
+    if len(kept) < len(candidates):
+        logger.info(
+            "Source quality: dropped %d clips under %dp with no camera EXIF",
+            len(candidates) - len(kept),
+            floor,
+        )
+    return kept
+
+
+def _has_camera_exif(asset) -> bool:
+    exif = getattr(asset, "exif_info", None)
+    return bool(exif and (exif.make or exif.model))
+
+
 def _apply_subject_policy(
-    candidates: list, *, config: Config, content_budget_seconds: float
+    candidates: list,
+    *,
+    config: Config,
+    content_budget_seconds: float,
+    photo_assets: list | None = None,
 ) -> list:
     """Prefer clips of people, and ration animals and objects by share of runtime."""
     if not config.analysis.subject_policy_enabled:
@@ -678,6 +716,7 @@ def _apply_subject_policy(
         animal_ratio=config.analysis.max_animal_ratio,
         object_ratio=config.analysis.max_object_ratio,
         content_budget_seconds=content_budget_seconds,
+        photo_asset_ids={a.id for a in photo_assets or []},
     )
 
 

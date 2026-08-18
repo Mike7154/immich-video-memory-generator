@@ -5,17 +5,20 @@ animals are a garnish, and a clip of a lawnmower is not a memory. Selection
 scored clips on faces, motion and stability alone, so a steady handheld pan
 across a lawn outranked a shaky clip of a child.
 
-The policy acts only on evidence. A clip nobody has described yet is kept, not
-rationed -- on a real library 35-46% of the pool has no cached description, and
+The policy acts only on evidence, and the evidence is a label, never prose.
+Keyword matching over the model's description was tried and measured: it called
+a treadmill and a driver's-eye road view "landscape" because both descriptions
+said "close-up view", a tray of animal figurines "animal", and a smartwatch
+demo "people" because a person was holding the watch. The model is now asked
+for the category outright. A clip it has not labelled is unknown, and unknown
+is kept -- on a real library a third of the pool has no analysis yet, and
 treating that silence as "probably an object" would delete half the memory.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import statistics
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -29,142 +32,28 @@ class SubjectCategory(Enum):
     ANIMAL = "animal"
     LANDSCAPE = "landscape"
     OBJECT = "object"
+    SCREEN = "screen"
     UNKNOWN = "unknown"
-
-
-_PEOPLE_TERMS = frozenset(
-    {
-        "person",
-        "people",
-        "man",
-        "men",
-        "woman",
-        "women",
-        "child",
-        "children",
-        "kid",
-        "kids",
-        "baby",
-        "babies",
-        "toddler",
-        "boy",
-        "boys",
-        "girl",
-        "girls",
-        "family",
-        "adult",
-        "adults",
-        "couple",
-        "crowd",
-        "group",
-        "someone",
-        "father",
-        "mother",
-        "dad",
-        "mom",
-        "parent",
-        "parents",
-        "friends",
-    }
-)
-
-_ANIMAL_TERMS = frozenset(
-    {
-        "dog",
-        "dogs",
-        "puppy",
-        "cat",
-        "cats",
-        "kitten",
-        "kittens",
-        "animal",
-        "animals",
-        "pet",
-        "pets",
-        "bird",
-        "birds",
-        "horse",
-        "horses",
-        "cow",
-        "cows",
-        "sheep",
-        "duck",
-        "ducks",
-        "chicken",
-        "rabbit",
-        "fish",
-        "goat",
-    }
-)
-
-# Deliberately narrow, and narrowed further by measurement. "view" and "field"
-# were dropped after they classified a treadmill, a bike hub and an office
-# renovation as scenery -- each of those descriptions said "close-up view".
-# A term earns its place only if it cannot also describe an object in a room.
-_LANDSCAPE_TERMS = frozenset(
-    {
-        "landscape",
-        "scenery",
-        "vista",
-        "panorama",
-        "horizon",
-        "skyline",
-        "sunset",
-        "sunrise",
-        "mountain",
-        "mountains",
-        "valley",
-        "countryside",
-        "sea",
-        "ocean",
-        "lake",
-        "river",
-        "waterfall",
-        "forest",
-        "beach",
-        "cliff",
-        "cliffs",
-        "meadow",
-        "shoreline",
-    }
-)
 
 
 def classify_subject(
     *,
     tagged_people: int,
     category: str | None = None,
-    subjects: Sequence[str] | None = None,
     description: str | None = None,
 ) -> SubjectCategory:
-    """Categorise a clip, most trustworthy signal first.
+    """Categorise a clip from Immich face tags and the model's own label.
 
-    1. Immich face tags. Face recognition has already run across the library, so
-       a tagged clip needs no model call and no guessing.
-    2. The category the VLM was asked to pick from a closed set.
-    3. Keywords in the VLM's prose, for the segments cached before the model was
-       ever asked for a category.
-
-    People win over anything else in frame -- a child chasing a dog is a memory
-    about the child.
+    Face tags settle it outright -- face recognition has already run across the
+    library, so a tagged clip needs no model call. Otherwise the answer is
+    whichever category the model was asked to choose, and nothing else. The
+    description is accepted so callers can pass what they have, and is
+    deliberately ignored; the module docstring records what happened when it
+    was trusted.
     """
     if tagged_people > 0:
         return SubjectCategory.PEOPLE
-
-    stated = _stated_category(category)
-    if stated is not None:
-        return stated
-
-    words = _words(subjects, description)
-    if not words:
-        return SubjectCategory.UNKNOWN
-    if words & _PEOPLE_TERMS:
-        return SubjectCategory.PEOPLE
-    if words & _ANIMAL_TERMS:
-        return SubjectCategory.ANIMAL
-    if words & _LANDSCAPE_TERMS:
-        return SubjectCategory.LANDSCAPE
-    return SubjectCategory.OBJECT
+    return _stated_category(category) or SubjectCategory.UNKNOWN
 
 
 def _stated_category(category: str | None) -> SubjectCategory | None:
@@ -178,12 +67,6 @@ def _stated_category(category: str | None) -> SubjectCategory | None:
     return None if stated is SubjectCategory.UNKNOWN else stated
 
 
-def _words(subjects: Sequence[str] | None, description: str | None) -> set[str]:
-    """Lowercased word set over the VLM's structured subjects and its prose."""
-    blob = " ".join([*(subjects or []), description or ""])
-    return set(re.findall(r"[a-z]+", blob.lower()))
-
-
 @dataclass(frozen=True)
 class SubjectCandidate:
     """A selection candidate reduced to what the subject policy needs."""
@@ -191,6 +74,7 @@ class SubjectCandidate:
     key: str
     category: SubjectCategory
     score: float
+    scale: str = "motion"
 
 
 @dataclass(frozen=True)
@@ -199,7 +83,7 @@ class QuotaOutcome:
 
     kept_keys: list[str]
     dropped: dict[SubjectCategory, int] = field(default_factory=dict)
-    quality_bar: float = 0.0
+    bars: dict[str, float] = field(default_factory=dict)
     bypassed: bool = False
 
 
@@ -224,16 +108,17 @@ def apply_subject_quotas(
     """
     max_animal = quota_for(animal_ratio, expected_clips)
     max_object = quota_for(object_ratio, expected_clips)
+
     by_category: dict[SubjectCategory, list[SubjectCandidate]] = {}
     for candidate in candidates:
         by_category.setdefault(candidate.category, []).append(candidate)
 
-    bar = _quality_bar(by_category, candidates)
+    bars = _quality_bars(candidates)
 
     keep: set[str] = set()
     dropped: dict[SubjectCategory, int] = {}
     for category, members in by_category.items():
-        survivors = _survivors(category, members, bar, max_animal, max_object)
+        survivors = _survivors(category, members, bars, max_animal, max_object)
         keep.update(c.key for c in survivors)
         if len(survivors) < len(members):
             dropped[category] = len(members) - len(survivors)
@@ -244,30 +129,36 @@ def apply_subject_quotas(
         # stands down rather than deleting the memory.
         return QuotaOutcome(
             kept_keys=[c.key for c in candidates],
-            quality_bar=bar,
+            bars=bars,
             bypassed=True,
         )
 
     return QuotaOutcome(
         kept_keys=[c.key for c in candidates if c.key in keep],
         dropped=dropped,
-        quality_bar=bar,
+        bars=bars,
     )
 
 
 def _survivors(
     category: SubjectCategory,
     members: list[SubjectCandidate],
-    bar: float,
+    bars: dict[str, float],
     max_animal: int,
     max_object: int,
 ) -> list[SubjectCandidate]:
     if category is SubjectCategory.ANIMAL:
         return _top(members, max_animal)
+
+    def clears(candidate: SubjectCandidate) -> bool:
+        return candidate.score >= bars.get(candidate.scale, 0.0)
+
+    if category is SubjectCategory.SCREEN:
+        return []
     if category is SubjectCategory.OBJECT:
-        return _top([c for c in members if c.score >= bar], max_object)
+        return _top([c for c in members if clears(c)], max_object)
     if category is SubjectCategory.LANDSCAPE:
-        return [c for c in members if c.score >= bar]
+        return [c for c in members if clears(c)]
     return members
 
 
@@ -291,15 +182,27 @@ def _top(members: list[SubjectCandidate], limit: int) -> list[SubjectCandidate]:
     return sorted(members, key=lambda c: -c.score)[:limit]
 
 
-def _quality_bar(
-    by_category: dict[SubjectCategory, list[SubjectCandidate]],
-    candidates: list[SubjectCandidate],
-) -> float:
-    people = by_category.get(SubjectCategory.PEOPLE)
-    reference = people or candidates
-    if not reference:
-        return 0.0
-    return statistics.median(c.score for c in reference)
+def _quality_bars(candidates: list[SubjectCandidate]) -> dict[str, float]:
+    """The median people-clip score, computed separately for each score scale.
+
+    Photos and motion clips are scored by different pipelines and land in
+    different ranges -- on a real June pool, people motion clips sat at a 0.70
+    median while photos sat far below. One pooled median put the bar at 0.43,
+    low enough for a clip of a string trimmer to clear it. Each scale is
+    therefore judged against its own people.
+    """
+    by_scale: dict[str, list[float]] = {}
+    for candidate in candidates:
+        by_scale.setdefault(candidate.scale, []).append(candidate.score)
+
+    people: dict[str, list[float]] = {}
+    for candidate in candidates:
+        if candidate.category is SubjectCategory.PEOPLE:
+            people.setdefault(candidate.scale, []).append(candidate.score)
+
+    return {
+        scale: statistics.median(people.get(scale) or scores) for scale, scores in by_scale.items()
+    }
 
 
 def filter_candidates_by_subject(
@@ -308,6 +211,7 @@ def filter_candidates_by_subject(
     animal_ratio: float,
     object_ratio: float,
     content_budget_seconds: float,
+    photo_asset_ids: set[str] | None = None,
 ) -> list:
     """Apply the subject policy to a pool of ClipWithSegment candidates.
 
@@ -319,6 +223,7 @@ def filter_candidates_by_subject(
         return candidates
 
     expected_clips = _expected_clip_count(candidates, content_budget_seconds)
+    photos = photo_asset_ids or set()
 
     described = [
         SubjectCandidate(
@@ -326,10 +231,9 @@ def filter_candidates_by_subject(
             category=classify_subject(
                 tagged_people=len(candidate.clip.asset.people or []),
                 category=candidate.clip.llm_category,
-                subjects=candidate.clip.llm_subjects,
-                description=candidate.clip.llm_description,
             ),
             score=candidate.score,
+            scale="photo" if candidate.clip.asset.id in photos else "motion",
         )
         for candidate in candidates
     ]
@@ -352,9 +256,9 @@ def filter_candidates_by_subject(
             f"{n} {category.value}" for category, n in sorted(outcome.dropped.items(), key=str)
         )
         logger.info(
-            "Subject policy: dropped %s (scenery had to beat %.2f, the median people clip)",
+            "Subject policy: dropped %s (had to beat %s)",
             counts,
-            outcome.quality_bar,
+            ", ".join(f"{scale} {bar:.2f}" for scale, bar in sorted(outcome.bars.items())),
         )
 
     kept = set(outcome.kept_keys)

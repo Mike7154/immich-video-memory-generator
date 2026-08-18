@@ -83,6 +83,17 @@ install:
 dev:
 	uv sync --all-extras
 
+install-acestep:  ## Install the tested ACE-Step 1.5 inference stack (music generation)
+	uv pip install --python .venv/bin/python --no-deps \
+	  'ace-step @ git+https://github.com/ace-step/ACE-Step-1.5.git@v0.1.8'
+	uv pip install --python .venv/bin/python \
+	  'accelerate>=1.12.0' 'diffusers>=0.37.0' diskcache 'loguru>=0.7.3' \
+	  'mlx>=0.25.2' 'mlx-lm>=0.20.0' 'pytorch-wavelets>=1.3.0' \
+	  'pywavelets>=1.9.0' toml 'torchvision==0.25.0' \
+	  'transformers>=4.51.0,<4.58.0' 'typer-slim>=0.21.1' \
+	  'vector-quantize-pytorch>=1.27.15'
+	@uv run python -c "from immich_memories.audio.generators.ace_step_backend import ACEStepBackend; import torch, torchvision.ops as o; o.nms(torch.zeros((0,4)), torch.zeros((0,)), 0.5); print('ACE-Step stack OK')"
+
 # Install dev tools only (no GPU/CUDA/audio-ml/face deps — for CI quality gates)
 dev-ci:
 	uv sync --extra dev
@@ -494,7 +505,10 @@ build-check:
 	uvx twine check dist/*
 
 # Ensure dev dependencies are installed
-ENSURE_DEV_COMMAND ?= uv sync --all-extras --quiet
+# --inexact: an exact sync deletes anything this project does not declare, which
+# silently uninstalls the ACE-Step inference stack (make install-acestep) every
+# time a quality gate runs, so music generation breaks after every `make ci`.
+ENSURE_DEV_COMMAND ?= uv sync --all-extras --inexact --quiet
 ensure-dev:
 	@$(ENSURE_DEV_COMMAND)
 
