@@ -76,6 +76,56 @@ Live photos go through the same pipeline as videos after burst merging and are s
 
 **Favorite inheritance**: If ANY photo in a burst cluster is favorited, the entire merged live photo clip inherits the favorite flag.
 
+## What a Clip Is Of
+
+A memory is about the people in it. Scoring ranks clips on faces, motion, stability
+and cut quality, so a steady handheld pan across a lawn can outrank a shaky clip of
+a child — a real generation put a string trimmer in a family video that way.
+
+Every candidate is therefore categorised as **people**, **animal**, **landscape** or
+**object** before selection, using the most trustworthy signal available:
+
+1. **Immich face tags.** Face recognition has already run over your library. A clip
+   with a tagged person is people, no model call needed. This covers roughly half a
+   typical pool and works on already-cached clips.
+2. **The category the model picks.** Content analysis asks the VLM to choose one of
+   the four. This fills in as clips are analysed — existing cache entries keep
+   working through step 3 until they are re-analysed.
+3. **Keywords in the description**, for clips analysed before the model was ever
+   asked for a category.
+
+The quotas:
+
+| category | treatment |
+|---|---|
+| people | always eligible |
+| animal | up to `max_animal_ratio` of the video (default 10%) |
+| object | up to `max_object_ratio` (default 5%) **and** must beat the median people clip |
+| landscape | must beat the median people-clip score |
+| unknown | always kept |
+
+Quotas are a **share of the finished video**, not a fixed count, so a ten-minute
+memory gets a proportionally larger allowance than a sixty-second one. The expected
+clip count is estimated from the runtime budget and the typical candidate length,
+because the candidate pool is many times larger than the final selection. Any
+non-zero ratio yields at least one slot; a ratio of `0` means none at all.
+
+Objects are rationed rather than banned. Buying a new car is a memory and a
+lawnmower is not, and the thing separating them is whether the clip is any good — so
+objects must clear the same bar as scenery *and* fit the quota.
+
+That bar is the median people-clip score rather than a fixed number, because photo
+scores and video scores sit on different scales and one threshold would silently
+exclude a whole pool.
+
+A clip nobody has described yet is **kept**. On a real library 35–46% of the pool
+has no cached description, and treating that silence as "probably an object" would
+delete half the memory. If the quotas would empty the pool entirely — an all-scenery
+trip — the policy stands down and logs that it did. A shorter video is the goal; an
+empty one is a failure.
+
+Set `subject_policy_enabled: false` to turn the whole thing off.
+
 ## Selection Process: Unified Pool
 
 Videos, live photos, and regular photos all compete in a single selection pool. There are no separate pipelines — temporal dedup, duration scaling, and all caps apply to the combined pool.

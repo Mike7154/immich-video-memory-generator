@@ -233,6 +233,28 @@ class AnalysisConfig(BaseModel):
         le=1.0,
         description="Minimum duration (seconds) of quiet audio to count as a silence gap",
     )
+    subject_policy_enabled: bool = Field(
+        default=True,
+        description="Prefer clips of people; ration animals and exclude object-only clips",
+    )
+    max_animal_ratio: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Share of a video that may be animal-only clips, so the allowance "
+            "scales with length (0 disables them entirely)"
+        ),
+    )
+    max_object_ratio: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Share of a video that may be object-only clips. They must also beat "
+            "the median people clip, which is what separates a new car from a lawnmower"
+        ),
+    )
 
 
 class HardwareAccelConfig(BaseModel):

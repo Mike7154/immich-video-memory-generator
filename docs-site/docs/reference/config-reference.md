@@ -69,6 +69,9 @@ analysis:
 
   # Duplicate detection
   duplicate_hash_threshold: 8    # Perceptual hash threshold (0-64)
+  subject_policy_enabled: true   # Prefer clips of people over things
+  max_animal_ratio: 0.10         # Share of the video that may be animal clips
+  max_object_ratio: 0.05         # Share that may be object clips (must also score well)
 
   # Performance
   download_workers: 3            # Parallel download clients for video and thumbnail prefetching (1-8)
