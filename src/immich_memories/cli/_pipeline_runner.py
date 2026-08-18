@@ -385,6 +385,7 @@ def run_pipeline_and_generate(
     # Merge photos into the unified selection pool (if enabled)
     all_candidates = _merge_photos_into_pool(
         analyzed_videos,
+        live_photo_clips=live_photo_clips,
         photo_assets=photo_assets,
         include_photos=include_photos,
         config=config,
@@ -392,6 +393,7 @@ def run_pipeline_and_generate(
         work_dir=output_path.parent,
         provider_circuit=pipeline.provider_circuit,
         dry_run=dry_run,
+        thumbnail_cache=thumbnail_cache,
     )
 
     # Phase 4: Unified selection (videos + photos compete together)
@@ -572,6 +574,7 @@ def _send_notification(
 def _merge_photos_into_pool(
     analyzed_videos: list,
     *,
+    live_photo_clips: list | None = None,
     photo_assets: list | None,
     include_photos: bool,
     config: Config,
@@ -579,6 +582,7 @@ def _merge_photos_into_pool(
     work_dir: Path,
     provider_circuit=None,
     dry_run: bool = False,
+    thumbnail_cache=None,
 ) -> list:
     """Score photos and merge them as ClipWithSegment into the video pool.
 
@@ -592,10 +596,23 @@ def _merge_photos_into_pool(
 
     from immich_memories.analysis.smart_pipeline import ClipWithSegment
     from immich_memories.api.models import VideoClipInfo
-    from immich_memories.photos.photo_pipeline import score_photos
+    from immich_memories.photos.photo_pipeline import (
+        score_photos,
+        video_count_for_photo_budget,
+    )
     from immich_memories.photos.scoring import score_photo
 
     _logger = logging.getLogger(__name__)
+
+    photo_assets = _drop_photos_already_shown_as_motion(
+        photo_assets,
+        analyzed_videos,
+        config=config,
+        client=client,
+        thumbnail_cache=thumbnail_cache,
+    )
+    if not photo_assets:
+        return analyzed_videos
 
     photo_duration = config.photos.duration
     if dry_run:
@@ -606,7 +623,9 @@ def _merge_photos_into_pool(
         scored = score_photos(
             assets=photo_assets,
             config=config.photos,
-            video_clip_count=len(analyzed_videos),
+            video_clip_count=video_count_for_photo_budget(
+                len(analyzed_videos), len(live_photo_clips or [])
+            ),
             work_dir=photo_dir,
             download_fn=client.download_asset,
             db_path=config.cache.database_path,
@@ -637,6 +656,33 @@ def _merge_photos_into_pool(
     )
 
     return analyzed_videos + photo_candidates
+
+
+def _drop_photos_already_shown_as_motion(
+    photo_assets: list,
+    analyzed_videos: list,
+    *,
+    config: Config,
+    client: SyncImmichClient,
+    thumbnail_cache=None,
+) -> list:
+    """Remove photos a selected clip from the same moment already shows.
+
+    Runs before scoring so the removed photos never reach the LLM.
+    """
+    from immich_memories.photos.moment_suppression import filter_photos_covered_by_motion
+
+    motion_clips = [c.clip for c in analyzed_videos if getattr(c, "clip", None) is not None]
+    if not motion_clips:
+        return photo_assets
+
+    return filter_photos_covered_by_motion(
+        photo_assets,
+        motion_clips,
+        config=config.photos,
+        thumbnail_cache=thumbnail_cache,
+        thumbnail_fn=client.get_asset_thumbnail,
+    )
 
 
 def fetch_videos_and_live_photos(
