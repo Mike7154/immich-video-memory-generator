@@ -123,8 +123,9 @@ def resolve_music_file(
     run_output_dir: Path,
     memory_type: str | None,
     report_fn: Callable[[str, float, str], None] | None = None,
+    bundled_library: Path | None = None,
 ) -> Path | None:
-    """Determine the music file to use: provided path, auto-generated, or None."""
+    """Determine the music file to use: provided path, generated, bundled, or None."""
     if no_music:
         return None
     if music_path and music_path.exists():
@@ -132,7 +133,38 @@ def resolve_music_file(
     if not music_path and music_config_available(config):
         if report_fn:
             report_fn("music", 0.85, "Generating AI music...")
-        return auto_generate_music(config, assembly_clips, run_output_dir, memory_type, report_fn)
+        generated = auto_generate_music(
+            config, assembly_clips, run_output_dir, memory_type, report_fn
+        )
+        return _master(generated, run_output_dir) if generated else generated
+
+    if music_path is not None:
+        # An explicit track that is missing is a user error; substituting bundled
+        # music would hide the typo.
+        return None
+
+    # WHY: with no generator configured this used to return silence, which is what
+    # the Docker/NAS path gets by default.
+    from immich_memories.audio.bundled_music import bundled_track_for_mood
+
+    bundled = bundled_track_for_mood(_mood_for_clips(assembly_clips), library=bundled_library)
+    return _master(bundled, run_output_dir) if bundled else bundled
+
+
+def _master(track: Path, run_output_dir: Path) -> Path:
+    """Master music we produced. A track the user chose is left as they made it."""
+    from immich_memories.audio.mastering import master_music_track
+
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    return master_music_track(track, run_output_dir / f"mastered_{track.stem}.wav")
+
+
+def _mood_for_clips(assembly_clips: list[AssemblyClip]) -> str | None:
+    """Mood to pick bundled music by, taken from the clips when they carry one."""
+    for clip in assembly_clips:
+        mood = getattr(clip, "mood", None)
+        if mood:
+            return str(mood)
     return None
 
 

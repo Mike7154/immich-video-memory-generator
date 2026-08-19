@@ -2,8 +2,9 @@
 
 from pathlib import Path
 
+import pytest
+
 from immich_memories.audio.generators.ace_step_backend import (
-    ACE_CAPTION_TEMPLATES,
     build_ace_caption,
 )
 from immich_memories.audio.generators.ace_step_captions import (
@@ -50,77 +51,21 @@ def test_build_ace_caption_unknown_mood_uses_default():
     assert len(tags) > 10
 
 
-def test_caption_templates_have_required_fields():
-    for name, template in ACE_CAPTION_TEMPLATES.items():
-        assert "caption" in template, f"Template '{name}' missing 'caption'"
-        assert "bpm" in template, f"Template '{name}' missing bpm"
-        assert "key" in template, f"Template '{name}' missing key"
-        assert "time_signature" in template, f"Template '{name}' missing time_signature"
-
-
-def test_structured_caption_has_explicit_musical_params():
-    result = build_ace_caption_structured("happy")
-    assert isinstance(result.bpm, int)
-    assert result.bpm > 0
-    assert result.key_scale != ""
-    assert result.time_signature != ""
-    assert "instrumental" in result.caption.lower()
-
-
-def test_structured_caption_bpm_not_in_caption_text():
-    """BPM should be a separate field, not embedded in caption."""
-    result = build_ace_caption_structured("happy")
-    assert "BPM" not in result.caption
-    assert str(result.bpm) not in result.caption
-
-
-def test_structured_caption_seasonal_modifier():
-    result = build_ace_caption_structured("happy", season="winter")
-    assert "cozy" in result.caption.lower() or "warm" in result.caption.lower()
-
-
-def test_memory_type_trip_picks_sunny_or_acoustic():
-    """Trip memory type should pick travel-appropriate music."""
-    result = build_ace_caption_structured("happy", memory_type="trip")
-    # Trip maps to tropical template (sunny summer feel) or acoustic
-    assert (
-        "sunny" in result.caption.lower()
-        or "summer" in result.caption.lower()
-        or "acoustic" in result.caption.lower()
+def test_every_matrix_cell_yields_a_complete_caption():
+    """Replaces the old per-template shape check: the matrix is the source now."""
+    from immich_memories.audio.generators.ace_step_captions import (
+        MOOD_PROFILES,
+        STYLE_PROFILES,
     )
 
+    for mood in MOOD_PROFILES:
+        for style in STYLE_PROFILES:
+            result = build_ace_caption_structured(mood, style=style)
 
-def test_memory_type_person_spotlight_picks_acoustic():
-    """Person Spotlight should pick intimate/acoustic music."""
-    result = build_ace_caption_structured("happy", memory_type="person_spotlight")
-    assert "acoustic" in result.caption.lower() or "gentle" in result.caption.lower()
-
-
-def test_memory_type_on_this_day_picks_nostalgic():
-    """On This Day should pick nostalgic music."""
-    result = build_ace_caption_structured("happy", memory_type="on_this_day")
-    assert "lo-fi" in result.caption.lower() or "lofi" in result.caption.lower()
-
-
-def test_memory_type_overrides_mood():
-    """Memory type should take priority over mood for template selection."""
-    # Without memory_type, "calm" maps to ambient
-    without = build_ace_caption_structured("calm")
-    assert "ambient" in without.caption.lower()
-
-    # With trip memory_type, should pick tropical template (sunny/summer) instead
-    with_trip = build_ace_caption_structured("calm", memory_type="trip")
-    assert (
-        "sunny" in with_trip.caption.lower()
-        or "summer" in with_trip.caption.lower()
-        or "acoustic" in with_trip.caption.lower()
-    )
-
-
-def test_unknown_memory_type_falls_back_to_mood():
-    """Unknown memory type should fall back to mood-based selection."""
-    result = build_ace_caption_structured("calm", memory_type="unknown_type")
-    assert "ambient" in result.caption.lower()
+            assert result.caption
+            assert result.bpm > 0
+            assert result.key_scale
+            assert result.time_signature
 
 
 class TestACEStepAPIPayload:
@@ -177,118 +122,100 @@ class TestACEStepAPIPayload:
         assert "timesignature" in captured_payload
 
 
-class TestDescriptiveCaptions:
-    """Captions should be descriptive sentences, not just comma-separated tag lists."""
-
-    def test_caption_is_descriptive_not_tag_list(self):
-        """Caption should read as a description, not a bare tag list."""
-        result = build_ace_caption_structured("happy")
-        # A descriptive caption starts with an article or descriptor
-        # not just "pop, upbeat, feel-good, bright"
-        first_word = result.caption.split()[0].lower()
-        descriptive_starters = {
-            "a",
-            "an",
-            "warm",
-            "bright",
-            "mellow",
-            "dreamy",
-            "smooth",
-            "lush",
-            "energetic",
-            "gentle",
-            "epic",
-            "festive",
-            "driving",
-        }
-        assert first_word in descriptive_starters, (
-            f"Caption should start descriptively, not with '{first_word}': {result.caption}"
-        )
-
-    def test_all_templates_produce_descriptive_captions(self):
-        """Every template should produce a descriptive sentence."""
-        from immich_memories.audio.generators.ace_step_captions import ACE_CAPTION_TEMPLATES
-
-        for _name in ACE_CAPTION_TEMPLATES:
-            # Access template directly
-            result = build_ace_caption_structured("happy", memory_type=None)
-            # At minimum: caption should contain "instrumental"
-            assert "instrumental" in result.caption.lower(), (
-                f"Template-derived caption missing 'instrumental': {result.caption}"
-            )
-
-
 class TestMoodVariety:
-    """Template matching should not be biased by generic booster words."""
+    """Mood resolution must not be hijacked by generic booster words.
 
-    def test_romantic_not_overridden_by_upbeat(self):
-        """'upbeat romantic' should match acoustic, not upbeat_pop."""
-        from immich_memories.audio.generators.ace_step_captions import _match_template
+    _transform_mood prepends words like "upbeat" and "warm" to every mood, so a
+    naive first-match would send every memory to the same profile.
+    """
 
-        # _transform_mood turns "romantic" into "upbeat romantic"
-        result = _match_template("upbeat romantic")
-        assert result == "acoustic", f"Expected 'acoustic' for 'upbeat romantic', got '{result}'"
+    @pytest.mark.parametrize(
+        ("phrase", "expected"),
+        [
+            ("upbeat romantic", "tender"),
+            ("upbeat warm groovy nostalgic", "nostalgic"),
+            ("upbeat playful", "happy"),
+            ("upbeat warm calm", "calm"),
+            ("upbeat", "happy"),
+        ],
+    )
+    def test_specific_mood_words_win_over_boosters(self, phrase, expected):
+        from immich_memories.audio.generators.ace_step_captions import resolve_mood
 
-    def test_nostalgic_not_overridden_by_upbeat(self):
-        """'upbeat warm groovy nostalgic' should match lofi, not upbeat_pop."""
-        from immich_memories.audio.generators.ace_step_captions import _match_template
+        assert resolve_mood(phrase) == expected
 
-        result = _match_template("upbeat warm groovy nostalgic")
-        assert result == "lofi", f"Expected 'lofi' for nostalgic, got '{result}'"
-
-    def test_playful_not_overridden_by_upbeat(self):
-        """'upbeat playful' should match indie_electronic, not upbeat_pop."""
-        from immich_memories.audio.generators.ace_step_captions import _match_template
-
-        result = _match_template("upbeat playful")
-        assert result == "indie_electronic", (
-            f"Expected 'indie_electronic' for playful, got '{result}'"
+    def test_scene_moods_drive_the_profile(self):
+        from immich_memories.audio.generators.ace_step_captions import (
+            build_ace_caption_structured,
         )
 
-    def test_dramatic_not_overridden_by_upbeat(self):
-        """'upbeat dramatic' should match cinematic, not upbeat_pop."""
-        from immich_memories.audio.generators.ace_step_captions import _match_template
+        result = build_ace_caption_structured("happy", scene_moods=["calm", "calm"])
 
-        result = _match_template("upbeat dramatic")
-        assert result == "cinematic", f"Expected 'cinematic' for dramatic, got '{result}'"
-
-    def test_calm_transformed_matches_lofi_or_ambient(self):
-        """'upbeat warm groovy calm' should match lofi or ambient, not upbeat_pop."""
-        from immich_memories.audio.generators.ace_step_captions import _match_template
-
-        result = _match_template("upbeat warm groovy calm")
-        assert result in ("lofi", "ambient"), (
-            f"Expected 'lofi' or 'ambient' for calm, got '{result}'"
-        )
-
-    def test_pure_upbeat_still_matches_upbeat_pop(self):
-        """Just 'upbeat' alone should match upbeat_pop (no more specific word)."""
-        from immich_memories.audio.generators.ace_step_captions import _match_template
-
-        result = _match_template("upbeat")
-        assert result == "upbeat_pop"
-
-    def test_scene_voting_variety(self):
-        """A mix of moods should not collapse to upbeat_pop."""
-        from immich_memories.audio.generators.ace_step_captions import _pick_template_for_scenes
-
-        scene_moods = [
-            "upbeat romantic",
-            "upbeat romantic",
-            "upbeat dramatic",
-        ]
-        # Should pick acoustic (2 votes for romantic) or cinematic (1 vote)
-        result = _pick_template_for_scenes(scene_moods)
-        assert result == "acoustic", f"Expected 'acoustic' for 2x romantic, got '{result}'"
+        assert "serene" in result.caption
 
 
-class TestDescriptiveCaptionNoVocals:
-    def test_caption_reinforces_no_vocals(self):
-        """Caption text should explicitly say no vocals to prevent LLM confusion."""
-        result = build_ace_caption_structured("happy")
-        caption_lower = result.caption.lower()
-        assert (
-            "no vocals" in caption_lower
-            or "no singing" in caption_lower
-            or "instrumental" in caption_lower
-        )
+# =============================================================================
+# Mood x style matrix contract
+#
+# Captions are deliberately tag lists now rather than prose. ACE-Step's
+# prompting guides put the genre anchor first and treat fidelity/production
+# tags as the lever for clarity; adjective-heavy prose gave the model little
+# concrete to render and sounded synthetic. Memory type now steers the *style*
+# instead of replacing the whole template, so a calm trip is still calm.
+# =============================================================================
+
+
+def test_structured_caption_carries_bpm_in_both_places():
+    """The guides say to state BPM in the tags and as the field."""
+    result = build_ace_caption_structured("happy")
+
+    assert result.bpm > 0
+    assert f"{result.bpm} bpm" in result.caption
+
+
+def test_key_is_stated_so_combinations_do_not_share_a_tonality():
+    """Left empty, the model settled on the same tonality for every style."""
+    key = build_ace_caption_structured("happy", style="acoustic").key_scale
+
+    assert key.endswith("major")
+    assert key.split()[0] in ("C", "D", "E", "F", "G", "A", "Bb")
+
+
+def test_caption_leads_with_its_genre_anchor():
+    from immich_memories.audio.generators.ace_step_captions import STYLE_PROFILES
+
+    result = build_ace_caption_structured("happy", style="acoustic")
+
+    assert result.caption.startswith(STYLE_PROFILES["acoustic"].genre)
+
+
+def test_memory_type_selects_a_style():
+    spotlight = build_ace_caption_structured("happy", memory_type="person_spotlight")
+    on_this_day = build_ace_caption_structured("happy", memory_type="on_this_day")
+
+    assert spotlight.caption.startswith("acoustic folk")
+    assert on_this_day.caption.startswith("future bass")
+
+
+def test_a_style_can_name_a_different_genre_per_mood():
+    """Electronic sub-genres are tempo-defined: drum and bass at 70 bpm is not a thing."""
+    fast = build_ace_caption_structured("energetic", style="electronic")
+    slow = build_ace_caption_structured("calm", style="electronic")
+
+    assert fast.caption.startswith("drum and bass")
+    assert slow.caption.startswith("downtempo electronic")
+
+
+def test_memory_type_does_not_override_the_moods_energy():
+    """A calm spotlight is still calm: it sits low in its style's tempo band."""
+    calm = build_ace_caption_structured("calm", memory_type="person_spotlight")
+    energetic = build_ace_caption_structured("energetic", memory_type="person_spotlight")
+
+    assert calm.bpm < energetic.bpm
+
+
+def test_unknown_memory_type_still_produces_a_caption():
+    result = build_ace_caption_structured("calm", memory_type="not_a_memory_type")
+
+    assert "serene" in result.caption
+    assert f"{result.bpm} bpm" in result.caption

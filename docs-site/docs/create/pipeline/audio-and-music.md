@@ -11,6 +11,32 @@ The music pipeline has three stages:
 2. **Music generation**: The pipeline takes that mood and sends it to the configured music backend. ACE-Step can run directly in the app or through its REST API. MusicGen is the alternative generator when ACE-Step is disabled.
 3. **Audio ducking**: When background music plays over your clips, it automatically gets quieter when someone's talking or when there's an interesting sound in the original audio.
 
+## No GPU? Start here
+
+A plain install produces silent videos unless you supply an MP3 per run: both
+music generators need a GPU or a separate server. The `music` extra ships 28
+royalty-free background tracks that are used automatically when no generator is
+configured, so Docker and NAS installs have music out of the box.
+
+```bash
+pip install "immich-memories[music]"
+```
+
+The Docker image already includes it — it installs every extra.
+
+Tracks cover five moods (calm, energetic, happy, nostalgic, tender) in acoustic
+and electronic styles, roughly 30 seconds each, and are repeated with a crossfade
+to fill longer videos. Selection follows the memory's detected mood, and a mood
+with no bundled folder falls back to another track rather than to silence.
+
+They were generated locally with ACE-Step 1.5 — nothing sampled from or derived
+from third-party recordings, so there is no attribution requirement. The models,
+settings and per-track tempo, key and seed are recorded in `LICENSE-MUSIC` inside
+the package.
+
+Supplying `--music yourfile.mp3` or configuring a generator overrides the bundle;
+`--no-music` still means no music.
+
 ## Music Providers
 
 ### ACE-Step
@@ -143,10 +169,28 @@ ace_step:
   mode: "lib"
   model_variant: "acestep-v15-xl-turbo"
   lm_model_size: "4B"
+  use_lm: false            # See "Thinking mode" below
 
 musicgen:
   enabled: false           # Not needed: local Demucs handles stems
 ```
+
+### Thinking mode (`use_lm`)
+
+Off by default. When on, ACE-Step's 5Hz language model rewrites your caption and
+invents its own genre metadata before the audio model ever sees the prompt, which
+pulls instrumental briefs off-target. It also dominates generation time — a 60 s
+track took ~45 s with it on and ~17 s with it off.
+
+Turn it on only if you want the model to elaborate a vague brief. The music
+prompts this project ships are already written the way ACE-Step's own guides
+recommend (genre first, then mood, instruments, production tags and BPM), so
+they do not need rewriting.
+
+:::note Upgrading
+`use_lm` previously defaulted to `true`. If your `config.yaml` sets it
+explicitly, set it to `false` to pick up the improved output.
+:::
 
 Install the tested ACE-Step 1.5 release into the same Python 3.12 environment as
 `immich-memories`. ACE-Step's full UI dependency set currently conflicts with the app's Starlette
