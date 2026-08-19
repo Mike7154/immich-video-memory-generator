@@ -6,101 +6,101 @@
       {
         "name": "ClipRefiner::_fill_empty_weeks",
         "complexity": 20,
-        "line_start": 580,
-        "line_end": 623,
+        "line_start": 529,
+        "line_end": 572,
         "line_complexities": [
           {
-            "line": 590,
+            "line": 539,
             "complexity": 0
           },
           {
-            "line": 591,
+            "line": 540,
             "complexity": 1
           },
           {
-            "line": 592,
+            "line": 541,
             "complexity": 0
           },
           {
-            "line": 595,
+            "line": 544,
             "complexity": 0
           },
           {
-            "line": 596,
+            "line": 545,
             "complexity": 1
           },
           {
-            "line": 597,
+            "line": 546,
             "complexity": 0
           },
           {
-            "line": 600,
+            "line": 549,
             "complexity": 0
           },
           {
-            "line": 601,
+            "line": 550,
             "complexity": 0
           },
           {
-            "line": 603,
+            "line": 552,
             "complexity": 0
           },
           {
-            "line": 604,
+            "line": 553,
             "complexity": 0
           },
           {
-            "line": 605,
+            "line": 554,
             "complexity": 1
           },
           {
-            "line": 606,
+            "line": 555,
             "complexity": 0
           },
           {
-            "line": 607,
+            "line": 556,
             "complexity": 2
           },
           {
-            "line": 609,
+            "line": 558,
             "complexity": 0
           },
           {
-            "line": 611,
+            "line": 560,
             "complexity": 0
           },
           {
-            "line": 612,
+            "line": 561,
             "complexity": 1
           },
           {
-            "line": 613,
+            "line": 562,
             "complexity": 2
           },
           {
-            "line": 614,
+            "line": 563,
             "complexity": 0
           },
           {
-            "line": 615,
+            "line": 564,
             "complexity": 3
           },
           {
-            "line": 617,
+            "line": 566,
             "complexity": 4
           },
           {
-            "line": 618,
+            "line": 567,
             "complexity": 5
           },
           {
-            "line": 623,
+            "line": 572,
             "complexity": 0
           }
         ]
       }
     ],
-    "complexity": 132
+    "complexity": 121
   },
   {
     "path": "src/immich_memories/analysis/unified_budget.py",
