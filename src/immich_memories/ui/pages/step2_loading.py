@@ -289,7 +289,7 @@ async def _load_thumbnails_and_metadata_async(
 
     all_asset_ids = [c.asset.id for c in clips]
 
-    cached_thumbnail_ids = set(thumbnail_cache.get_batch(all_asset_ids, "preview").keys())
+    cached_thumbnail_ids = thumbnail_cache.cached_ids(all_asset_ids, "preview")
     cached_metadata = analysis_cache.get_video_metadata_batch(all_asset_ids)
 
     for clip in clips:
@@ -337,6 +337,9 @@ async def _fetch_thumbnails_batched(
     batch_size: int,
 ) -> int:
     """Fetch thumbnails in batches. Returns updated done count."""
+    # One client for the whole fetch rather than one per batch of ten: each
+    # carries an httpx connection pool and a private event loop, and 500
+    # thumbnails meant fifty of them, all discarded after ten requests.
     for i in range(0, len(need_thumbs), batch_size):
         batch = need_thumbs[i : i + batch_size]
 
@@ -480,7 +483,7 @@ async def _load_photo_thumbnails_async(
         return
 
     photo_ids = [a.id for a in photo_assets]
-    cached = set(thumbnail_cache.get_batch(photo_ids, "preview").keys())
+    cached = thumbnail_cache.cached_ids(photo_ids, "preview")
     need = [a for a in photo_assets if a.id not in cached]
 
     if not need:
