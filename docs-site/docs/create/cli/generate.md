@@ -56,17 +56,26 @@ immich-memories generate [OPTIONS]
 | `--add-date` | — | flag | — | Caption each clip with its capture date |
 | `--add-place` | — | flag | — | Caption each clip with where it was taken |
 
-`--add-date` writes the clip's own capture date in the bottom-right corner, as
-`5 Jan 2026` — spelled out rather than formatted by locale, so the caption reads
-the same wherever it runs. Size and inset scale with the frame, so a 4K memory
-and a 720p one look alike. Title cards and clips without a date are left alone.
-On HDR output the caption is drawn at HLG graphics white rather than full white,
-which would otherwise glare above the picture's own diffuse white.
+`--add-date` writes the clip's own capture date in the bottom-right corner,
+in bold uppercase using the same Outfit face as the title screens, worded
+relative to the memory's span: inside a single-month memory the month is the
+video's own premise, so the caption reads `SUNDAY 10`; a memory spanning
+months within one year reads `10 AUGUST`; only a multi-year memory spells out
+`10 AUGUST 2025`. Day and month names follow the configured locale
+(`title_screens.locale`; `auto` follows the host machine's language — deployed
+next to Immich, that is the server's locale): a French library says
+`DIMANCHE 10`. Size and corner insets scale with the frame and are identical
+in portrait and landscape. A dark outline keeps white text readable over
+bright content; on HDR output the caption is drawn at HLG graphics white
+rather than full white, which would otherwise glare above the picture's own
+diffuse white. Title cards and clips without a date are left alone.
 
-`--add-place` adds the location Immich recorded for the clip, as `City, Country`.
-Clips without one are left alone, so a memory mixing geotagged and untagged
-footage captions only what it can. With both flags the caption reads
-`Paris, France · 5 Jan 2026` on a single line.
+`--add-place` adds the location Immich recorded for the clip, as
+`CITY, COUNTRY`, in the top-left corner — the date keeps the bottom right.
+The place is shown when it *changes*: the first clip in `Nice, France` is
+captioned, the clips that stay there are not, and coming home captions the
+first clip back. A clip without a location does not reset the run, so EXIF
+gaps inside one event stay quiet.
 
 Place names bring characters FFmpeg's text renderer treats as syntax. A colon
 would break the filter outright, and an ASCII apostrophe is silently *dropped* —
