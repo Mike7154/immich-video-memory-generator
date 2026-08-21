@@ -165,6 +165,12 @@ systems. That is a built-in control:
   flight gets the blame it does not deserve.
 - **every Linux cell red, macOS green** → a real platform difference.
 
+The matrix is a hint, not the verdict. Two cells can be reclaimed at once when
+the host is under memory pressure, which looks like a platform difference and is
+not. The log decides: `FAILED` lines mean a real failure, while `Error 137`
+after a run of `PASSED` lines means the runner was killed. Check the log before
+concluding from the pattern.
+
 This settled a real case: a photo-caption test appeared to fail on Python 3.12
 with `Error 137` (SIGKILL/OOM), and passed on 3.11 and 3.13 in the *same run* on
 the *same image*. The test was correct. It was simply the slowest thing running
@@ -188,6 +194,49 @@ cancels superseded runs. That is safe: a runner death produces
 reads `cancelled`. So an OOM still fails the gate, and only genuinely superseded
 runs pass through. Check `gh run list --branch <branch>` to confirm a newer run
 covered the cancelled one.
+
+### A reclaimed job is an unverified job
+
+This is the one that costs real time, so it goes before the mechanics.
+
+A cancelled job is a scheduling artefact, and it is tempting to treat it as
+noise to re-run at leisure. It is not noise. **It is a job that did not run**, so
+merging while one is outstanding means merging on the strength of whichever jobs
+happened to survive.
+
+That is not hypothetical. `TestPhotoPlaceCaption` reached `main` broken and
+stayed there through two PRs:
+
+| PR | macOS job | merged |
+|---|---|---|
+| introduced the test | **failure** | yes |
+| shortened the test | **all three cancelled — never ran** | yes |
+| next merge | — | failure finally surfaced on main |
+
+The test had never once passed on a macOS runner. Nothing reported it, because
+the job was either red-and-ignored or reclaimed, and every branch cut from main
+afterwards inherited a red macOS job that was nobody's own change.
+
+Before merging, check that each job **ran**, not just that nothing is red.
+
+### Hardware encoders are absent on CI
+
+`_render_single_photo` picks its encoder from `check_zscale_available()`: with
+zscale it uses `hevc_videotoolbox`, without it `libx264`. VideoToolbox writes no
+file inside CI's macOS VM, and the function returns `None` when encoding
+produces nothing — so the failure surfaces as whatever the test asserted next,
+not as an encoder error.
+
+Any unit test that reaches the photo encoder needs the software path forced:
+
+```python
+monkeypatch.setattr(
+    "immich_memories.processing.hdr_utilities.check_zscale_available", lambda: False
+)
+```
+
+It passes on a real Mac either way, which is what makes this one easy to merge
+and hard to notice.
 
 ### Re-running
 
