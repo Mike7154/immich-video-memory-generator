@@ -13,6 +13,7 @@ import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -71,6 +72,11 @@ class PipelineConfig:
     # Verify passes (#468): re-analyze shipped fallback-scored clips and
     # re-select, until nothing shipping is a guess or the budget is spent.
     max_refinement_passes: int = 3
+    # The judge (#468/#463): a selected clip below the floor never ships,
+    # and the chronological ending cannot be the one weak clip in the
+    # timeline (weakest member AND below this share of the mean score).
+    judge_floor_score: float = 0.30
+    judge_boundary_ratio: float = 0.6
     avg_clip_duration: float = 5.0  # Average clip duration in final video
     target_duration_seconds: float | None = None  # Explicit strict content budget
     hdr_only: bool = False  # Only select HDR clips
@@ -314,11 +320,30 @@ class SmartPipeline:
         self.tracker.complete_item("filters")
         self.tracker.complete_phase()
 
+    def _stabilize_selection(
+        self,
+        analyzed: list[ClipWithSegment],
+        result: PipelineResult,
+    ) -> tuple[PipelineResult, list[ClipWithSegment]]:
+        """Verify and judge until the selection is stable (#468).
+
+        Found live on the 2026-08-21 demo: a judge (or review) drop
+        re-selects, the re-selection admits a NEW fallback-scored clip, and
+        a straight verify→judge sequence ships it unverified. The stages
+        iterate together until a pass changes nothing or the budget is spent.
+        """
+        for _ in range(max(1, self.config.max_refinement_passes)):
+            result, analyzed = self._verify_selection(analyzed, result)
+            result, analyzed, dropped = self._judge_selection(analyzed, result)
+            if not dropped:
+                break
+        return result, analyzed
+
     def _verify_selection(
         self,
         analyzed: list[ClipWithSegment],
         result: PipelineResult,
-    ) -> PipelineResult:
+    ) -> tuple[PipelineResult, list[ClipWithSegment]]:
         """Re-analyze any shipped fallback-scored clip and re-select (#468).
 
         Heavy when cold, cheap when warm: every verified clip lands in the
@@ -327,7 +352,7 @@ class SmartPipeline:
         so the loop always terminates.
         """
         by_id = {c.clip.asset.id: c for c in analyzed}
-        for _ in range(max(0, self.config.max_refinement_passes - 1)):
+        for _ in range(max(1, self.config.max_refinement_passes)):
             unverified = [
                 by_id[c.asset.id]
                 for c in result.selected_clips
@@ -357,7 +382,82 @@ class SmartPipeline:
                         analyzed=True,
                     )
             result = self.refiner.phase_refine(list(by_id.values()), self.tracker)
-        return result
+        return result, list(by_id.values())
+
+    def _judge_selection(
+        self,
+        analyzed: list[ClipWithSegment],
+        result: PipelineResult,
+    ) -> tuple[PipelineResult, list[ClipWithSegment], bool]:
+        """One judge sweep (#468): drop offenders, let selection refill.
+
+        A single sweep by design — the caller re-verifies whatever the
+        re-selection admitted before judging again.
+        """
+        by_id = {c.clip.asset.id: c for c in analyzed}
+        selected = [by_id[c.asset.id] for c in result.selected_clips if c.asset.id in by_id]
+        if len(selected) < 2:
+            return result, analyzed, False
+        offenders = self._judge_offenders(selected)
+        if not offenders:
+            return result, analyzed, False
+        logger.info(
+            "Judge: dropping %d clip(s) below the quality gate, re-selecting",
+            len(offenders),
+        )
+        analyzed = [c for c in analyzed if c.clip.asset.id not in offenders]
+        if not analyzed:
+            return result, analyzed, False
+        result = self.refiner.phase_refine(analyzed, self.tracker)
+        return result, analyzed, True
+
+    def _judge_offenders(self, selected: list[ClipWithSegment]) -> set[str]:
+        """Members failing the gate. Favorites are exempt from both rules —
+        the user explicitly chose them, and "Starting with ALL favorites" is
+        the selection's oldest contract."""
+        judgeable = [s for s in selected if not getattr(s.clip.asset, "is_favorite", False)]
+        offenders = {s.clip.asset.id for s in judgeable if s.score < self.config.judge_floor_score}
+        scores = [s.score for s in selected]
+        mean_score = sum(scores) / len(scores)
+        ending = max(
+            selected,
+            key=lambda s: s.clip.asset.file_created_at or datetime.min.replace(tzinfo=UTC),
+        )
+        if (
+            len(selected) > 2
+            and not getattr(ending.clip.asset, "is_favorite", False)
+            and ending.score == min(scores)
+            and ending.score < mean_score * self.config.judge_boundary_ratio
+        ):
+            offenders.add(ending.clip.asset.id)
+        return offenders
+
+    def _holistic_review(
+        self,
+        analyzed: list[ClipWithSegment],
+        result: PipelineResult,
+    ) -> tuple[PipelineResult, list[ClipWithSegment], bool]:
+        """One LLM pass over the finished cut (#468): redundancy and feel.
+
+        The mechanical judge sees scores; only something reading the
+        descriptions can see the same birthday candles twice. Optional by
+        construction — no LLM, no drops, selection unchanged.
+        """
+        if not self._app_config.content_analysis.enabled:
+            return result, analyzed, False
+        from immich_memories.analysis.selection_review import review_selection
+
+        by_id = {c.clip.asset.id: c for c in analyzed}
+        selected = [by_id[c.asset.id] for c in result.selected_clips if c.asset.id in by_id]
+        drops = review_selection(selected, self._app_config.llm)
+        if not drops:
+            return result, analyzed, False
+        remaining = [c for c in analyzed if c.clip.asset.id not in set(drops)]
+        if not remaining:
+            return result, analyzed, False
+        # WHY the pool shrinks too: a later stabilization re-refines from the
+        # pool — returning the old one would resurrect the LLM's drops.
+        return self.refiner.phase_refine(remaining, self.tracker), remaining, True
 
     def _semantic_cache_miss_count(self, clips: list[VideoClipInfo]) -> int:
         """Count clips that need work under the exact active semantic model."""
@@ -432,7 +532,12 @@ class SmartPipeline:
         try:
             result = self.refiner.phase_refine(analyzed, self.tracker)
             if verify:
-                result = self._verify_selection(analyzed, result)
+                result, analyzed = self._stabilize_selection(analyzed, result)
+                result, analyzed, review_changed = self._holistic_review(analyzed, result)
+                if review_changed:
+                    # WHY: the review's re-selection can admit new fallback
+                    # clips, exactly like a judge drop — same stabilization.
+                    result, analyzed = self._stabilize_selection(analyzed, result)
             self.tracker.finish()
             return result
         except (
