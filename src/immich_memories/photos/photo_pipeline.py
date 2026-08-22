@@ -71,6 +71,12 @@ def score_photos(
     if not assets:
         return []
 
+    # Photos score below videos so a recap prefers moving footage. With no
+    # video in the month there is nothing to defer to, and the penalty only
+    # compresses the range the selection has to work with.
+    if video_clip_count == 0:
+        config = config.model_copy(update={"score_penalty": 0.0})
+
     # Phase 1: Fast metadata scoring (no I/O). Keep this complete pool so the
     # final optimizer can use unshortlisted photos when preferred media is sparse.
     metadata_scored = [(a, score_photo(a, config)) for a in assets]
@@ -79,6 +85,10 @@ def score_photos(
     # June pool 21% of the photos were one. Collapsing bursts here rather than
     # after scoring means each one dropped is also an LLM call saved.
     metadata_scored = _drop_burst_duplicates(metadata_scored, config, thumbnail_cache)
+
+    # The metadata score alone ties hundreds of photos onto a handful of
+    # values; what the pixels say breaks those ties (#489).
+    metadata_scored = _apply_frame_quality(metadata_scored, config, thumbnail_cache)
 
     # Cap only the expensive semantic-scoring shortlist.
     shortlist_size = llm_shortlist_size(video_clip_count, len(metadata_scored), config.max_ratio)
@@ -124,6 +134,7 @@ def score_and_select_photos(
     memory_type: str | None = None,
     transition_duration: float = 0.5,
     provider_circuit: Any = None,
+    thumbnail_cache: Any = None,
 ) -> PhotoSelectionResult:
     """Score photos and select within unified budget.
 
@@ -133,6 +144,11 @@ def score_and_select_photos(
     if not photo_assets:
         return PhotoSelectionResult(scored_photos=[], selection=UnifiedSelection())
 
+    # WHY every argument: score_photos degrades silently without them. No
+    # app_config and the VLM never scores a photo; no thumbnail_cache and both
+    # burst dedup and the frame-quality re-weighting return early, leaving the
+    # metadata lattice that ties hundreds of photos onto a handful of values;
+    # no db_path and every LLM score is paid for again next run.
     scored = score_photos(
         assets=photo_assets,
         config=config.photos,
@@ -141,6 +157,9 @@ def score_and_select_photos(
         download_fn=download_fn,
         thumbnail_fn=thumbnail_fn,
         provider_circuit=provider_circuit,
+        app_config=config,
+        db_path=config.cache.database_path,
+        thumbnail_cache=thumbnail_cache,
     )
 
     if not scored:
@@ -241,6 +260,69 @@ def render_photo_clips(
 # shortlist to place a few dozen photos, which ran for hours.
 LLM_SHORTLIST_CEILING = 200
 _LLM_SHORTLIST_HEADROOM = 3
+
+
+# How much of a photo's score the pixels are allowed to decide. The metadata
+# terms keep their meaning — a favorite is still the user telling us directly —
+# but they no longer decide the whole ordering on their own.
+_QUALITY_SHARE = 0.35
+_SHARPNESS_SHARE = 0.6
+_CONTRAST_SHARE = 0.2
+_EXPOSURE_SHARE = 0.2
+
+
+def _apply_frame_quality(
+    scored: list[tuple[Asset, float]],
+    config: PhotoConfig,
+    thumbnail_cache: Any,
+) -> list[tuple[Asset, float]]:
+    """Re-weight scores so a share of each is decided by the image itself.
+
+    Without this the pool arrives at selection in a handful of tie groups and
+    "best N" means "first N of the largest group". Measured on four months:
+    227-648 photos collapsing onto 5-8 distinct scores, all inside 0.24-0.48.
+    """
+    if thumbnail_cache is None or len(scored) < 2:
+        return scored
+
+    from immich_memories.photos.frame_quality import measure, rank
+
+    measured = []
+    for asset, _score in scored:
+        data = thumbnail_cache.get(asset.id, "preview")
+        measured.append(measure(data) if data else None)
+
+    usable = [(i, m) for i, m in enumerate(measured) if m is not None]
+    if len(usable) < 2:
+        return scored
+
+    sharp = rank([m.sharpness for _i, m in usable])
+    contrast = rank([m.contrast for _i, m in usable])
+    exposure = rank([m.exposure for _i, m in usable])
+    quality = {
+        idx: sharp[n] * _SHARPNESS_SHARE
+        + contrast[n] * _CONTRAST_SHARE
+        + exposure[n] * _EXPOSURE_SHARE
+        for n, (idx, _m) in enumerate(usable)
+    }
+
+    # An unmeasurable thumbnail sits mid-pool rather than last: we know nothing
+    # about it, which is not the same as knowing it is bad.
+    # The metadata score arrives already carrying the photo penalty, so the
+    # quality share takes it too — otherwise a third of every photo's score
+    # would quietly escape the rule that keeps photos behind videos.
+    penalty = 1.0 - config.score_penalty
+    rescored = []
+    for i, (asset, score) in enumerate(scored):
+        share = quality.get(i, 0.5) * penalty
+        rescored.append((asset, score * (1.0 - _QUALITY_SHARE) + share * _QUALITY_SHARE))
+    logger.info(
+        "Frame quality: %d of %d photos measured, %.0f%% of the score",
+        len(usable),
+        len(scored),
+        _QUALITY_SHARE * 100,
+    )
+    return rescored
 
 
 def _drop_burst_duplicates(
@@ -371,11 +453,7 @@ def _enhance_with_llm(
     cache = _get_score_cache(db_path) if db_path else None
     asset_ids = [a.id for a, _ in scored]
     model_version = app_config.llm.model
-    cached = (
-        cache.get_asset_scores_batch(asset_ids, model_version=model_version)
-        if cache and model_version
-        else {}
-    )
+    cached = _cached_scores(cache, asset_ids, model_version)
 
     cache_hits = 0
     enhanced: list[tuple[Asset, float]] = []
@@ -483,13 +561,40 @@ def _llm_score_photo(
         return None
 
 
+def _cached_scores(cache, asset_ids: list[str], model_version: str | None) -> dict:
+    """Previously computed scores, or nothing if the cache cannot answer.
+
+    The cache opens lazily, so an unwritable database survives construction
+    and raises on the first read instead — which took photo scoring down with
+    it. Losing the cache costs LLM calls, not the run.
+    """
+    import sqlite3
+
+    if not cache or not model_version:
+        return {}
+    try:
+        return cache.get_asset_scores_batch(asset_ids, model_version=model_version)
+    except (OSError, sqlite3.Error) as exc:
+        logger.debug("Photo score cache unreadable (%s): rescoring", exc)
+        return {}
+
+
 def _get_score_cache(db_path: Path):
-    """Get the asset score cache for score lookups."""
+    """Get the asset score cache, or None when it cannot be opened.
+
+    sqlite raises OperationalError rather than OSError for an unwritable or
+    missing directory, so that case escaped the guard and took photo scoring
+    down with it. A cache that cannot be opened costs repeated LLM calls, not
+    a failed run.
+    """
+    import sqlite3
+
     try:
         from immich_memories.cache.asset_score_cache import AssetScoreCache
 
         return AssetScoreCache(db_path=db_path)
-    except (ImportError, OSError):
+    except (ImportError, OSError, sqlite3.Error) as exc:
+        logger.debug("Photo score cache unavailable (%s): scores will not persist", exc)
         return None
 
 

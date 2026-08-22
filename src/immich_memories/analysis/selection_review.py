@@ -33,11 +33,47 @@ Below is every clip in timeline order, with everything we can see and hear.
 
 {clips}
 
-Judge the SET as a whole: feel, coherence, variety. Identify clips that are
-REDUNDANT (the same moment or scene shown twice) or that CLASH with the rest
-of the set. Most good selections need no changes.
+Judge the SET as a whole: feel, coherence, variety. Drop a clip when it is
 
-Answer with STRICT JSON only, no prose:
+- REDUNDANT: the same moment, scene or kind of shot is already in the set.
+  Self-portraits and mirror shots repeat hard — three of them from three days
+  is one idea shown three times, however different the days were. A selfie of
+  one person alone is the weakest way to record a day: prefer the clip that
+  shows what they were doing, or who they were with, and drop the solo shot
+  when the set already has one.
+- CROWDING OUT: the same THING recurring until it takes over — a pet, a room,
+  an object photographed on unrelated days while nothing else happens. Keep
+  the best two or three and drop the rest, even when each is a fine
+  photograph. Two exceptions, and they matter more than the rule:
+    * A subject that is NEW is the story of the period it arrives in, not
+      repetition — a kitten, a puppy, a first home, a first instrument. A
+      quiet month whose one development is a new animal is allowed to be
+      mostly that animal.
+    * A person is never crowding out. When someone appears through most of a
+      period they are usually its story: a new baby, a companion on a trip.
+      Repetition of a person is REDUNDANT only when it is the same SHOT
+      repeated, never merely the same face living their life.
+    * A thing that CHANGES across the set is a project, not repetition — a
+      house being renovated, a car being restored, furniture being built.
+      Progress is the story. Keep the sequence and let it read in order.
+- CLASHING: it breaks the feel the rest of the set has,
+- NOT A MEMORY: it records a thing rather than a moment — an object or a
+  product photographed on its own, a screen or a video game, a document or
+  a receipt, an empty room, a photo taken to remember information rather
+  than an occasion. A person can be in one of these: a head-and-shoulders
+  portrait against a blank wall, facing the camera, no expression and no
+  surroundings, is an identity photo taken for a form. Nothing happened when
+  it was taken, and several of them in one set is a giveaway.
+
+A memory of a trip or an occasion is not only the people in it. If every
+clip is a person facing the camera, say so by dropping the weakest of them:
+where they were is part of what happened.
+
+A clip with no description has not been analysed yet. That says nothing about
+whether it is any good: never drop a clip for missing information, and never
+treat it as a duplicate on those grounds.
+
+Most good selections need no changes. Answer with STRICT JSON only, no prose:
 {{"drop": [{{"index": <clip number>, "reason": "<short reason>"}}]}}
 Use an empty list when the set is good."""
 

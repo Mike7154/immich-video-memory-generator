@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from immich_memories.analysis import selection_trace as trace
 from immich_memories.analysis.clip_analyzer import ClipAnalyzer
 from immich_memories.analysis.clip_refiner import ClipRefiner
 from immich_memories.analysis.clip_scaler import ClipScaler
@@ -71,7 +73,7 @@ class PipelineConfig:
     target_clips: int = 120  # Target number of clips to select
     # Verify passes (#468): re-analyze shipped fallback-scored clips and
     # re-select, until nothing shipping is a guess or the budget is spent.
-    max_refinement_passes: int = 3
+    max_refinement_passes: int = 10
     # The judge (#468/#463): a selected clip below the floor never ships,
     # and the chronological ending cannot be the one weak clip in the
     # timeline (weakest member AND below this share of the mean score).
@@ -83,11 +85,7 @@ class PipelineConfig:
     prioritize_favorites: bool = True  # Prioritize favorite clips
     max_non_favorite_ratio: float = 0.70  # Max ratio of non-favorites (0.70 = at most 70%)
 
-    # Resolution filtering - exclude small videos that would look bad upscaled
-    # Set to 0 to disable, or specify minimum resolution
-    # If output_resolution is set, min_resolution defaults to output/2 (4K->1080, 1080->720)
-    min_resolution: int = 0  # 0 = auto based on output, or explicit minimum
-    output_resolution: int = 2160  # Output resolution (2160=4K, 1080=HD) for auto min calc
+    output_resolution: int = 2160  # Output resolution (2160=4K, 1080=HD)
 
     # Analysis settings
     analyze_all: bool = False  # Analyze all clips (slow but better selection)
@@ -352,23 +350,39 @@ class SmartPipeline:
         so the loop always terminates.
         """
         by_id = {c.clip.asset.id: c for c in analyzed}
+        attempted: set[str] = set()
         for _ in range(max(1, self.config.max_refinement_passes)):
             unverified = [
                 by_id[c.asset.id]
                 for c in result.selected_clips
-                if c.asset.id in by_id and not by_id[c.asset.id].analyzed
+                if c.asset.id in by_id
+                and c.asset.id not in attempted
+                and self._needs_a_real_look(by_id[c.asset.id])
             ]
             if not unverified:
                 break
             logger.info(
-                "Verify pass: analyzing %d selected clip(s) shipping on fallback scores",
+                "Verify pass: analyzing %d selected clip(s) the review cannot see",
                 len(unverified),
             )
+            trace.record(
+                "verify: analyze unseen",
+                result.selected_clips,
+                result.selected_clips,
+                [f"{len(unverified)} clip(s) analyzed for real before judging"],
+            )
+            attempted.update(u.clip.asset.id for u in unverified)
             try:
                 verified = self.analyzer.phase_analyze([u.clip for u in unverified], self.tracker)
             finally:
                 with contextlib.suppress(Exception):
                     self.analyzer.close()
+            # WHY only what we asked for: analysis can hand back more than it
+            # was given (a Live Photo expands into its components), and any
+            # extra id lands straight back in the pool — resurrecting a clip
+            # the judge or the review had just dropped.
+            requested = {u.clip.asset.id for u in unverified}
+            verified = [v for v in verified if v.clip.asset.id in requested]
             verified_ids = {v.clip.asset.id for v in verified}
             for v in verified:
                 by_id[v.clip.asset.id] = v
@@ -383,6 +397,63 @@ class SmartPipeline:
                     )
             result = self.refiner.phase_refine(list(by_id.values()), self.tracker)
         return result, list(by_id.values())
+
+    def _final_review_drop(
+        self,
+        analyzed: list[ClipWithSegment],
+        result: PipelineResult,
+    ) -> tuple[PipelineResult, list[ClipWithSegment]]:
+        """One last review that drops without refilling.
+
+        The iterating review always leaves its own last refill unjudged: it
+        stops when the budget runs out, and by then it has just re-selected.
+        Refilling again would only admit more unseen clips, so this pass takes
+        the cut it has and removes what does not belong.
+        """
+        if not self._app_config.content_analysis.enabled:
+            return result, analyzed
+        from immich_memories.analysis.selection_review import review_selection
+
+        by_id = {c.clip.asset.id: c for c in analyzed}
+        selected = [by_id[c.asset.id] for c in result.selected_clips if c.asset.id in by_id]
+        drops = set(review_selection(selected, self._app_config.llm))
+        if not drops:
+            return result, analyzed
+
+        kept = [c for c in result.selected_clips if c.asset.id not in drops]
+        if not kept:
+            return result, analyzed
+        logger.info(
+            "Selection review: budget spent, dropping %d unreviewed clip(s) "
+            "rather than shipping them",
+            len(result.selected_clips) - len(kept),
+        )
+        trimmed = replace(
+            result,
+            selected_clips=kept,
+            clip_segments={
+                asset_id: seg
+                for asset_id, seg in result.clip_segments.items()
+                if asset_id not in drops
+            },
+        )
+        return trimmed, [c for c in analyzed if c.clip.asset.id not in drops]
+
+    def _needs_a_real_look(self, member: ClipWithSegment) -> bool:
+        """Would the LLM review be judging this clip blind?
+
+        A metadata guess for a score is one way to ship unseen. The other is
+        subtler and was shipping: a clip carries a real visual score, so it
+        counts as analyzed, but no content analysis ever ran on it, so the
+        review is handed a bare line. It is then told — correctly — never to
+        drop a clip for missing information, and two near-identical hotel
+        mirror selfies from consecutive days both survive as a result.
+        """
+        if not member.analyzed:
+            return True
+        if not self._app_config.content_analysis.enabled:
+            return False
+        return not getattr(member.clip, "llm_description", None)
 
     def _judge_selection(
         self,
@@ -451,8 +522,15 @@ class SmartPipeline:
         selected = [by_id[c.asset.id] for c in result.selected_clips if c.asset.id in by_id]
         drops = review_selection(selected, self._app_config.llm)
         if not drops:
+            trace.record("llm review", selected, selected)
             return result, analyzed, False
-        remaining = [c for c in analyzed if c.clip.asset.id not in set(drops)]
+        dropped = set(drops)
+        trace.record(
+            "llm review",
+            selected,
+            [c for c in selected if c.clip.asset.id not in dropped],
+        )
+        remaining = [c for c in analyzed if c.clip.asset.id not in dropped]
         if not remaining:
             return result, analyzed, False
         # WHY the pool shrinks too: a later stabilization re-refines from the
@@ -529,15 +607,43 @@ class SmartPipeline:
                 lambda _: progress_callback(self.tracker.get_status_summary())
             )
 
+        # WHY an environment variable rather than an argument: every caller of
+        # this method — CLI, UI, scripts — would otherwise need a parameter it
+        # does not use, to carry a debugging concern four layers down.
+        trace_path = os.environ.get("IMMICH_MEMORIES_SELECTION_TRACE")
+        with trace.tracing(Path(trace_path) if trace_path else None):
+            return self._run_selection(analyzed, verify=verify)
+
+    def _run_selection(
+        self,
+        analyzed: list[ClipWithSegment],
+        *,
+        verify: bool,
+    ) -> PipelineResult:
         try:
             result = self.refiner.phase_refine(analyzed, self.tracker)
             if verify:
                 result, analyzed = self._stabilize_selection(analyzed, result)
-                result, analyzed, review_changed = self._holistic_review(analyzed, result)
-                if review_changed:
-                    # WHY: the review's re-selection can admit new fallback
-                    # clips, exactly like a judge drop — same stabilization.
+                # WHY a loop: one review pass drops what it can see, and the
+                # refill puts new clips in their place that nothing has looked
+                # at yet. Reviewing once leaves whatever the last refill
+                # admitted unjudged, which is how a product shot survived a
+                # cut that had already dropped two others.
+                review_changed = True
+                for _ in range(max(1, self.config.max_refinement_passes)):
+                    result, analyzed, review_changed = self._holistic_review(analyzed, result)
+                    if not review_changed:
+                        break
+                    # The review's re-selection can admit new fallback clips,
+                    # exactly like a judge drop — same stabilization.
                     result, analyzed = self._stabilize_selection(analyzed, result)
+                if review_changed:
+                    # Every pass so far dropped something and refilled, so the
+                    # last refill has never been looked at — which is how a
+                    # photo of a games console ended a December cut. Judge it
+                    # once more and simply drop what fails: a cut four seconds
+                    # short beats a cut that ends on a shelf.
+                    result, analyzed = self._final_review_drop(analyzed, result)
             self.tracker.finish()
             return result
         except (
@@ -577,95 +683,6 @@ class SmartPipeline:
         )
 
         return deduplicated
-
-    def _apply_non_favorite_filters(
-        self,
-        non_favorites: list[VideoClipInfo],
-        all_favorites: list[VideoClipInfo],
-    ) -> list[VideoClipInfo]:
-        """Apply quality filters to non-favorites only.
-
-        Applies HDR, compilation, and resolution filters sequentially.
-        """
-        filtered = non_favorites
-
-        # HDR filter
-        if self.config.hdr_only:
-            before = len(filtered)
-            filtered = [c for c in filtered if c.is_hdr]
-            logger.info(f"HDR filter on non-favorites: {before} -> {len(filtered)}")
-
-        # Compilation filter
-        before = len(filtered)
-        filtered = [c for c in filtered if c.is_camera_original]
-        compilations_removed = before - len(filtered)
-        if compilations_removed > 0:
-            logger.info(
-                f"Compilation filter: removed {compilations_removed} non-camera videos "
-                f"(no make/model EXIF)"
-            )
-
-        compilation_favorites = [c for c in all_favorites if not c.is_camera_original]
-        if compilation_favorites:
-            logger.warning(
-                f"Note: {len(compilation_favorites)} favorites appear to be compilations "
-                f"(no camera EXIF) - keeping them anyway"
-            )
-
-        # Resolution filter
-        min_res = self.config.min_resolution
-        if min_res == 0 and self.config.output_resolution > 0:
-            min_res = self.config.output_resolution // 2
-            min_res = max(min_res, 480)
-
-        if min_res > 0:
-            before = len(filtered)
-            # WHY: 0x0 = unknown resolution (live photo video components) — let them through
-            filtered = [
-                c
-                for c in filtered
-                if max(c.width, c.height) >= min_res or max(c.width, c.height) == 0
-            ]
-            logger.info(
-                f"Resolution filter on non-favorites: {before} -> {len(filtered)} "
-                f"(min {min_res}px for {self.config.output_resolution}p output)"
-            )
-
-        return filtered
-
-    def _select_gap_fillers(
-        self,
-        all_favorites: list[VideoClipInfo],
-        filtered_non_favorites: list[VideoClipInfo],
-    ) -> list[VideoClipInfo]:
-        """Select non-favorites from weeks that have no favorites."""
-        from collections import defaultdict
-
-        weeks_with_favorites: set[str] = set()
-        non_favorites_by_week: dict[str, list] = defaultdict(list)
-
-        weeks_with_favorites.update(
-            clip.asset.file_created_at.strftime("%Y-W%W") for clip in all_favorites
-        )
-
-        for clip in filtered_non_favorites:
-            non_favorites_by_week[clip.asset.file_created_at.strftime("%Y-W%W")].append(clip)
-
-        weeks_needing_fill = set(non_favorites_by_week.keys()) - weeks_with_favorites
-
-        gap_fillers: list[VideoClipInfo] = []
-        for week in sorted(weeks_needing_fill):
-            week_clips = non_favorites_by_week[week]
-            week_clips.sort(
-                key=lambda c: (
-                    c.width * c.height if c.width and c.height else 0,
-                    c.bitrate or 0,
-                ),
-                reverse=True,
-            )
-            gap_fillers.extend(week_clips[:3])
-
-        return gap_fillers
 
     def _adapt_target_for_content(self, clips: list[VideoClipInfo]) -> None:
         """Reduce target_clips when available content is sparse."""
