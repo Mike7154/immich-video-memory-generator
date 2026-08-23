@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from collections.abc import Container, Iterable
     from datetime import date, datetime
 
-    from immich_memories.config_models import LLMConfig
+    from immich_memories.config_models_llm import LLMConfig
 
 logger = logging.getLogger(__name__)
 

@@ -14,7 +14,7 @@ import httpx
 from immich_memories.analysis.llm_query import query_llm
 
 if TYPE_CHECKING:
-    from immich_memories.config_models import LLMConfig
+    from immich_memories.config_models_llm import LLMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +208,7 @@ async def generate_title_with_llm(
             temperature=temperature,
             max_tokens=8000,
             timeout_seconds=300,
+            thinking=True,
         )
         return parse_title_response(raw)
     except (httpx.HTTPError, RuntimeError, ValueError, OSError) as e:

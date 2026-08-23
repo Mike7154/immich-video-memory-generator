@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from immich_memories.analysis.smart_pipeline import ClipWithSegment
-    from immich_memories.config_models import LLMConfig
+    from immich_memories.config_models_llm import LLMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,9 @@ def _ask(prompt: str, llm_config: LLMConfig, timeout_seconds: int) -> str:
     from immich_memories.analysis.llm_query import query_llm
 
     return asyncio.run(
-        query_llm(prompt, llm_config, temperature=0.2, timeout_seconds=timeout_seconds)
+        query_llm(
+            prompt, llm_config, temperature=0.2, timeout_seconds=timeout_seconds, thinking=True
+        )
     )
 
 

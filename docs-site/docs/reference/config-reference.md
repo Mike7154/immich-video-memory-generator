@@ -256,11 +256,64 @@ Used by content analysis and title generation. Any OpenAI-compatible endpoint wo
 
 ```yaml
 llm:
-  provider: "openai-compatible"   # openai-compatible or ollama
+  provider: "openai-compatible"   # openai-compatible | openai | zai | anthropic | ollama
   base_url: "http://localhost:8080/v1"
   model: ""                        # e.g. mlx-community/Qwen2.5-VL-7B-Instruct-8bit
   api_key: ""                      # optional, only for cloud APIs
   timeout_seconds: 300             # increase for slow local models (10-3600)
+  thinking: false                  # server has a reasoning switch
+  # thinking_params:               # what the switch looks like on your server
+  #   chat_template_kwargs:        # (default: the Qwen dialect, vLLM/mlx)
+  #     enable_thinking: true
+```
+
+**The goal of this product is a fully local process** — your photos analyzed
+on your own hardware, nothing leaving your network. A local server (mlx,
+vLLM, Ollama) is the intended setup. The cloud providers below exist for one
+reason: so that people without the means — or the desire — to run a local
+model can still use the product. Using one sends each analyzed clip's frames
+or thumbnails and the derived descriptions to that provider; see the
+"data leaving your network" page before choosing this route.
+
+Two adapters cover every provider: `openai-compatible` speaks
+`/chat/completions` (vLLM, mlx, Ollama's `/v1`, aggregators, OpenAI itself),
+and `anthropic` speaks the native `/v1/messages` API (Claude, or z.ai's
+Anthropic-compatible endpoint) with its own reasoning dialect handled
+natively. `openai` and `zai` are named presets: the generic adapter with the
+provider's URL and reasoning dialect pre-filled — set `provider: openai`,
+`model: gpt-5.6-terra` and an API key, and thinking works with nothing else
+to configure. Explicit `base_url`/`thinking_params` always win over a preset.
+
+`thinking: true` runs the model in reasoning mode for the judgement calls
+only — the holistic selection review and title generation. Each such call
+costs roughly 5-10× the latency and 10-20× the completion tokens of a fast
+call, which matters on a paid API. Bulk work (per-clip content analysis,
+photo scoring) always runs in fast mode: reasoning over multiple images is
+unreliable on current models, and the volume would make it unaffordable
+anyway.
+
+`thinking_params` is merged verbatim into a thinking request, so the switch
+matches your server's dialect: the default is Qwen's
+`chat_template_kwargs: {"enable_thinking": true}` (vLLM, mlx, SGLang); for
+the OpenAI API use `{"reasoning_effort": "medium"}`. Leave `thinking` off
+unless you know the server supports your chosen switch — some
+OpenAI-compatible servers reject unknown request fields.
+
+Parameter dialects are otherwise handled automatically: OpenAI's reasoning
+models (gpt-5 family) reject `max_tokens` and non-default temperatures, and
+the query layer reads those 400s, adapts the request, and remembers the
+answer per server and model — validated against the live OpenAI API. One
+provider note: z.ai's OpenAI-compatible endpoint accepts image content only
+on its dedicated vision models, so point `llm.model` at one of those if you
+use it for content analysis.
+
+A provider's dialect can also be declared up front instead of negotiated:
+
+```yaml
+llm:
+  max_tokens_param: max_completion_tokens  # token-limit field name
+  drop_params: [temperature]               # fields this server rejects
+  extra_params: {}                         # fields merged into every call
 ```
 
 A separate `title_llm` section can point the web UI's title step at a different model than the one
