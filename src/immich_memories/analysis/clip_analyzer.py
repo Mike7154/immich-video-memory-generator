@@ -153,6 +153,11 @@ class ClipAnalyzer:
                         start_time=0.0,
                         end_time=min(duration, self.config.avg_clip_duration),
                         score=0.0,
+                        # Not a verdict of zero: nothing looked at this clip.
+                        # The verify pass reads this to know it must keep the
+                        # score it already had rather than write the
+                        # placeholder over it.
+                        analyzed=False,
                     )
                 )
 
@@ -533,13 +538,31 @@ class ClipAnalyzer:
 
         return start, end, score, llm_analysis
 
+    def _cache_hit_is_complete(self, cached: tuple) -> bool:
+        """Whether this cached row answers everything this run needs.
+
+        A model switch leaves every clip objective-fresh and semantics-stale:
+        _check_analysis_cache keeps the scores and drops the semantics, and
+        returning the hit anyway meant nothing could ever regenerate them.
+        _needs_a_real_look then re-flagged the clip every round and the verify
+        pass "analyzed" it as a cache-hit no-op, forever — leaving the holistic
+        review judging bare lines it is instructed never to drop for missing
+        information, library-wide, until ANALYSIS_VERSION happened to bump.
+
+        Falling through costs one real analysis per clip per model switch, and
+        the run after it is warm again.
+        """
+        if not self._app_config.content_analysis.enabled:
+            return True
+        return cached[4] is not None
+
     def _analyze_clip_with_preview(
         self,
         clip: VideoClipInfo,
     ) -> tuple[float, float, float, str | None, dict[str, object] | None]:
         """Analyze a clip and extract a preview segment."""
         cached_result = self._check_analysis_cache(clip)
-        if cached_result is not None:
+        if cached_result is not None and self._cache_hit_is_complete(cached_result):
             return cached_result
 
         config = self._app_config
