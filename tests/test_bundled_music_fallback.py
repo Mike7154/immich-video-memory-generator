@@ -49,14 +49,14 @@ def test_returns_nothing_when_the_package_is_not_installed(tmp_path):
     assert bundled_track_for_mood("calm", library=tmp_path / "absent") is None
 
 
-def test_resolve_music_file_uses_the_bundle_when_no_backend_is_configured(library):
-    from immich_memories.generate_music import resolve_music_file
+def test_resolve_music_uses_the_bundle_when_no_backend_is_configured(library):
+    from immich_memories.generate_music import resolve_music
 
     config = Config()
     config.ace_step.enabled = False
     config.musicgen.enabled = False
 
-    chosen = resolve_music_file(
+    chosen = resolve_music(
         config=config,
         music_path=None,
         no_music=False,
@@ -66,13 +66,13 @@ def test_resolve_music_file_uses_the_bundle_when_no_backend_is_configured(librar
         bundled_library=library,
     )
 
-    assert chosen is not None
+    assert chosen.path is not None
 
 
 def test_no_music_still_means_no_music(library):
-    from immich_memories.generate_music import resolve_music_file
+    from immich_memories.generate_music import resolve_music
 
-    chosen = resolve_music_file(
+    chosen = resolve_music(
         config=Config(),
         music_path=None,
         no_music=True,
@@ -82,14 +82,14 @@ def test_no_music_still_means_no_music(library):
         bundled_library=library,
     )
 
-    assert chosen is None
+    assert chosen.path is None
 
 
 def test_a_missing_explicit_track_is_not_silently_replaced(library, tmp_path):
     """A typo in --music should fail loudly, not quietly play something else."""
-    from immich_memories.generate_music import resolve_music_file
+    from immich_memories.generate_music import resolve_music
 
-    chosen = resolve_music_file(
+    chosen = resolve_music(
         config=Config(),
         music_path=tmp_path / "typo.mp3",
         no_music=False,
@@ -99,12 +99,12 @@ def test_a_missing_explicit_track_is_not_silently_replaced(library, tmp_path):
         bundled_library=library,
     )
 
-    assert chosen is None
+    assert chosen.path is None
 
 
 def test_bundled_music_is_mastered_before_use(library, tmp_path):
     """Bundled and generated tracks get the tilt and loudness target; user files do not."""
-    from immich_memories.generate_music import resolve_music_file
+    from immich_memories.generate_music import resolve_music
 
     seen: list[Path] = []
 
@@ -121,7 +121,7 @@ def test_bundled_music_is_mastered_before_use(library, tmp_path):
         config = Config()
         config.ace_step.enabled = False
         config.musicgen.enabled = False
-        resolve_music_file(
+        resolve_music(
             config=config,
             music_path=None,
             no_music=False,
@@ -136,13 +136,100 @@ def test_bundled_music_is_mastered_before_use(library, tmp_path):
     assert seen, "bundled music should be mastered"
 
 
+def _emotional_clips(emotion, tmp_path):
+    from immich_memories.processing.assembly_config import AssemblyClip
+
+    return [
+        AssemblyClip(path=tmp_path / f"clip{i}.mp4", duration=3.0, llm_emotion=emotion)
+        for i in range(3)
+    ]
+
+
+def _bundled_choice(clips, library, tmp_path, monkeypatch):
+    from immich_memories.generate_music import resolve_music
+
+    # WHY: replaces the FFmpeg mastering pass so the pick keeps its folder.
+    monkeypatch.setattr(
+        "immich_memories.audio.mastering.master_music_track", lambda source, _dest: source
+    )
+    config = Config()
+    config.ace_step.enabled = False
+    config.musicgen.enabled = False
+    return resolve_music(
+        config=config,
+        music_path=None,
+        no_music=False,
+        assembly_clips=clips,
+        run_output_dir=tmp_path,
+        memory_type=None,
+        bundled_library=library,
+    ).path
+
+
+def test_the_analysers_emotion_reaches_the_bundled_mood_folder(library, tmp_path, monkeypatch):
+    """The five mood folders were inert: AssemblyClip carries llm_emotion, not mood.
+
+    Asserted over repeats because a mood-blind pick would land in the right
+    folder by chance often enough to pass a single draw.
+    """
+    clips = _emotional_clips("joyful", tmp_path)
+
+    folders = {
+        _bundled_choice(clips, library, tmp_path, monkeypatch).parent.name for _ in range(30)
+    }
+
+    assert folders == {"happy"}, "joyful belongs to the happy family"
+
+
+def test_clips_with_no_emotion_still_draw_from_the_whole_library(library, tmp_path, monkeypatch):
+    clips = _emotional_clips(None, tmp_path)
+
+    folders = {
+        _bundled_choice(clips, library, tmp_path, monkeypatch).parent.name for _ in range(30)
+    }
+
+    assert folders == {"calm", "happy"}
+
+
+@pytest.mark.parametrize(
+    ("emotion", "folder"),
+    [
+        # The vocabulary the analysis prompt asks the vision LLM for.
+        ("happy", "happy"),
+        ("calm", "calm"),
+        ("excited", "energetic"),
+        ("playful", "happy"),
+        ("joyful", "happy"),
+        ("peaceful", "calm"),
+        # Families with no folder of their own borrow the closest that has one.
+        ("romantic", "tender"),
+        ("wistful", "nostalgic"),
+    ],
+)
+def test_every_emotion_the_prompt_asks_for_reaches_a_shipped_folder(tmp_path, emotion, folder):
+    """A vocabulary drift here is what left all five folders unreachable."""
+    from immich_memories.processing.scaling_utilities import aggregate_mood_from_clips
+
+    shipped = tmp_path / "shipped"
+    for name in ("calm", "energetic", "happy", "nostalgic", "tender"):
+        (shipped / name).mkdir(parents=True)
+        (shipped / name / f"{name}.opus").write_bytes(b"")
+    mood = aggregate_mood_from_clips(_emotional_clips(emotion, tmp_path))
+
+    # Repeated because a mood with no folder falls to the flat pool, which would
+    # land on the right one by chance once in five.
+    folders = {bundled_track_for_mood(mood, library=shipped).parent.name for _ in range(20)}
+
+    assert folders == {folder}
+
+
 def test_a_user_supplied_track_is_left_alone(library, tmp_path):
-    from immich_memories.generate_music import resolve_music_file
+    from immich_memories.generate_music import resolve_music
 
     theirs = tmp_path / "mine.mp3"
     theirs.write_bytes(b"")
 
-    chosen = resolve_music_file(
+    chosen = resolve_music(
         config=Config(),
         music_path=theirs,
         no_music=False,
@@ -152,4 +239,4 @@ def test_a_user_supplied_track_is_left_alone(library, tmp_path):
         bundled_library=library,
     )
 
-    assert chosen == theirs
+    assert chosen.path == theirs

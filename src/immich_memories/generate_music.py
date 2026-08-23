@@ -24,6 +24,7 @@ from immich_memories.processing.output_contract import (
     probe_output,
     publish_validated_output,
 )
+from immich_memories.processing.scaling_utilities import aggregate_mood_from_clips
 from immich_memories.security import configured_secret_values, sanitize_error_message
 
 if TYPE_CHECKING:
@@ -40,6 +41,19 @@ class MusicPhaseResult:
     """Outcome of optional music work without changing artifact validity."""
 
     applied: bool
+    warning: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MusicSelection:
+    """The track the run will use, and what it had to settle for to get there.
+
+    The warning travels with the path rather than only reaching the log,
+    because a bundled substitution is a success the user still needs told
+    about: otherwise a dead backend looks like working music forever.
+    """
+
+    path: Path | None
     warning: str | None = None
 
 
@@ -115,7 +129,7 @@ def music_config_available(config: Config) -> bool:
     return bool((ace and ace.enabled) or (mg and mg.enabled))
 
 
-def resolve_music_file(
+def resolve_music(
     config: Config,
     music_path: Path | None,
     no_music: bool,
@@ -124,12 +138,14 @@ def resolve_music_file(
     memory_type: str | None,
     report_fn: Callable[[str, float, str], None] | None = None,
     bundled_library: Path | None = None,
-) -> Path | None:
-    """Determine the music file to use: provided path, generated, bundled, or None."""
+) -> MusicSelection:
+    """Determine the music to use: provided path, generated, bundled, or none."""
     if no_music:
-        return None
+        return MusicSelection(None)
     if music_path and music_path.exists():
-        return music_path
+        return MusicSelection(music_path)
+
+    warning: str | None = None
     if not music_path and music_config_available(config):
         if report_fn:
             report_fn("music", 0.85, "Generating AI music...")
@@ -141,27 +157,36 @@ def resolve_music_file(
             # A configured generator that fails used to be worse than no generator
             # at all: the exception unwound past the bundled branch below and the
             # whole music phase was abandoned, so the most-configured setup got
-            # the only silent video. Fall through to bundled and keep the warning.
-            logger.warning("%s; using a bundled track", optional_music_warning(exc, config))
+            # the only silent video. Fall through to bundled and carry the warning
+            # out with the track — a log line alone never reaches the run artifact,
+            # the UI or the nightly notification, so a dead backend stayed invisible.
+            warning = f"{optional_music_warning(exc, config)}; used a bundled track instead"
+            logger.warning(warning)
             generated = None
         if generated:
-            return _master(generated, run_output_dir)
+            return MusicSelection(_master(generated, run_output_dir))
 
     if music_path is not None:
         # An explicit track that is missing is a user error; substituting bundled
         # music would hide the typo.
-        return None
+        return MusicSelection(None)
 
     # WHY: with no generator configured this used to return silence, which is what
     # the Docker/NAS path gets by default.
     from immich_memories.audio.bundled_music import bundled_track_for_mood
 
+    # The mood used to be read off a `clip.mood` field AssemblyClip has never
+    # had, so it was always None and the bundled mood folders never served their
+    # purpose. What the clips actually carry is llm_emotion, which the title
+    # stack already aggregates into mood families.
     bundled = bundled_track_for_mood(
-        _mood_for_clips(assembly_clips),
+        aggregate_mood_from_clips(assembly_clips),
         library=bundled_library,
         cadence_seconds=photo_cadence_seconds(assembly_clips),
     )
-    return _master(bundled, run_output_dir) if bundled else bundled
+    if not bundled:
+        return MusicSelection(None, warning)
+    return MusicSelection(_master(bundled, run_output_dir), warning)
 
 
 def _master(track: Path, run_output_dir: Path) -> Path:
@@ -183,15 +208,6 @@ def photo_cadence_seconds(assembly_clips: list[AssemblyClip]) -> float | None:
     if len(durations) < 2:
         return None
     return durations[len(durations) // 2]
-
-
-def _mood_for_clips(assembly_clips: list[AssemblyClip]) -> str | None:
-    """Mood to pick bundled music by, taken from the clips when they carry one."""
-    for clip in assembly_clips:
-        mood = getattr(clip, "mood", None)
-        if mood:
-            return str(mood)
-    return None
 
 
 def auto_generate_music(

@@ -27,8 +27,11 @@ The Docker image and the `all` extra already include it.
 
 Tracks cover five moods (calm, energetic, happy, nostalgic, tender) in acoustic
 and electronic styles, roughly 30 seconds each, and are repeated with a crossfade
-to fill longer videos. Selection follows the memory's detected mood, and a mood
-with no bundled folder falls back to another track rather than to silence.
+to fill longer videos. Selection follows the memory's detected mood: the per-clip
+emotions the vision LLM reported are aggregated into a dominant mood, and near
+neighbours share a folder — playful draws from happy, peaceful from calm,
+romantic from tender. A mood that maps to no folder at all, and a memory with no
+emotions at all, draw from the whole library rather than falling to silence.
 
 They were generated locally with ACE-Step 1.5 — nothing sampled from or derived
 from third-party recordings, so there is no attribution requirement. The models,
@@ -108,9 +111,17 @@ Measured on the 28 bundled tracks, ACE-Step honours a requested tempo to within
 is also why cuts are aligned in *rate*, not yet locked to the beat.
 
 A bundled track cannot be asked for a tempo; its own is already fixed. So the
-choice runs the other way — the tracks are measured and the one whose beat
-divides the photo cadence is picked, instead of one at random. With no photos
-there is no rhythm to sync to, and the pick stays random so repeats differ.
+choice runs the other way — the tracks are measured, the ones whose beat lands
+within 0.2 beats of the photo cadence become the candidates, and one of those is
+picked at random. Alignment narrows the field; it does not name a winner, or the
+same memory would get the same song every time it was regenerated. When nothing
+lands close enough the pick falls back to any track. With no photos there is no
+rhythm to sync to, and the pick stays random too.
+
+That 0.2 is the detector's floor, not a preference: the onset envelope quantizes
+the beat period to 23 ms frames, so a track built at 120 bpm measures 117.5, and
+a track that really does land on a 4 s cadence can still measure 0.18 beats out.
+A tighter window would throw away tracks that fit and measure only the noise.
 
 Tempo is measured with an onset envelope and autocorrelation over an FFmpeg
 decode, using numpy alone. librosa would be a line, but it is not a dependency

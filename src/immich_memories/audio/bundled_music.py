@@ -15,6 +15,16 @@ logger = logging.getLogger(__name__)
 
 _SUFFIXES = (".opus", ".mp3", ".m4a", ".flac", ".ogg", ".wav")
 
+# The package ships five folders; the analyser's mood families are wider than
+# that. A near neighbour is better music for the memory than the flat pool, so
+# the families with no folder of their own borrow the closest one that has.
+_MOOD_FOLDERS = {
+    "playful": "happy",
+    "peaceful": "calm",
+    "exciting": "energetic",
+    "romantic": "tender",
+}
+
 
 def bundled_library() -> Path | None:
     """Directory of bundled tracks, or None when the music package is absent."""
@@ -46,7 +56,8 @@ def bundled_track_for_mood(
     if root is None or not root.is_dir():
         return None
 
-    folder = root / (mood or "")
+    family = (mood or "").lower()
+    folder = root / _MOOD_FOLDERS.get(family, family)
     candidates = _tracks_in(folder) if folder.is_dir() else []
     if not candidates:
         candidates = sorted(
