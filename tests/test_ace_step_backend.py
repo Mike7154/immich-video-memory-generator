@@ -160,6 +160,21 @@ class TestACEStepBackend:
 
 
 class TestACEStepBackendV15Library:
+    @pytest.fixture(autouse=True)
+    def _plentiful_memory(self):
+        """Keep handler-wiring tests independent of whatever the runner has free.
+
+        `_init_pipeline` refuses a profile the host cannot hold, and a CI runner holds
+        very little — without this the memory guard, not the wiring, decides these tests.
+        The two tests that are about the guard patch this again with their own figure.
+        """
+        # WHY: available_memory_bytes reads the runner's real vm_stat / procfs
+        with patch(
+            "immich_memories.audio.generators.memory_budget.available_memory_bytes",
+            return_value=512 * 1024**3,
+        ):
+            yield
+
     @staticmethod
     def _fake_v15_modules(tmp_path: Path, captured: dict):
         package_root = tmp_path / "ace-step-1.5"
@@ -340,6 +355,55 @@ class TestACEStepBackendV15Library:
             "offload_to_cpu": False,
             "dtype": None,
         }
+
+    def test_v15_library_declines_a_profile_this_host_cannot_hold(self, tmp_path):
+        """Jetsam must not be the thing that decides; the music chain can absorb a raise."""
+        captured = {}
+        modules, _ = self._fake_v15_modules(tmp_path, captured)
+        backend = ACEStepBackend(
+            ACEStepConfig(
+                mode="lib", model_variant="acestep-v15-xl-turbo", lm_model_size="4B", use_lm=True
+            )
+        )
+
+        # WHY: replaces the ACE-Step package, the host OS, and the host-memory probe
+        with (
+            patch.dict(sys.modules, modules),
+            patch.dict(os.environ, {"ACESTEP_CHECKPOINTS_DIR": str(tmp_path / "checkpoints")}),
+            patch("platform.system", return_value="Darwin"),
+            patch(
+                "immich_memories.audio.generators.memory_budget.available_memory_bytes",
+                return_value=4 * 1024**3,
+            ),
+            pytest.raises(RuntimeError, match="needs at least 29 GB"),
+        ):
+            backend._init_pipeline()
+
+        assert "dit_init" not in captured, "the guard must fire before any weights load"
+
+    def test_v15_library_loads_normally_when_memory_is_plentiful(self, tmp_path):
+        """The guard is a floor, not a new step: a host with room behaves as before."""
+        captured = {}
+        modules, _ = self._fake_v15_modules(tmp_path, captured)
+        backend = ACEStepBackend(
+            ACEStepConfig(
+                mode="lib", model_variant="acestep-v15-xl-turbo", lm_model_size="4B", use_lm=True
+            )
+        )
+
+        # WHY: replaces the ACE-Step package, the host OS, and the host-memory probe
+        with (
+            patch.dict(sys.modules, modules),
+            patch.dict(os.environ, {"ACESTEP_CHECKPOINTS_DIR": str(tmp_path / "checkpoints")}),
+            patch("platform.system", return_value="Darwin"),
+            patch(
+                "immich_memories.audio.generators.memory_budget.available_memory_bytes",
+                return_value=200 * 1024**3,
+            ),
+        ):
+            backend._init_pipeline()
+
+        assert captured["dit_init"]["config_path"] == "acestep-v15-xl-turbo"
 
     @staticmethod
     def _fake_mlx_modules(captured: dict) -> dict:
