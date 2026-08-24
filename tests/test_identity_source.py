@@ -81,6 +81,29 @@ def test_all_group_builds_cooccurrence_query_for_every_account() -> None:
     }
 
 
+def test_required_plus_any_of_builds_union_of_cooccurrence_clauses() -> None:
+    config = _identity_config()
+    config.groups["mothers_day"] = IdentityGroupConfig(
+        display_name="Mom & Kids",
+        required=["katie"],
+        any_of=["asher", "lucas"],
+    )
+
+    selection = resolve_identity_selection(config, group="mothers_day")
+
+    assert selection.match == "composite"
+    assert selection.account_clauses == {
+        "michael": [
+            ["m-katie", "m-asher"],
+            ["m-katie", "m-lucas"],
+        ],
+        "katie": [
+            ["k-katie", "k-asher"],
+            ["k-katie", "k-lucas"],
+        ],
+    }
+
+
 def _asset(asset_id: str, checksum: str) -> Asset:
     now = datetime(2026, 1, 1)
     return Asset(
@@ -170,6 +193,44 @@ def test_all_group_intersects_people_inside_each_account() -> None:
     assert [asset.id for asset in videos] == ["together"]
     assert clients["michael"].all_calls == [["m-michael", "m-katie"]]
     assert clients["katie"].all_calls == [["k-michael", "k-katie"]]
+
+
+def test_required_plus_any_of_keeps_mom_with_at_least_one_kid() -> None:
+    config = _identity_config()
+    config.groups["mothers_day"] = IdentityGroupConfig(
+        display_name="Mom & Kids",
+        required=["katie"],
+        any_of=["asher", "lucas"],
+    )
+    mom_asher = _asset("mom-asher", "mom-asher")
+    mom_lucas = _asset("mom-lucas", "mom-lucas")
+    mom_only = _asset("mom-only", "mom-only")
+    clients = {
+        "michael": _DiscoveryClient(
+            {
+                "m-katie": [mom_asher, mom_lucas, mom_only],
+                "m-asher": [mom_asher],
+                "m-lucas": [mom_lucas],
+            }
+        ),
+        "katie": _DiscoveryClient(
+            {
+                "k-katie": [],
+                "k-asher": [],
+                "k-lucas": [],
+            }
+        ),
+    }
+    date_ranges = [DateRange(start=datetime(2026, 1, 1), end=datetime(2026, 12, 31))]
+    selection = resolve_identity_selection(config, group="mothers_day")
+
+    videos = fetch_identity_videos(selection, clients, date_ranges)
+    photos = fetch_identity_photos(selection, clients, date_ranges)
+
+    assert [asset.id for asset in videos] == ["mom-asher", "mom-lucas"]
+    assert [asset.id for asset in photos] == ["mom-asher", "mom-lucas"]
+    assert ["m-katie", "m-asher"] in clients["michael"].all_calls
+    assert ["m-katie", "m-lucas"] in clients["michael"].all_calls
 
 
 def test_photo_queries_follow_the_same_any_and_all_rules() -> None:

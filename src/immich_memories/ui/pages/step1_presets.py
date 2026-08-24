@@ -160,7 +160,7 @@ def _render_saved_identity_filter(memory_type: MemoryType) -> None:
     )
     options.update(
         {
-            f"group:{key}": f"{group.display_name} ({group.match.upper()})"
+            f"group:{key}": f"{group.display_name} ({group.boolean_label})"
             for key, group in identities.groups.items()
         }
     )
@@ -463,7 +463,7 @@ def _render_multi_person_params() -> None:
         group_options = {"": "Choose people manually"}
         group_options.update(
             {
-                key: f"{group.display_name} ({group.match.upper()})"
+                key: f"{group.display_name} ({group.boolean_label})"
                 for key, group in logical_groups.items()
             }
         )
@@ -802,10 +802,11 @@ def _apply_preset_to_state(memory_type: MemoryType) -> None:
                 subject=params.get("identity_subject"),
                 group=params.get("identity_group"),
             )
-            if selection.event_date is None:
+            if selection.event_date is None and selection.event_rule is None:
                 raise ValueError(f"No event date configured for {selection.display_name}")
             _display, state.date_ranges = annual_story_scope(
                 selection.event_date,
+                event_rule=selection.event_rule,
                 event_year=int(params.get("year") or date.today().year),
                 years_back=params.get("years_back"),
             )

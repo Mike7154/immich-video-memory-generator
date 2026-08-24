@@ -14,6 +14,10 @@ class ScheduleEntry(BaseModel):
     memory_type: str = Field(description="Memory type preset (year_in_review, on_this_day, etc.)")
     cron: str = Field(description="Cron expression (minute hour day month weekday)")
     enabled: bool = Field(default=True, description="Whether this schedule is active")
+    event_only: bool = Field(
+        default=False,
+        description="Run only when the selected subject/group event occurs on the fire date",
+    )
     upload_to_immich: bool = Field(default=False, description="Upload result to Immich")
     album_name: str | None = Field(
         default=None, description="Album name template ({year}, {month})"

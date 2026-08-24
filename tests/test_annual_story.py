@@ -5,6 +5,7 @@ from datetime import date
 from immich_memories.analysis.annual_story import annual_story_scope
 from immich_memories.analysis.identity_source import resolve_identity_selection
 from immich_memories.config_models_identity import (
+    FloatingAnnualEventConfig,
     IdentityAccountConfig,
     IdentityConfig,
     IdentityGroupConfig,
@@ -32,6 +33,24 @@ def test_annual_story_handles_leap_day() -> None:
 
     assert windows[0].start.date() == date(2024, 3, 1)
     assert windows[0].end.date() == date(2025, 2, 28)
+
+
+def test_floating_event_uses_each_years_actual_weekday_occurrence() -> None:
+    mothers_day = FloatingAnnualEventConfig(month=5, weekday="sunday", occurrence=2)
+
+    _display, windows = annual_story_scope(
+        None,
+        event_rule=mothers_day,
+        event_year=2026,
+        years_back=2,
+    )
+
+    assert windows[0].start.date() == date(2025, 5, 12)
+    assert windows[0].end.date() == date(2026, 5, 10)
+    assert [window.start.date() for window in windows[1:]] == [
+        date(2025, 5, 10),
+        date(2024, 5, 11),
+    ]
 
 
 def test_subject_birth_date_and_group_event_date_resolve_generically() -> None:

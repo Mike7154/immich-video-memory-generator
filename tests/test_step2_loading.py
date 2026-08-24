@@ -163,3 +163,44 @@ def test_web_anniversary_story_builds_history_plus_latest_year(monkeypatch) -> N
     assert len(state.date_ranges) == 4
     assert state.date_ranges[0].start.date() == date(2025, 9, 23)
     assert state.target_duration == 5
+
+
+def test_web_floating_event_story_uses_the_rule_for_each_year(monkeypatch) -> None:
+    state = AppState(
+        config=Config(
+            identities={
+                "accounts": {"one": {"api_key": "one-key"}},
+                "subjects": {
+                    "mom": {"display_name": "Mom", "people": {"one": "mom-id"}},
+                    "child": {"display_name": "Child", "people": {"one": "child-id"}},
+                },
+                "groups": {
+                    "mothers_day": {
+                        "display_name": "Mom & Kids",
+                        "required": ["mom"],
+                        "any_of": ["child"],
+                        "event_rule": {
+                            "month": 5,
+                            "weekday": "sunday",
+                            "occurrence": 2,
+                        },
+                    }
+                },
+            }
+        ),
+        memory_preset_params={
+            "identity_group": "mothers_day",
+            "annual_story": True,
+            "year": 2026,
+            "years_back": 2,
+        },
+    )
+    monkeypatch.setattr("immich_memories.ui.pages.step1_presets.get_app_state", lambda: state)
+
+    from immich_memories.memory_types.registry import MemoryType
+
+    _apply_preset_to_state(MemoryType.MULTI_PERSON)
+
+    assert len(state.date_ranges) == 3
+    assert state.date_ranges[0].start.date() == date(2025, 5, 12)
+    assert state.date_ranges[0].end.date() == date(2026, 5, 10)

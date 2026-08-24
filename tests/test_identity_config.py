@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from immich_memories.config_loader import Config
 
 
@@ -65,6 +67,67 @@ identities:
     }
     assert config.identities.groups["kids"].match == "any"
     assert config.identities.groups["parents"].match == "all"
+
+
+def test_composite_group_and_floating_event_load(tmp_path: Path) -> None:
+    source = tmp_path / "config.yaml"
+    source.write_text(
+        """
+identities:
+  accounts:
+    family:
+      api_key: key
+  subjects:
+    mom:
+      display_name: Mom
+      people: {family: mom-id}
+    asher:
+      display_name: Asher
+      people: {family: asher-id}
+    lucas:
+      display_name: Lucas
+      people: {family: lucas-id}
+  groups:
+    mothers_day:
+      display_name: Mom & Kids
+      required: [mom]
+      any_of: [asher, lucas]
+      event_rule:
+        month: 5
+        weekday: sunday
+        occurrence: 2
+""".strip()
+    )
+
+    group = Config.from_yaml(source).identities.groups["mothers_day"]
+
+    assert group.boolean_label == "REQUIRED + ANY"
+    assert group.event_rule is not None
+    assert group.event_rule.date_for_year(2026).isoformat() == "2026-05-10"
+
+
+def test_group_rejects_ambiguous_boolean_syntax(tmp_path: Path) -> None:
+    source = tmp_path / "config.yaml"
+    source.write_text(
+        """
+identities:
+  accounts:
+    family:
+      api_key: key
+  subjects:
+    mom:
+      display_name: Mom
+      people: {family: mom-id}
+  groups:
+    invalid:
+      display_name: Invalid
+      subjects: [mom]
+      required: [mom]
+""".strip()
+    )
+
+    with pytest.raises(ValueError, match="either subjects\\+match or required\\+any_of"):
+        Config.from_yaml(source)
 
 
 def test_identity_account_secret_template_survives_save(tmp_path: Path, monkeypatch) -> None:

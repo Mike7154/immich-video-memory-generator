@@ -128,11 +128,32 @@ identities:
       subjects: [michael, katie]
       match: all
       event_date: 2012-09-22
+    mothers_day:
+      display_name: "Mom & Kids"
+      required: [katie]
+      any_of: [asher, lucas, charles]
+      event_rule:
+        month: 5
+        weekday: sunday
+        occurrence: 2
+    fathers_day:
+      display_name: "Dad & Kids"
+      required: [michael]
+      any_of: [asher, lucas, charles]
+      event_rule:
+        month: 6
+        weekday: sunday
+        occurrence: 3
 ```
 
 `match: any` is OR: an asset qualifies when at least one subject appears. `match: all` is AND:
 every subject must appear in the same asset. The query is evaluated independently in each owner's
 face database, the results are combined, and shared duplicates are collapsed by checksum.
+
+For a mixed expression, use `required` plus `any_of`. `required: [katie]` with
+`any_of: [asher, lucas, charles]` means Katie must appear together with at least one listed child:
+`Katie AND (Asher OR Lucas OR Charles)`. Use either `subjects` plus `match`, or
+`required` plus `any_of`, in one group.
 
 The primary `immich.api_key` remains the rendering and upload account. It must be able to read
 every resulting asset, normally through Immich Partner Sharing with the other owners. Each key in
@@ -142,8 +163,11 @@ variables or another environment source; saved config preserves `${...}` placeho
 Copy a Person ID from the UUID in that owner's Immich person page URL. The same real person needs
 one mapping per owner whose face results should participate. An `all` group skips an account unless
 every subject has a Person ID mapped there, preventing a partial match from being treated as AND.
-`birth_date` supplies a subject's annual birthday story date; `event_date` supplies a group's
-annual event, such as an anniversary.
+`birth_date` supplies a subject's annual birthday story date; `event_date` supplies a fixed group
+event, such as an anniversary. `event_rule` describes a floating annual event by month, weekday,
+and occurrence. For example, the second Sunday in May is Mother's Day in the United States, and
+the third Sunday in June is Father's Day. Historical annual-story windows resolve the rule
+separately in every year instead of assuming that the month/day stays fixed.
 
 ## Video analysis
 
@@ -353,6 +377,9 @@ llm:
   # thinking_params:               # what the switch looks like on your server
   #   chat_template_kwargs:        # (default: the Qwen dialect, vLLM/mlx)
   #     enable_thinking: true
+  # no_thinking_params:            # how to say "don't reason" to that server
+  #   chat_template_kwargs:        # (default: the Qwen dialect, vLLM/mlx)
+  #     enable_thinking: false
 ```
 
 **The goal of this product is a fully local process** — your photos analyzed
@@ -387,6 +414,18 @@ matches your server's dialect: the default is Qwen's
 the OpenAI API use `{"reasoning_effort": "medium"}`. Leave `thinking` off
 unless you know the server supports your chosen switch — some
 OpenAI-compatible servers reject unknown request fields.
+
+`no_thinking_params` is the other half, and it matters on servers whose chat
+template reasons by default: not asking for reasoning is not the same as
+asking for none, so bulk analysis reasons anyway, at the small token budget
+those calls ask for, and comes back truncated mid-thought with nothing
+parseable in it. This field is sent on every non-thinking call — it hangs off
+the switch, not off `thinking`, because a server that reasons by default does
+so whether or not you turned reasoning on. The default is Qwen's
+`chat_template_kwargs: {"enable_thinking": false}`; set it to `{}` for servers
+that reason only when asked (the `openai` and `zai` presets already do). A
+server that rejects the field is detected from its 400 and asked without it
+from then on.
 
 Parameter dialects are otherwise handled automatically: OpenAI's reasoning
 models (gpt-5 family) reject `max_tokens` and non-default temperatures, and
@@ -675,6 +714,7 @@ scheduler:
       memory_type: "year_in_review"
       cron: "0 9 15 1 *"
       enabled: true
+      event_only: false           # true: run only on the selected subject/group event date
       upload_to_immich: false
       album_name: "{year} Memories"
       person_names: []

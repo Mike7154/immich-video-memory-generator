@@ -92,6 +92,80 @@ class TestDaemonLoop:
         assert "--upload-to-immich" in cmd
         assert "--album" in cmd
 
+    def test_floating_event_guard_runs_only_on_the_resolved_date(self):
+        from immich_memories.config_loader import Config
+        from immich_memories.scheduling.daemon import event_schedule_matches
+
+        config = Config(
+            identities={
+                "accounts": {"family": {"api_key": "key"}},
+                "subjects": {
+                    "mom": {"display_name": "Mom", "people": {"family": "mom"}},
+                    "child": {"display_name": "Child", "people": {"family": "child"}},
+                },
+                "groups": {
+                    "mothers_day": {
+                        "display_name": "Mom & Kids",
+                        "required": ["mom"],
+                        "any_of": ["child"],
+                        "event_rule": {
+                            "month": 5,
+                            "weekday": "sunday",
+                            "occurrence": 2,
+                        },
+                    }
+                },
+            }
+        )
+        params = {"group": "mothers_day", "annual_story": True}
+
+        with patch("immich_memories.config_loader.get_config", return_value=config):
+            assert event_schedule_matches(
+                params,
+                fire_time=datetime(2026, 5, 10, 8, 0, tzinfo=UTC),
+            )
+            assert not event_schedule_matches(
+                params,
+                fire_time=datetime(2026, 5, 11, 8, 0, tzinfo=UTC),
+            )
+
+    def test_event_only_schedule_skips_subprocess_on_anordinary_day(self):
+        from immich_memories.config_loader import Config
+        from immich_memories.scheduling.daemon import execute_job
+        from immich_memories.scheduling.engine import PendingJob
+
+        config = Config(
+            identities={
+                "accounts": {"family": {"api_key": "key"}},
+                "subjects": {
+                    "lucas": {
+                        "display_name": "Lucas",
+                        "birth_date": "2018-04-10",
+                        "people": {"family": "lucas"},
+                    }
+                },
+            }
+        )
+        entry = ScheduleEntry(
+            name="Lucas birthday",
+            memory_type="person_spotlight",
+            cron="0 8 * * *",
+            event_only=True,
+            params={"subject": "lucas", "annual_story": True},
+        )
+        job = PendingJob(
+            schedule=entry,
+            fire_time=datetime(2026, 4, 9, 8, 0, tzinfo=UTC),
+        )
+
+        with (
+            patch("immich_memories.config_loader.get_config", return_value=config),
+            patch("immich_memories.scheduling.daemon.subprocess") as mock_sub,
+        ):
+            execute_job(job)
+
+        mock_sub.run.assert_not_called()
+
     def test_default_timeout_is_60_minutes(self):
         """Default job timeout should be 3600s (60min), not 1800s."""
         from immich_memories.scheduling.daemon import execute_job

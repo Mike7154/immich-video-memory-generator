@@ -421,6 +421,68 @@ class TestCLIMemoryTypeFlags:
         assert call["use_photos"] is True
         assert call["use_live_photos"] is True
 
+    def test_floating_composite_group_builds_mothers_day_story(self):
+        config = Config(
+            immich={"url": "http://immich.test", "api_key": "primary"},
+            identities={
+                "accounts": {"family": {"api_key": "family-key"}},
+                "subjects": {
+                    "mom": {"display_name": "Mom", "people": {"family": "mom-id"}},
+                    "asher": {"display_name": "Asher", "people": {"family": "asher-id"}},
+                    "lucas": {"display_name": "Lucas", "people": {"family": "lucas-id"}},
+                },
+                "groups": {
+                    "mothers_day": {
+                        "display_name": "Mom & Kids",
+                        "required": ["mom"],
+                        "any_of": ["asher", "lucas"],
+                        "event_rule": {
+                            "month": 5,
+                            "weekday": "sunday",
+                            "occurrence": 2,
+                        },
+                    }
+                },
+            },
+        )
+        primary = MagicMock()
+        primary.__enter__.return_value = primary
+        primary.__exit__.return_value = False
+
+        with (
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=primary),
+            patch(
+                "immich_memories.cli.identity_generation.handle_identity_generation",
+                return_value=(Path("mothers-day.mp4"), False, None),
+            ) as generate_identity,
+        ):
+            result = _invoke(
+                [
+                    "generate",
+                    "--group",
+                    "mothers_day",
+                    "--annual-story",
+                    "--year",
+                    "2026",
+                    "--years-back",
+                    "2",
+                    "--duration",
+                    "600",
+                    "--quiet",
+                ],
+                config=config,
+            )
+
+        assert result.exit_code == 0
+        call = generate_identity.call_args.kwargs
+        assert call["selection"].match == "composite"
+        assert call["selection"].account_clauses["family"] == [
+            ["mom-id", "asher-id"],
+            ["mom-id", "lucas-id"],
+        ]
+        assert call["date_ranges"][0].start.date() == date(2025, 5, 12)
+        assert call["date_ranges"][0].end.date() == date(2026, 5, 10)
+
 
 class TestCLIMemoryTypeResolve:
     """Test memory type date resolution in dry-run mode."""

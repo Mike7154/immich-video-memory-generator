@@ -72,7 +72,7 @@ def run_daemon_loop(
             next_job = jobs[0]
             logger.info(
                 f"Next: '{next_job.schedule.name}' at "
-                f"{next_job.fire_time.strftime('%Y-%m-%d %H:%M UTC')} "
+                f"{next_job.fire_time.strftime('%Y-%m-%d %H:%M %Z')} "
                 f"(in {wait:.0f}s)"
             )
 
@@ -135,6 +135,19 @@ def execute_job(
 ) -> None:
     """Execute a scheduled job by invoking the CLI as a subprocess."""
     params = resolve_schedule_params(job.schedule, job.fire_time)
+    if job.schedule.event_only:
+        try:
+            matches = event_schedule_matches(
+                params,
+                fire_time=job.fire_time,
+                config_path=config_path,
+            )
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            logger.error("Event schedule '%s' is invalid: %s", job.schedule.name, exc)
+            return
+        if not matches:
+            logger.info("Skipping '%s': today is not its configured event", job.schedule.name)
+            return
     logger.info(f"Executing '{job.schedule.name}': {params}")
 
     cmd = build_generation_command(params, config_path=config_path)
@@ -181,6 +194,31 @@ def execute_job(
         error=error_msg,
         config_path=config_path,
     )
+
+
+def event_schedule_matches(
+    params: dict,
+    *,
+    fire_time: datetime,
+    config_path: Path | None = None,
+) -> bool:
+    """Return whether a guarded subject/group schedule falls on this fire date."""
+    from immich_memories.analysis.annual_story import event_occurrence
+    from immich_memories.analysis.identity_source import resolve_identity_selection
+    from immich_memories.config_loader import Config, get_config
+
+    config = Config.from_yaml(config_path) if config_path is not None else get_config()
+    selection = resolve_identity_selection(
+        config.identities,
+        subject=params.get("subject"),
+        group=params.get("group"),
+    )
+    occurrence = event_occurrence(
+        selection.event_date,
+        event_rule=selection.event_rule,
+        year=fire_time.year,
+    )
+    return fire_time.date() == occurrence
 
 
 def build_generation_command(

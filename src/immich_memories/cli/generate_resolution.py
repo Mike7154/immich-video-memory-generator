@@ -188,9 +188,9 @@ def validate_annual_story_options(
         return year
     if selection is None:
         raise click.UsageError("--annual-story requires --subject or --group")
-    if selection.event_date is None:
+    if selection.event_date is None and selection.event_rule is None:
         section = "subjects" if selection.kind == "subject" else "groups"
-        field = "birth_date" if selection.kind == "subject" else "event_date"
+        field = "birth_date" if selection.kind == "subject" else "event_date or event_rule"
         raise click.UsageError(f"Set identities.{section}.{selection.key}.{field} in config.yaml")
     if used := [flag for flag, value in scope_values.items() if value]:
         raise click.UsageError(f"--annual-story defines its own dates; drop {', '.join(used)}")
@@ -213,8 +213,13 @@ def build_annual_story_scope(
         raise click.UsageError(
             f"--annual-story with this selection requires --memory-type {expected_type}"
         )
-    assert selection.event_date is not None
+    assert selection.event_date is not None or selection.event_rule is not None
     assert year is not None
     from immich_memories.analysis.annual_story import annual_story_scope
 
-    return annual_story_scope(selection.event_date, event_year=year, years_back=years_back)
+    return annual_story_scope(
+        selection.event_date,
+        event_rule=selection.event_rule,
+        event_year=year,
+        years_back=years_back,
+    )

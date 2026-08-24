@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from croniter import croniter
 
@@ -26,21 +27,25 @@ class Scheduler:
 
     def __init__(self, config: SchedulerConfig) -> None:
         self.config = config
+        self.timezone = ZoneInfo(config.timezone)
 
     def get_next_jobs(self, now: datetime | None = None) -> list[PendingJob]:
         """Calculate next fire time for each enabled schedule, sorted earliest first."""
         if now is None:
             now = datetime.now(tz=UTC)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        local_now = now.astimezone(self.timezone)
 
         jobs: list[PendingJob] = []
         for entry in self.config.schedules:
             if not entry.enabled:
                 continue
 
-            cron = croniter(entry.cron, now)
+            cron = croniter(entry.cron, local_now)
             fire_time = cron.get_next(datetime)
             if fire_time.tzinfo is None:
-                fire_time = fire_time.replace(tzinfo=UTC)
+                fire_time = fire_time.replace(tzinfo=self.timezone)
 
             jobs.append(PendingJob(schedule=entry, fire_time=fire_time))
 
@@ -51,6 +56,8 @@ class Scheduler:
         """Seconds until the next job should fire. None if no jobs."""
         if now is None:
             now = datetime.now(tz=UTC)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
 
         jobs = self.get_next_jobs(now)
         if not jobs:

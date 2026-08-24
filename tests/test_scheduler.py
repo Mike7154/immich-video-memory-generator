@@ -18,6 +18,7 @@ class TestScheduleEntryConfig:
         assert entry.memory_type == "year_in_review"
         assert entry.cron == "0 9 15 1 *"
         assert entry.enabled
+        assert not entry.event_only
         assert not entry.upload_to_immich
         assert entry.album_name is None
         assert not entry.person_names
@@ -31,6 +32,7 @@ class TestScheduleEntryConfig:
             memory_type="monthly_highlights",
             cron="0 9 1 * *",
             enabled=True,
+            event_only=True,
             upload_to_immich=True,
             album_name="{year} Memories",
             person_names=["Alice"],
@@ -38,6 +40,7 @@ class TestScheduleEntryConfig:
             params={"month": 7, "year": 2024},
         )
         assert entry.album_name == "{year} Memories"
+        assert entry.event_only
         assert entry.person_names == ["Alice"]
         assert entry.params == {"month": 7, "year": 2024}
 
@@ -97,6 +100,26 @@ class TestSchedulerEngine:
         assert next_jobs[0].schedule.name == "daily"
         # Next 9:00 AM UTC after 8:00 AM is same day
         assert next_jobs[0].fire_time == datetime(2024, 7, 15, 9, 0, 0, tzinfo=UTC)
+
+    def test_configured_timezone_controls_local_fire_time(self):
+        from zoneinfo import ZoneInfo
+
+        from immich_memories.scheduling.engine import Scheduler
+        from immich_memories.scheduling.models import ScheduleEntry, SchedulerConfig
+
+        config = SchedulerConfig(
+            enabled=True,
+            timezone="America/Denver",
+            schedules=[
+                ScheduleEntry(name="daily", memory_type="on_this_day", cron="0 8 * * *"),
+            ],
+        )
+        scheduler = Scheduler(config)
+        now = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+
+        next_job = scheduler.get_next_jobs(now)[0]
+
+        assert next_job.fire_time == datetime(2026, 5, 10, 8, 0, tzinfo=ZoneInfo("America/Denver"))
 
     def test_skips_disabled_schedules(self):
         from immich_memories.scheduling.engine import Scheduler

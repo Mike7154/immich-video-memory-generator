@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 from datetime import date
 from typing import Literal
 
@@ -34,13 +35,69 @@ class LogicalSubjectConfig(BaseModel):
     birth_date: date | None = None
 
 
+class FloatingAnnualEventConfig(BaseModel):
+    """A yearly event described by its weekday occurrence within a month."""
+
+    month: int = Field(ge=1, le=12)
+    weekday: Literal["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    occurrence: int = Field(ge=1, le=5)
+
+    def date_for_year(self, year: int) -> date:
+        """Resolve this rule in one year, rejecting an absent fifth occurrence."""
+        weekday_index = {
+            "monday": 0,
+            "tuesday": 1,
+            "wednesday": 2,
+            "thursday": 3,
+            "friday": 4,
+            "saturday": 5,
+            "sunday": 6,
+        }[self.weekday]
+        first = date(year, self.month, 1)
+        day = 1 + (weekday_index - first.weekday()) % 7 + 7 * (self.occurrence - 1)
+        if day > calendar.monthrange(year, self.month)[1]:
+            raise ValueError(
+                f"{self.occurrence} occurrence of {self.weekday} does not exist "
+                f"in {year}-{self.month:02d}"
+            )
+        return date(year, self.month, day)
+
+
 class IdentityGroupConfig(BaseModel):
     """Saved Boolean selection over logical subjects."""
 
     display_name: str
-    subjects: list[str] = Field(min_length=1)
+    subjects: list[str] = Field(default_factory=list)
     match: Literal["any", "all"] = "any"
+    required: list[str] = Field(default_factory=list)
+    any_of: list[str] = Field(default_factory=list)
     event_date: date | None = None
+    event_rule: FloatingAnnualEventConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_boolean_expression(self) -> IdentityGroupConfig:
+        composite = bool(self.required or self.any_of)
+        if self.subjects and composite:
+            raise ValueError("Use either subjects+match or required+any_of, not both")
+        if not self.subjects and not composite:
+            raise ValueError("An identity group needs subjects or required/any_of")
+        if overlap := set(self.required) & set(self.any_of):
+            raise ValueError(
+                "Subjects cannot be both required and any_of: " + ", ".join(sorted(overlap))
+            )
+        if self.event_date is not None and self.event_rule is not None:
+            raise ValueError("Use either event_date or event_rule, not both")
+        return self
+
+    @property
+    def referenced_subjects(self) -> list[str]:
+        """Return every logical subject named by either Boolean syntax."""
+        return [*self.subjects, *self.required, *self.any_of]
+
+    @property
+    def boolean_label(self) -> str:
+        """Human-readable label for selectors without exposing query internals."""
+        return "REQUIRED + ANY" if self.required or self.any_of else self.match.upper()
 
 
 class IdentityConfig(BaseModel):
@@ -65,7 +122,7 @@ class IdentityConfig(BaseModel):
         unknown_subjects = {
             subject
             for group in self.groups.values()
-            for subject in group.subjects
+            for subject in group.referenced_subjects
             if subject not in self.subjects
         }
         if unknown_subjects:

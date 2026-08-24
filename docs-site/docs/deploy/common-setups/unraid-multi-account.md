@@ -101,6 +101,22 @@ identities:
       subjects: [michael, katie]
       match: all
       event_date: 2012-09-22
+    mothers_day:
+      display_name: "Mom & Kids"
+      required: [katie]
+      any_of: [asher, lucas, charles]
+      event_rule:
+        month: 5
+        weekday: sunday
+        occurrence: 2
+    fathers_day:
+      display_name: "Dad & Kids"
+      required: [michael]
+      any_of: [asher, lucas, charles]
+      event_rule:
+        month: 6
+        weekday: sunday
+        occurrence: 3
 ```
 
 Open Immich while signed in as each owner, open a person, and copy the UUID from that person's
@@ -115,6 +131,8 @@ Restart the container after editing the YAML, open its WebUI, and choose:
 
 - **Monthly Highlights → Cross-account people → The Kids (ANY)** for Asher OR Lucas OR Charles.
 - **Multi-Person → Michael & Katie (ALL)** for assets where both appear together.
+- **Multi-Person → Mom & Kids (REQUIRED + ANY)** for Katie with at least one child.
+- **Multi-Person → Dad & Kids (REQUIRED + ANY)** for Michael with at least one child.
 - **Person Spotlight → Lucas (all accounts)** for a birthday memory.
 
 In Step 2, turn **Auto duration** off and set **Target duration (min)**. On the CLI, use seconds:
@@ -141,8 +159,29 @@ immich-memories generate --group anniversary --annual-story --year 2026 \
   --upload-to-immich --album "Anniversary Story 2026"
 ```
 
-The advanced scheduler can run these commands annually. See the scheduler documentation for
-ready-to-paste birthday and anniversary cron entries.
+## 5. Run family events automatically
+
+Add the ready-to-paste guarded schedules from the scheduler documentation to `config.yaml`.
+Each schedule checks daily, while `event_only: true` prevents it from rendering except on the
+configured birthday, anniversary, Mother's Day, Father's Day, or other event.
+
+Create a second Unraid container from the same image for the scheduler:
+
+1. Use a different name, such as `Immich-Memories-Scheduler`.
+2. Reuse the UI container's network, API-key variables, timezone, config mapping, and output
+   mapping.
+3. Do not map port 8080.
+4. In Advanced View, add `--no-healthcheck` to **Extra Parameters**, because this container does
+   not run the UI health endpoint.
+5. Set **Post Arguments** to:
+
+   ```text
+   immich-memories scheduler start --foreground
+   ```
+
+Keep both containers running. The UI container remains the editor and manual generator; the
+scheduler container performs the recurring event checks. Both can continue pulling
+`ghcr.io/mike7154/immich-video-memory-generator:multi-account` through Unraid auto-update.
 
 The first target is five minutes and the second is ten. Title cards and transition overlap are
 part of that budget, so the encoded runtime can differ slightly from the requested target.

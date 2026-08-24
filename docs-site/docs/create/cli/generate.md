@@ -212,6 +212,17 @@ Make a ten-minute anniversary highlight containing Michael AND Katie together:
 immich-memories generate --group anniversary --year 2025 --duration 600
 ```
 
+Mixed groups can require one person while accepting any member of another set. With the example
+configuration, this means Katie AND (Asher OR Lucas OR Charles):
+
+```bash
+immich-memories generate --group mothers_day --annual-story --year 2026 \
+  --years-back 20 --duration 600 --include-photos --include-live-photos
+```
+
+The Father's Day group uses the same expression with Michael as the required person. Floating
+`event_rule` dates are resolved independently for every historical year.
+
 For the complete annual story—each prior anniversary plus the year since the previous
 anniversary—add `--annual-story`. The selected clips are assembled chronologically:
 
@@ -239,8 +250,10 @@ which helps include parties held the evening before or after. Overlaps and partn
 are deduplicated before chronological selection.
 
 `--subject`, `--group`, and `--person` are mutually exclusive. For an `all` group, each retained
-asset must contain every subject; for `any`, one is enough. The duration is the complete video's
-target in seconds and may differ slightly because title cards and transition overlap are budgeted.
+asset must contain every subject; for `any`, one is enough. A `required + any_of` group keeps
+assets containing every required subject together with at least one optional subject. The
+duration is the complete video's target in seconds and may differ slightly because title cards
+and transition overlap are budgeted.
 
 ### Override any preset with custom dates
 

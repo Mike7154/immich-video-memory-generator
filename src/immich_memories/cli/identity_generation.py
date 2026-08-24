@@ -119,6 +119,9 @@ def handle_identity_generation(
             "subject_names": selection.subject_names,
             "annual_story": annual_story,
             "event_date": selection.event_date.isoformat() if selection.event_date else None,
+            "event_rule": (
+                selection.event_rule.model_dump(mode="json") if selection.event_rule else None
+            ),
         },
         source=source,
         memory_key=memory_key,

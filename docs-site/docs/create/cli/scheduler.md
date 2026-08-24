@@ -97,11 +97,15 @@ scheduler:
 
 Cron format: `minute hour day-of-month month day-of-week`. Standard 5-field cron syntax, nothing fancy.
 
-## Scheduled cross-account birthday and anniversary stories
+## Scheduled birthdays, anniversaries, Mother's Day, and Father's Day
 
-Logical subjects and groups can run automatically on their event dates. `duration_minutes` is
-converted to the CLI's seconds internally. These examples pull photos, Live Photos, and videos,
-then upload the chronological result:
+An event schedule can wake up every day and use `event_only: true` to generate only when the
+selected logical subject or group actually occurs. This works for fixed birthdays and
+anniversaries as well as floating rules such as the second Sunday in May. It avoids trying to
+encode floating holidays into cron. `duration_minutes` is converted to the CLI's seconds.
+
+These examples pull photos, Live Photos, and videos, assemble them chronologically, and upload
+the completed memories:
 
 ```yaml
 scheduler:
@@ -110,7 +114,8 @@ scheduler:
   schedules:
     - name: "Lucas birthday story"
       memory_type: "person_spotlight"
-      cron: "0 8 10 4 *"          # April 10 at 8am
+      cron: "0 8 * * *"           # Check every day at 8am
+      event_only: true
       duration_minutes: 5
       upload_to_immich: true
       album_name: "Lucas Birthday Story"
@@ -123,7 +128,8 @@ scheduler:
 
     - name: "Anniversary story"
       memory_type: "multi_person"
-      cron: "0 8 22 9 *"          # September 22 at 8am
+      cron: "0 8 * * *"
+      event_only: true
       duration_minutes: 10
       upload_to_immich: true
       album_name: "Anniversary Story"
@@ -133,7 +139,40 @@ scheduler:
         years_back: 20
         include_photos: true
         include_live_photos: true
+
+    - name: "Mother's Day story"
+      memory_type: "multi_person"
+      cron: "0 8 * * *"
+      event_only: true
+      duration_minutes: 10
+      upload_to_immich: true
+      album_name: "Mother's Day Stories"
+      params:
+        group: mothers_day
+        annual_story: true
+        years_back: 20
+        include_photos: true
+        include_live_photos: true
+
+    - name: "Father's Day story"
+      memory_type: "multi_person"
+      cron: "0 8 * * *"
+      event_only: true
+      duration_minutes: 10
+      upload_to_immich: true
+      album_name: "Father's Day Stories"
+      params:
+        group: fathers_day
+        annual_story: true
+        years_back: 20
+        include_photos: true
+        include_live_photos: true
 ```
 
-The subject needs `birth_date`; the group needs `event_date` and normally uses `match: all` for an
-anniversary. Keep `scheduler start --foreground` running in the container for these cron entries.
+The subject needs `birth_date`. A group needs either a fixed `event_date` or a floating
+`event_rule`. Copy one guarded schedule for every child or other named event. On non-event days,
+the guard exits without starting analysis or rendering.
+
+Keep `immich-memories scheduler start --foreground` running for these entries. In Docker or
+Unraid, run it as a second container using the same image, configuration volume, output volume,
+network, API-key variables, and timezone as the UI container. It does not need a WebUI port.
