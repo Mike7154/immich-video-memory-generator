@@ -96,3 +96,44 @@ scheduler:
 ```
 
 Cron format: `minute hour day-of-month month day-of-week`. Standard 5-field cron syntax, nothing fancy.
+
+## Scheduled cross-account birthday and anniversary stories
+
+Logical subjects and groups can run automatically on their event dates. `duration_minutes` is
+converted to the CLI's seconds internally. These examples pull photos, Live Photos, and videos,
+then upload the chronological result:
+
+```yaml
+scheduler:
+  enabled: true
+  timezone: "America/Denver"
+  schedules:
+    - name: "Lucas birthday story"
+      memory_type: "person_spotlight"
+      cron: "0 8 10 4 *"          # April 10 at 8am
+      duration_minutes: 5
+      upload_to_immich: true
+      album_name: "Lucas Birthday Story"
+      params:
+        subject: lucas
+        annual_story: true
+        years_back: 20
+        include_photos: true
+        include_live_photos: true
+
+    - name: "Anniversary story"
+      memory_type: "multi_person"
+      cron: "0 8 22 9 *"          # September 22 at 8am
+      duration_minutes: 10
+      upload_to_immich: true
+      album_name: "Anniversary Story"
+      params:
+        group: anniversary
+        annual_story: true
+        years_back: 20
+        include_photos: true
+        include_live_photos: true
+```
+
+The subject needs `birth_date`; the group needs `event_date` and normally uses `match: all` for an
+anniversary. Keep `scheduler start --foreground` running in the container for these cron entries.

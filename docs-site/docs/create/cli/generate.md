@@ -32,6 +32,9 @@ immich-memories generate [OPTIONS]
 | `--holiday` | — | text | — | Holiday name or `MM-DD` (with `--memory-type holiday`) |
 | `--from-album` | — | string | — | Generate from an Immich album (name or ID) instead of a date range. See [Album Memories](../memory-types/album-memories). Cannot be combined with any time-period or person flag |
 | `--person` | `-p` | string | — | Person name from Immich face recognition (repeatable: `--person "Alice" --person "Bob"`) |
+| `--subject` | — | string | — | Configured logical person whose face IDs span multiple owner accounts |
+| `--group` | — | string | — | Configured `any`/`all` group of logical people |
+| `--annual-story` | — | flag | off | Add prior event-date windows to the year ending on this birthday or anniversary |
 | `--birthday` | `-b` | flag/string | — | Use birthday-based year. Bare flag auto-detects from Immich; or pass `MM-DD` to override |
 | `--season` | — | choice | — | `spring`, `summer`, `fall`, `autumn`, `winter` (use with `--memory-type season`) |
 | `--month` | — | int | — | Month 1-12 (with `--year`, generates that month; selects trip by month) |
@@ -192,6 +195,52 @@ Narrow a person spotlight to just February:
 ```bash
 immich-memories generate --memory-type person_spotlight --person "Alice" --year 2026 --month 2
 ```
+
+### People across two owner accounts
+
+After defining `identities` in the [config reference](../../reference/config-reference.md#cross-account-identities),
+make a five-minute Kids monthly highlight (Asher OR Lucas OR Charles):
+
+```bash
+immich-memories generate --group kids --year 2026 --month 7 \
+  --include-photos --include-live-photos --duration 300
+```
+
+Make a ten-minute anniversary highlight containing Michael AND Katie together:
+
+```bash
+immich-memories generate --group anniversary --year 2025 --duration 600
+```
+
+For the complete annual story—each prior anniversary plus the year since the previous
+anniversary—add `--annual-story`. The selected clips are assembled chronologically:
+
+```bash
+immich-memories generate --group anniversary --annual-story --year 2026 \
+  --years-back 20 --duration 600 --include-photos --include-live-photos
+```
+
+For one child's birthday, `--birthday` uses the logical subject's configured `birth_date`:
+
+```bash
+immich-memories generate --subject lucas --year 2026 --birthday --duration 600
+```
+
+The analogous birthday story uses the subject's `birth_date`:
+
+```bash
+immich-memories generate --subject lucas --annual-story --year 2026 \
+  --years-back 20 --duration 300 --include-photos --include-live-photos
+```
+
+The rolling portion starts immediately after the previous birthday/anniversary and ends on the
+selected year's event date. Historical event windows use the same ±1-day tolerance as On This Day,
+which helps include parties held the evening before or after. Overlaps and partner-shared copies
+are deduplicated before chronological selection.
+
+`--subject`, `--group`, and `--person` are mutually exclusive. For an `all` group, each retained
+asset must contain every subject; for `any`, one is enough. The duration is the complete video's
+target in seconds and may differ slightly because title cards and transition overlap are budgeted.
 
 ### Override any preset with custom dates
 

@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import sys
-from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import click
 
@@ -30,156 +27,20 @@ from immich_memories.cli._pipeline_runner import (
     run_pipeline_and_generate,
 )
 from immich_memories.cli._trip_generation import handle_trip_generation, resolve_music_arg
+from immich_memories.cli.generate_options import (
+    SHORT_FORM_SECONDS,
+    apply_scalar_overrides,
+    arm_selection_trace,
+    build_annual_story_scope,
+    reject_album_scope_conflicts,
+    resolve_generation_scope,
+    resolve_inclusion,
+    resolve_short_form,
+    validate_annual_story_options,
+)
 from immich_memories.filename_builder import build_memory_output_path, normalize_output_path
 from immich_memories.processing.encoding_plan import resolve_output_selection
 from immich_memories.timeperiod import DateRange, parse_date
-
-if TYPE_CHECKING:
-    from immich_memories.config_loader import Config
-
-
-def _resolve_generation_scope(
-    *,
-    from_album: str | None,
-    year: int | None,
-    start: str | None,
-    end: str | None,
-    period: str | None,
-    birthday: str | None,
-    memory_type: str | None,
-    season: str | None,
-    month: int | None,
-    hemisphere: str,
-    years_back: int | None,
-    on_this_day_target: date | None,
-    holiday: str | None = None,
-) -> tuple[DateRange, list[DateRange]]:
-    """Resolve what a memory covers: date range(s), or an album that defines its own.
-
-    Returns the display range plus the ranges to search. Album mode returns no ranges
-    at all — its span comes from the album's assets, which need a connection to read —
-    so the returned range is a stand-in that album mode replaces and never displays.
-    """
-    if from_album:
-        now = datetime.now()
-        return DateRange(start=now, end=now), []
-
-    # WHY: birthday="auto" means detect from Immich later — don't pass to parser
-    initial_birthday = None if birthday == "auto" else birthday
-    date_result = resolve_date_range(
-        year,
-        start,
-        end,
-        period,
-        initial_birthday,
-        memory_type=memory_type,
-        season=season,
-        month=month,
-        hemisphere=hemisphere,
-        years_back=years_back,
-        on_this_day_target=on_this_day_target,
-        holiday=holiday,
-    )
-
-    # Normalize to single DateRange for display (multi-range for on_this_day)
-    if not isinstance(date_result, list):
-        return date_result, [date_result]
-    if not date_result:
-        print_error("No date ranges generated for On This Day")
-        sys.exit(1)
-    return DateRange(start=date_result[-1].start, end=date_result[0].end), date_result
-
-
-def _reject_album_scope_conflicts(
-    *,
-    year: int | None,
-    start: str | None,
-    end: str | None,
-    period: str | None,
-    birthday: str | None,
-    season: str | None,
-    month: int | None,
-    memory_type: str | None,
-    person_names: list[str] | tuple[str, ...],
-) -> None:
-    """Album mode replaces date-range discovery, so date scoping is meaningless."""
-    conflicts = {
-        "--year": year,
-        "--start": start,
-        "--end": end,
-        "--period": period,
-        "--birthday": birthday,
-        "--season": season,
-        "--month": month,
-        "--memory-type": memory_type,
-        "--person": person_names,
-    }
-    used = sorted(flag for flag, value in conflicts.items() if value)
-    if used:
-        raise click.UsageError(f"--from-album selects its own assets; drop {', '.join(used)}")
-
-
-SHORT_FORM_SECONDS = ("15", "30", "60", "90")
-
-
-@dataclass(frozen=True, slots=True)
-class ShortForm:
-    """What a short-form preset resolves to."""
-
-    duration: float | None
-    orientation: str
-
-
-def resolve_short_form(
-    short_form: str | None,
-    *,
-    duration: float | None,
-    orientation: str,
-    orientation_was_given: bool = False,
-) -> ShortForm:
-    """Apply a short-form preset without overruling anything asked for explicitly.
-
-    The preset is vertical because that is the shape Reels, Shorts and TikTok
-    take, but square short-form is real, so an orientation the user actually
-    typed wins. Same for a duration: the preset fills a gap, it does not argue.
-    """
-    if short_form is None:
-        return ShortForm(duration=duration, orientation=orientation)
-    return ShortForm(
-        duration=duration if duration is not None else int(short_form),
-        orientation=orientation if orientation_was_given else "portrait",
-    )
-
-
-def _apply_scalar_overrides(
-    config: Config,
-    *,
-    photo_duration: float | None,
-    refinement_passes: int | None,
-) -> None:
-    """Let a flag outrank the config file for the dials that have both."""
-    if photo_duration is not None:
-        config.photos.duration = photo_duration
-    if refinement_passes is not None:
-        config.analysis.max_refinement_passes = refinement_passes
-
-
-def resolve_inclusion(flag: bool | None, *, config_enabled: bool) -> bool:
-    """Resolve a content-inclusion choice from an optional CLI flag and config.
-
-    `flag or config_enabled` made the flag one-way: with the feature enabled in
-    config there was no way to ask for a run without it. None means "not
-    specified", so the config decides; an explicit True or False wins.
-    """
-    if flag is None:
-        return config_enabled
-    return flag
-
-
-def _arm_selection_trace(path: Path | None) -> None:
-    """Tell run_selection where to write its stage-by-stage report."""
-    if path:
-        os.environ["IMMICH_MEMORIES_SELECTION_TRACE"] = str(path)
 
 
 def register_generate_commands(main: click.Group) -> None:
@@ -208,6 +69,25 @@ def register_generate_commands(main: click.Group) -> None:
         help="Generate from an Immich album (name or ID) instead of a date range",
     )
     @click.option("--person", "-p", type=str, multiple=True, help="Person name (repeatable)")
+    @click.option(
+        "--subject",
+        type=str,
+        default=None,
+        help="Configured logical person spanning multiple Immich accounts",
+    )
+    @click.option(
+        "--group",
+        "identity_group",
+        type=str,
+        default=None,
+        help="Configured any/all group of logical people",
+    )
+    @click.option(
+        "--annual-story",
+        is_flag=True,
+        default=False,
+        help="Prior event dates plus the year ending on this birthday or anniversary",
+    )
     @click.option(
         "--memory-type",
         type=click.Choice(
@@ -467,6 +347,9 @@ def register_generate_commands(main: click.Group) -> None:
         period: str | None,
         birthday: str | None,
         person: tuple[str, ...],
+        subject: str | None,
+        identity_group: str | None,
+        annual_story: bool,
         memory_type: str | None,
         holiday: str | None,
         season: str | None,
@@ -530,7 +413,7 @@ def register_generate_commands(main: click.Group) -> None:
           --start 2024-01-01 --end 2024-06-30   Custom range
           --start 2024-01-01 --period 6m        Period from start
         """
-        _arm_selection_trace(trace_selection)
+        arm_selection_trace(trace_selection)
 
         from immich_memories.cli._live_display import LiveDisplay, ProgressDisplay, QuietDisplay
 
@@ -547,6 +430,45 @@ def register_generate_commands(main: click.Group) -> None:
             config.output.crf = None  # Let quality preset determine CRF
 
         person_names = list(person) if person else []
+
+        if sum(bool(value) for value in (person_names, subject, identity_group)) > 1:
+            raise click.UsageError("--person, --subject, and --group are mutually exclusive")
+
+        identity_selection = None
+        if subject or identity_group:
+            from immich_memories.analysis.identity_source import resolve_identity_selection
+
+            try:
+                identity_selection = resolve_identity_selection(
+                    config.identities, subject=subject, group=identity_group
+                )
+            except ValueError as exc:
+                raise click.UsageError(str(exc)) from exc
+            person_names = [identity_selection.display_name]
+            if birthday == "auto":
+                if identity_selection.kind != "subject":
+                    raise click.UsageError("Automatic birthday mode requires --subject")
+                if identity_selection.birth_date is None:
+                    raise click.UsageError(
+                        f"Set identities.subjects.{identity_selection.key}.birth_date in config.yaml"
+                    )
+                birthday = identity_selection.birth_date.strftime(BIRTHDAY_FLAG_FORMAT)
+
+        year = validate_annual_story_options(
+            annual_story,
+            selection=identity_selection,
+            year=year,
+            scope_values={
+                "--start": start,
+                "--end": end,
+                "--period": period,
+                "--birthday": birthday,
+                "--month": month,
+                "--season": season,
+                "--holiday": holiday,
+                "--from-album": from_album,
+            },
+        )
 
         if not config.immich.url or not config.immich.api_key:
             print_error("Immich not configured. Run 'immich-memories config' first.")
@@ -572,7 +494,7 @@ def register_generate_commands(main: click.Group) -> None:
                 raise click.UsageError(str(exc)) from exc
 
         if from_album:
-            _reject_album_scope_conflicts(
+            reject_album_scope_conflicts(
                 year=year,
                 start=start,
                 end=end,
@@ -581,30 +503,44 @@ def register_generate_commands(main: click.Group) -> None:
                 season=season,
                 month=month,
                 memory_type=memory_type,
-                person_names=person_names,
+                person_names=person,
+                subject=subject,
+                identity_group=identity_group,
+                annual_story=annual_story,
             )
 
         # Read the memory from the date flags when it was not named. Without
         # this --month did nothing unless --memory-type was also given, so
         # `--year 2025 --month 7` rendered the whole year.
+        if memory_type is None and identity_selection is not None:
+            memory_type = (
+                "person_spotlight" if identity_selection.kind == "subject" else "multi_person"
+            )
         memory_type = infer_memory_type(
             memory_type,
             year=year,
             month=month,
-            has_person=bool(person_names),
+            has_person=bool(person_names or subject or identity_group),
             season=season,
             birthday=birthday,
             from_album=from_album,
         )
 
         # Validate memory type constraints
-        if memory_type in ("person_spotlight", "multi_person") and not person_names:
-            print_error(f"--person is required with --memory-type {memory_type}")
+        if memory_type in ("person_spotlight", "multi_person") and not (
+            person_names or subject or identity_group
+        ):
+            print_error(
+                f"--person, --subject, or --group is required with --memory-type {memory_type}"
+            )
             sys.exit(1)
 
         if memory_type == "trip" and not year:
             print_error("--year is required with --memory-type trip")
             sys.exit(1)
+
+        if identity_selection and memory_type == "trip":
+            raise click.UsageError("Logical subjects and groups do not yet support trip discovery")
 
         if (trip_index is not None or all_trips) and memory_type != "trip":
             print_error("--trip-index and --all-trips require --memory-type trip")
@@ -614,29 +550,40 @@ def register_generate_commands(main: click.Group) -> None:
             print_error("--near-date requires --memory-type trip")
             sys.exit(1)
 
-        if years_back is not None and memory_type not in (
-            "on_this_day",
-            "holiday",
-            "then_and_now",
+        if (
+            years_back is not None
+            and not annual_story
+            and memory_type
+            not in (
+                "on_this_day",
+                "holiday",
+                "then_and_now",
+            )
         ):
             print_error("--years-back requires --memory-type on_this_day, holiday or then_and_now")
             sys.exit(1)
 
-        date_range, date_ranges = _resolve_generation_scope(
-            from_album=from_album,
-            year=year,
-            start=start,
-            end=end,
-            period=period,
-            birthday=birthday,
-            memory_type=memory_type,
-            season=season,
-            month=month,
-            hemisphere=hemisphere,
-            years_back=years_back,
-            on_this_day_target=exact_on_this_day,
-            holiday=holiday,
+        annual_scope = build_annual_story_scope(
+            annual_story, identity_selection, memory_type, year, years_back
         )
+        if annual_scope:
+            date_range, date_ranges = annual_scope
+        else:
+            date_range, date_ranges = resolve_generation_scope(
+                from_album=from_album,
+                year=year,
+                start=start,
+                end=end,
+                period=period,
+                birthday=birthday,
+                memory_type=memory_type,
+                season=season,
+                month=month,
+                hemisphere=hemisphere,
+                years_back=years_back,
+                on_this_day_target=exact_on_this_day,
+                holiday=holiday,
+            )
 
         # Determine output path
         if output:
@@ -662,14 +609,13 @@ def register_generate_commands(main: click.Group) -> None:
             include_live_photos, config_enabled=config.analysis.include_live_photos
         )
         use_photos = resolve_inclusion(include_photos, config_enabled=config.photos.enabled)
-        _apply_scalar_overrides(
+        apply_scalar_overrides(
             config, photo_duration=photo_duration, refinement_passes=refinement_passes
         )
 
         # Analysis depth: CLI override → stored for PipelineConfig
         effective_analysis_depth = analysis_depth or "auto"
 
-        # Infer memory type from context when not explicitly set
         if memory_type is None and person_names:
             memory_type = "person_spotlight" if len(person_names) == 1 else "multi_person"
 
@@ -782,6 +728,60 @@ def register_generate_commands(main: click.Group) -> None:
                             memory_category=memory_category,
                             automation_attempt_id=automation_attempt_id,
                             dry_run=dry_run,
+                        )
+                        return
+
+                    if identity_selection:
+                        from immich_memories.cli.identity_generation import (
+                            handle_identity_generation,
+                        )
+
+                        result_path, should_upload, album_name = handle_identity_generation(
+                            client=client,
+                            config=config,
+                            progress=progress,
+                            selection=identity_selection,
+                            annual_story=annual_story,
+                            date_ranges=date_ranges,
+                            date_range=date_range,
+                            use_live_photos=use_live_photos,
+                            use_photos=use_photos,
+                            analysis_depth=effective_analysis_depth,
+                            duration=duration,
+                            transition=(
+                                transition if transition != "smart" else config.defaults.transition
+                            ),
+                            music=resolve_music_arg(music),
+                            music_volume=music_volume,
+                            no_music=no_music,
+                            output_path=output_path,
+                            resolution=resolution,
+                            orientation=orientation,
+                            scale_mode=scale_mode or config.defaults.scale_mode,
+                            output_format=output_format,
+                            add_date=add_date,
+                            add_place=add_place,
+                            keep_intermediates=keep_intermediates,
+                            privacy_mode=privacy_mode,
+                            title_override=title_override,
+                            subtitle_override=subtitle_override,
+                            llm_title=llm_title,
+                            memory_type=memory_type,
+                            upload_to_immich=upload_to_immich,
+                            album=album,
+                            source=source,
+                            memory_key=memory_key,
+                            memory_category=memory_category,
+                            automation_attempt_id=automation_attempt_id,
+                            dry_run=dry_run,
+                            no_render=no_render,
+                        )
+                        _print_generation_result(
+                            dry_run=dry_run,
+                            no_render=no_render,
+                            result_path=result_path,
+                            should_upload=should_upload,
+                            album_name=album_name,
                         )
                         return
 

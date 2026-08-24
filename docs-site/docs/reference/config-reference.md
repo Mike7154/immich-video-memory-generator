@@ -21,7 +21,7 @@ advanced:
 ```
 
 When reading, both placements work; if a section appears in both places the top-level one wins.
-Everything else (`immich`, `defaults`, `output`, `audio`, `title_screens`, `cache`, `upload`,
+Everything else (`immich`, `identities`, `defaults`, `output`, `audio`, `title_screens`, `cache`, `upload`,
 `trips`, `photos`, `scheduler`) is Tier 1 and stays at the top level.
 Unknown keys *inside* a section are silently ignored; unknown top-level keys and invalid values
 fail validation at startup.
@@ -75,6 +75,75 @@ The compatibility boundary normalizes v2 duration strings and v3 millisecond dur
 seconds, chooses the matching upload fields before any file upload, and emits timezone-aware
 search dates accepted by v3. Run the read-only `immich-memories config test` command to check
 credentials and see the resolved API contract without generating or uploading a memory.
+
+## Cross-account identities
+
+Immich keeps face clusters private to each owner. This section maps each real person to the
+different Person ID assigned by every account, then saves reusable Boolean groups:
+
+```yaml
+identities:
+  accounts:
+    michael:
+      api_key: "${MICHAEL_IMMICH_API_KEY}"
+      # url: "https://photos.example.com"  # omit to reuse immich.url
+      # api_version: auto                  # omit to reuse immich.api_version
+    katie:
+      api_key: "${KATIE_IMMICH_API_KEY}"
+  subjects:
+    michael:
+      display_name: "Michael"
+      birth_date: 1988-02-14
+      people:
+        michael: "PERSON-UUID-FROM-MICHAELS-ACCOUNT"
+        katie: "PERSON-UUID-FROM-KATIES-ACCOUNT"
+    katie:
+      display_name: "Katie"
+      birth_date: 1989-06-08
+      people:
+        michael: "PERSON-UUID-FROM-MICHAELS-ACCOUNT"
+        katie: "PERSON-UUID-FROM-KATIES-ACCOUNT"
+    asher:
+      display_name: "Asher"
+      people:
+        michael: "PERSON-UUID-FROM-MICHAELS-ACCOUNT"
+        katie: "PERSON-UUID-FROM-KATIES-ACCOUNT"
+    lucas:
+      display_name: "Lucas"
+      people:
+        michael: "PERSON-UUID-FROM-MICHAELS-ACCOUNT"
+        katie: "PERSON-UUID-FROM-KATIES-ACCOUNT"
+    charles:
+      display_name: "Charles"
+      people:
+        michael: "PERSON-UUID-FROM-MICHAELS-ACCOUNT"
+        katie: "PERSON-UUID-FROM-KATIES-ACCOUNT"
+  groups:
+    kids:
+      display_name: "The Kids"
+      subjects: [asher, lucas, charles]
+      match: any
+    anniversary:
+      display_name: "Michael & Katie"
+      subjects: [michael, katie]
+      match: all
+      event_date: 2012-09-22
+```
+
+`match: any` is OR: an asset qualifies when at least one subject appears. `match: all` is AND:
+every subject must appear in the same asset. The query is evaluated independently in each owner's
+face database, the results are combined, and shared duplicates are collapsed by checksum.
+
+The primary `immich.api_key` remains the rendering and upload account. It must be able to read
+every resulting asset, normally through Immich Partner Sharing with the other owners. Each key in
+`identities.accounts` is used only to search that owner's private face data. Put secrets in Unraid
+variables or another environment source; saved config preserves `${...}` placeholders.
+
+Copy a Person ID from the UUID in that owner's Immich person page URL. The same real person needs
+one mapping per owner whose face results should participate. An `all` group skips an account unless
+every subject has a Person ID mapped there, preventing a partial match from being treated as AND.
+`birth_date` supplies a subject's annual birthday story date; `event_date` supplies a group's
+annual event, such as an anniversary.
 
 ## Video analysis
 

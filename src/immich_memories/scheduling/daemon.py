@@ -137,27 +137,7 @@ def execute_job(
     params = resolve_schedule_params(job.schedule, job.fire_time)
     logger.info(f"Executing '{job.schedule.name}': {params}")
 
-    cmd = ["immich-memories"]
-    if config_path is not None:
-        cmd.extend(["--config", str(config_path)])
-    cmd.append("generate")
-    cmd.extend(["--memory-type", params["memory_type"]])
-
-    if "year" in params:
-        cmd.extend(["--year", str(params["year"])])
-    if "month" in params:
-        cmd.extend(["--month", str(params["month"])])
-    if "target_date" in params:
-        cmd.extend(["--target-date", str(params["target_date"])])
-    if params.get("upload_to_immich"):
-        cmd.append("--upload-to-immich")
-    if params.get("album_name"):
-        cmd.extend(["--album", params["album_name"]])
-    if params.get("duration_minutes"):
-        cmd.extend(["--duration", str(params["duration_minutes"])])
-    for name in params.get("person_names", []):
-        # WHY: `=` syntax prevents names starting with `-` from being parsed as flags
-        cmd.append(f"--person={name}")
+    cmd = build_generation_command(params, config_path=config_path)
 
     logger.info(f"Running: {' '.join(cmd)}")
     start = time.monotonic()
@@ -201,6 +181,48 @@ def execute_job(
         error=error_msg,
         config_path=config_path,
     )
+
+
+def build_generation_command(
+    params: dict,
+    *,
+    config_path: Path | None = None,
+) -> list[str]:
+    """Translate resolved scheduler parameters into one generate command."""
+    cmd = ["immich-memories"]
+    if config_path is not None:
+        cmd.extend(["--config", str(config_path)])
+    cmd.append("generate")
+    cmd.extend(["--memory-type", params["memory_type"]])
+
+    if "year" in params:
+        cmd.extend(["--year", str(params["year"])])
+    if "month" in params:
+        cmd.extend(["--month", str(params["month"])])
+    if "target_date" in params:
+        cmd.extend(["--target-date", str(params["target_date"])])
+    if params.get("upload_to_immich"):
+        cmd.append("--upload-to-immich")
+    if params.get("album_name"):
+        cmd.extend(["--album", params["album_name"]])
+    if params.get("duration_minutes"):
+        cmd.extend(["--duration", str(params["duration_minutes"] * 60)])
+    if params.get("subject"):
+        cmd.extend(["--subject", str(params["subject"])])
+    if params.get("group"):
+        cmd.extend(["--group", str(params["group"])])
+    if params.get("annual_story"):
+        cmd.append("--annual-story")
+    if params.get("years_back") is not None:
+        cmd.extend(["--years-back", str(params["years_back"])])
+    if params.get("include_photos"):
+        cmd.append("--include-photos")
+    if params.get("include_live_photos"):
+        cmd.append("--include-live-photos")
+    for name in params.get("person_names", []):
+        # WHY: `=` syntax prevents names starting with `-` from being parsed as flags
+        cmd.append(f"--person={name}")
+    return cmd
 
 
 def _notify_if_configured(

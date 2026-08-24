@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from unittest.mock import MagicMock
 
 import immich_memories.ui.pages.step2_loading as step2_loading
 from immich_memories.api.models import Asset, AssetType, VideoClipInfo
 from immich_memories.cache.versions import ANALYSIS_VERSION
 from immich_memories.config_loader import Config
-from immich_memories.ui.pages.step2_loading import _set_initial_selection
+from immich_memories.ui.pages.step1_presets import _apply_preset_to_state
+from immich_memories.ui.pages.step2_loading import _selected_identity, _set_initial_selection
 from immich_memories.ui.state import AppState
 
 
@@ -97,3 +98,68 @@ def test_load_surfaces_only_current_model_cached_analysis() -> None:
     assert current.llm_quality == 0.86
     assert current.audio_categories == ["waves"]
     assert stale.llm_description is None
+
+
+def test_saved_identity_group_is_resolved_for_web_discovery() -> None:
+    state = AppState(
+        config=Config(
+            identities={
+                "accounts": {"one": {"api_key": "one-key"}},
+                "subjects": {
+                    "michael": {"display_name": "Michael", "people": {"one": "m-id"}},
+                    "katie": {"display_name": "Katie", "people": {"one": "k-id"}},
+                },
+                "groups": {
+                    "parents": {
+                        "display_name": "Michael & Katie",
+                        "subjects": ["michael", "katie"],
+                        "match": "all",
+                    }
+                },
+            }
+        ),
+        memory_preset_params={"identity_group": "parents"},
+    )
+
+    selection = _selected_identity(state)
+
+    assert selection is not None
+    assert selection.display_name == "Michael & Katie"
+    assert selection.match == "all"
+
+
+def test_web_anniversary_story_builds_history_plus_latest_year(monkeypatch) -> None:
+    state = AppState(
+        config=Config(
+            identities={
+                "accounts": {"one": {"api_key": "one-key"}},
+                "subjects": {
+                    "michael": {"display_name": "Michael", "people": {"one": "m-id"}},
+                    "katie": {"display_name": "Katie", "people": {"one": "k-id"}},
+                },
+                "groups": {
+                    "anniversary": {
+                        "display_name": "Michael & Katie",
+                        "subjects": ["michael", "katie"],
+                        "match": "all",
+                        "event_date": "2012-09-22",
+                    }
+                },
+            }
+        ),
+        memory_preset_params={
+            "identity_group": "anniversary",
+            "annual_story": True,
+            "year": 2026,
+            "years_back": 3,
+        },
+    )
+    monkeypatch.setattr("immich_memories.ui.pages.step1_presets.get_app_state", lambda: state)
+
+    from immich_memories.memory_types.registry import MemoryType
+
+    _apply_preset_to_state(MemoryType.MULTI_PERSON)
+
+    assert len(state.date_ranges) == 4
+    assert state.date_ranges[0].start.date() == date(2025, 9, 23)
+    assert state.target_duration == 5

@@ -32,6 +32,7 @@ from immich_memories.config_models_automation import (
     TripsConfig,
     UploadConfig,
 )
+from immich_memories.config_models_identity import IdentityConfig
 from immich_memories.config_models_llm import LLMConfig  # noqa: F401
 from immich_memories.config_models_render import (
     DefaultsConfig,
@@ -146,20 +147,23 @@ _CREDENTIAL_ENV_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 def _feeder_env_vars(path: str) -> tuple[str, ...]:
-    section, _, field = path.partition(".")
-    settings_name = f"IMMICH_MEMORIES_{section.upper()}__{field.upper()}"
+    settings_name = f"IMMICH_MEMORIES_{path.upper().replace('.', '__')}"
     return (*_CREDENTIAL_ENV_ALIASES.get(path, ()), settings_name)
 
 
 def _credential_templates(data: dict) -> dict[str, str]:
     """Record the `${VAR}` forms written in the file before expansion loses them."""
     templates: dict[str, str] = {}
-    for section, values in data.items():
-        if not isinstance(values, dict):
-            continue
+
+    def visit(values: dict, prefix: str = "") -> None:
         for field, value in values.items():
+            path = f"{prefix}.{field}" if prefix else field
             if field in CREDENTIAL_FIELD_NAMES and isinstance(value, str) and "$" in value:
-                templates[f"{section}.{field}"] = value
+                templates[path] = value
+            elif isinstance(value, dict):
+                visit(value, path)
+
+    visit(data)
     return templates
 
 
@@ -182,14 +186,17 @@ def _keep_env_secrets_out(data: dict, templates: dict[str, str]) -> None:
     disk by pressing Save -- the file outlives the container that had the env
     var, and it is the one artifact most likely to be copied or backed up.
     """
-    for section, values in data.items():
-        if not isinstance(values, dict):
-            continue
+
+    def visit(values: dict, prefix: str = "") -> None:
         for field, value in values.items():
-            if field not in CREDENTIAL_FIELD_NAMES or not isinstance(value, str):
-                continue
-            if replacement := _text_to_persist(f"{section}.{field}", value, templates):
-                values[field] = replacement
+            path = f"{prefix}.{field}" if prefix else field
+            if field in CREDENTIAL_FIELD_NAMES and isinstance(value, str):
+                if replacement := _text_to_persist(path, value, templates):
+                    values[field] = replacement
+            elif isinstance(value, dict):
+                visit(value, path)
+
+    visit(data)
 
 
 class Config(BaseSettings):
@@ -221,6 +228,7 @@ class Config(BaseSettings):
 
     server: ServerConfig = Field(default_factory=ServerConfig)
     immich: ImmichConfig = Field(default_factory=ImmichConfig)
+    identities: IdentityConfig = Field(default_factory=IdentityConfig)
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)

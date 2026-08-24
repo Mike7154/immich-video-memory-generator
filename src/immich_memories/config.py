@@ -23,6 +23,12 @@ from immich_memories.config_models_analysis import (  # noqa: F401
     AudioContentConfig,
     ContentAnalysisConfig,
 )
+from immich_memories.config_models_identity import (  # noqa: F401
+    IdentityAccountConfig,
+    IdentityConfig,
+    IdentityGroupConfig,
+    LogicalSubjectConfig,
+)
 from immich_memories.config_models_llm import LLMConfig  # noqa: F401
 from immich_memories.config_models_render import (  # noqa: F401
     DefaultsConfig,
@@ -48,7 +54,11 @@ __all__ = [
     "DefaultsConfig",
     "HardwareAccelConfig",
     "ImmichConfig",
+    "IdentityAccountConfig",
+    "IdentityConfig",
+    "IdentityGroupConfig",
     "LLMConfig",
+    "LogicalSubjectConfig",
     "MusicGenConfig",
     "OutputConfig",
     "PhotoConfig",

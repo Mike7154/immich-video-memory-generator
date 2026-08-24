@@ -136,6 +136,62 @@ def _render_params(key: str) -> None:
         elif memory_type == MemoryType.ALBUM:
             _render_album_picker()
 
+        if memory_type not in {
+            MemoryType.PERSON_SPOTLIGHT,
+            MemoryType.MULTI_PERSON,
+            MemoryType.TRIP,
+            MemoryType.ALBUM,
+        }:
+            _render_saved_identity_filter(memory_type)
+
+
+def _render_saved_identity_filter(memory_type: MemoryType) -> None:
+    """Offer configured cross-account subjects and groups as an optional filter."""
+    state = get_app_state()
+    if state.config is None:
+        return
+    identities = state.config.identities
+    options = {"": "All people"}
+    options.update(
+        {
+            f"subject:{key}": f"{subject.display_name} (all accounts)"
+            for key, subject in identities.subjects.items()
+        }
+    )
+    options.update(
+        {
+            f"group:{key}": f"{group.display_name} ({group.match.upper()})"
+            for key, group in identities.groups.items()
+        }
+    )
+    if len(options) == 1:
+        return
+
+    current = ""
+    if key := state.memory_preset_params.get("identity_subject"):
+        current = f"subject:{key}"
+    elif key := state.memory_preset_params.get("identity_group"):
+        current = f"group:{key}"
+
+    def on_identity(event):
+        state.memory_preset_params.pop("identity_subject", None)
+        state.memory_preset_params.pop("identity_group", None)
+        state.memory_preset_params.pop("person_names", None)
+        state.selected_person = None
+        if event.value:
+            kind, key = event.value.split(":", 1)
+            state.memory_preset_params[f"identity_{kind}"] = key
+            source = identities.subjects[key] if kind == "subject" else identities.groups[key]
+            state.memory_preset_params["person_names"] = [source.display_name]
+        _apply_preset_to_state(memory_type)
+
+    ui.select(
+        options=options,
+        label="Cross-account people (optional)",
+        value=current,
+        on_change=on_identity,
+    ).classes("w-72 mt-3")
+
 
 def _render_holiday_params() -> None:
     """Holiday + year + how many years back to span."""
@@ -306,6 +362,7 @@ def _render_person_spotlight_params() -> None:
     state = get_app_state()
     named_people = [p for p in state.people if p.name]
     name_to_person = {p.name: p for p in named_people}
+    logical_subjects = state.config.identities.subjects if state.config else {}
 
     with ui.row().classes("gap-4 items-end flex-wrap"):
         year_options = state.years or list(range(2024, 2019, -1))
@@ -323,13 +380,26 @@ def _render_person_spotlight_params() -> None:
             "w-36"
         )
 
-        person_names = [p.name for p in named_people]
+        person_options = {p.name: p.name for p in named_people}
+        person_options.update(
+            {
+                f"identity:{key}": f"{subject.display_name} (all accounts)"
+                for key, subject in logical_subjects.items()
+            }
+        )
         saved_person_id = state.memory_preset_params.get("person_id")
-        current_name = next((p.name for p in named_people if p.id == saved_person_id), None)
+        saved_subject = state.memory_preset_params.get("identity_subject")
+        current_name = (
+            f"identity:{saved_subject}"
+            if saved_subject
+            else next((p.name for p in named_people if p.id == saved_person_id), None)
+        )
 
         def on_person(e):
+            state.memory_preset_params.pop("identity_subject", None)
             selected = name_to_person.get(e.value)
             if selected:
+                state.memory_preset_params.pop("annual_story", None)
                 state.memory_preset_params["person_id"] = selected.id
                 state.memory_preset_params["person_names"] = [selected.name]
                 state.selected_person = selected
@@ -337,10 +407,20 @@ def _render_person_spotlight_params() -> None:
                 if hasattr(selected, "birth_date") and selected.birth_date:
                     state.memory_preset_params["use_birthday"] = True
                     state.memory_preset_params["birthday"] = selected.birth_date
+            elif isinstance(e.value, str) and e.value.startswith("identity:"):
+                key = e.value.split(":", 1)[1]
+                subject = logical_subjects[key]
+                state.memory_preset_params.pop("person_id", None)
+                state.memory_preset_params["identity_subject"] = key
+                state.memory_preset_params["person_names"] = [subject.display_name]
+                state.selected_person = None
+                if subject.birth_date:
+                    state.memory_preset_params["use_birthday"] = True
+                    state.memory_preset_params["birthday"] = subject.birth_date
             _apply_preset_to_state(MemoryType.PERSON_SPOTLIGHT)
 
         ui.select(
-            options=person_names,
+            options=person_options,
             label="Person",
             value=current_name,
             on_change=on_person,
@@ -357,6 +437,17 @@ def _render_person_spotlight_params() -> None:
         on_change=on_birthday_toggle,
     ).classes("mt-2").tooltip("Year runs from birthday to birthday instead of January to December")
 
+    def on_annual_story(e):
+        state.memory_preset_params["annual_story"] = e.value
+        state.memory_preset_params["use_birthday"] = False
+        _apply_preset_to_state(MemoryType.PERSON_SPOTLIGHT)
+
+    ui.checkbox(
+        "Annual birthday story: prior birthdays + the latest year",
+        value=state.memory_preset_params.get("annual_story", False),
+        on_change=on_annual_story,
+    ).classes("mt-2")
+
     state.memory_preset_params.setdefault("year", saved_year)
     _apply_preset_to_state(MemoryType.PERSON_SPOTLIGHT)
 
@@ -366,6 +457,35 @@ def _render_multi_person_params() -> None:
     state = get_app_state()
     named_people = [p for p in state.people if p.name]
     name_to_person = {p.name: p for p in named_people}
+    logical_groups = state.config.identities.groups if state.config else {}
+
+    if logical_groups:
+        group_options = {"": "Choose people manually"}
+        group_options.update(
+            {
+                key: f"{group.display_name} ({group.match.upper()})"
+                for key, group in logical_groups.items()
+            }
+        )
+
+        def on_group(event):
+            state.memory_preset_params.pop("identity_group", None)
+            if event.value:
+                group = logical_groups[event.value]
+                state.memory_preset_params["identity_group"] = event.value
+                state.memory_preset_params["person_ids"] = []
+                state.memory_preset_params["person_names"] = [group.display_name]
+                state.selected_person = None
+            else:
+                state.memory_preset_params.pop("annual_story", None)
+            _apply_preset_to_state(MemoryType.MULTI_PERSON)
+
+        ui.select(
+            options=group_options,
+            label="Saved cross-account group",
+            value=state.memory_preset_params.get("identity_group", ""),
+            on_change=on_group,
+        ).classes("w-72 mb-3")
 
     with ui.row().classes("gap-4 items-end flex-wrap"):
         year_options = state.years or list(range(2024, 2019, -1))
@@ -389,6 +509,8 @@ def _render_multi_person_params() -> None:
         def on_people(e):
             selected_names = list(e.value) if e.value else []
             selected = [name_to_person[n] for n in selected_names if n in name_to_person]
+            state.memory_preset_params.pop("identity_group", None)
+            state.memory_preset_params.pop("annual_story", None)
             state.memory_preset_params["person_ids"] = [p.id for p in selected]
             state.memory_preset_params["person_names"] = [p.name for p in selected]
             _apply_preset_to_state(MemoryType.MULTI_PERSON)
@@ -400,6 +522,16 @@ def _render_multi_person_params() -> None:
             on_change=on_people,
             multiple=True,
         ).props("use-chips").classes("w-64")
+
+    def on_annual_story(e):
+        state.memory_preset_params["annual_story"] = e.value
+        _apply_preset_to_state(MemoryType.MULTI_PERSON)
+
+    ui.checkbox(
+        "Annual anniversary story: prior anniversaries + the latest year",
+        value=state.memory_preset_params.get("annual_story", False),
+        on_change=on_annual_story,
+    ).classes("mt-2")
 
     state.memory_preset_params.setdefault("year", saved_year)
     _apply_preset_to_state(MemoryType.MULTI_PERSON)
@@ -657,6 +789,33 @@ def _apply_preset_to_state(memory_type: MemoryType) -> None:
 
     state = get_app_state()
     params = state.memory_preset_params
+
+    if params.get("annual_story"):
+        try:
+            from datetime import date
+
+            from immich_memories.analysis.annual_story import annual_story_scope
+            from immich_memories.analysis.identity_source import resolve_identity_selection
+
+            selection = resolve_identity_selection(
+                state.config.identities,
+                subject=params.get("identity_subject"),
+                group=params.get("identity_group"),
+            )
+            if selection.event_date is None:
+                raise ValueError(f"No event date configured for {selection.display_name}")
+            _display, state.date_ranges = annual_story_scope(
+                selection.event_date,
+                event_year=int(params.get("year") or date.today().year),
+                years_back=params.get("years_back"),
+            )
+            state.target_duration = 5
+            state.duration_mode = "auto"
+            return
+        except (AttributeError, TypeError, ValueError) as exc:
+            state.date_ranges = []
+            logger.debug("Annual story not ready yet: %s", exc)
+            return
 
     # "All Time" → wide date range covering all years
     if params.get("year") == 0:

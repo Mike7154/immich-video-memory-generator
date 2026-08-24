@@ -136,6 +136,8 @@ src/immich_memories/
 │   ├── trip_detection.py       # GPS-based trip detection (clustering, geocoding)
 │   ├── special_day.py          # Which days had something happen: active hours, not photo volume
 │   ├── album_source.py         # Album mode: the album is the candidate pool, nothing is searched for
+│   ├── identity_source.py      # Logical people: per-owner face queries, ANY/ALL union, checksum dedup
+│   ├── annual_story.py         # Prior event-day windows plus the latest birthday/anniversary year
 │   ├── source_filter.py        # Drop doorbell / dashcam / screen-recorder uploads by filename
 │   ├── source_quality.py       # Drop messaging re-encodes: sub-1080p with no camera EXIF
 │   ├── subject_policy.py       # What a clip is of (people / scenery / animal / object) and how much fits
@@ -279,6 +281,8 @@ src/immich_memories/
 ├── cli/                        # Command-line interface (Click)
 │   ├── __init__.py             # Main CLI group + `ui` command
 │   ├── generate.py             # `generate`
+│   ├── generate_options.py     # Date scope, short-form, and inclusion option resolution
+│   ├── identity_generation.py  # Cross-account discovery handoff to the normal render pipeline
 │   ├── _analyze_export.py      # `analyze`, `export-project`
 │   ├── config_cmd.py           # `config`, `people`, `years`, `preflight`
 │   ├── scheduler_cmd.py        # `scheduler list/status/start`
@@ -396,6 +400,7 @@ src/immich_memories/
 │
 ├── config.py                   # YAML configuration management (re-exports)
 ├── config_loader.py            # Config loading logic
+├── config_models_identity.py   # Account credentials, logical people, and ANY/ALL groups
 ├── config_presets.py           # Named presets (`preset: fast`) that fill several knobs at once
 ├── config_models.py            # Resources a run uses: Immich server, cache, hardware (+ expand_env_vars)
 ├── config_models_analysis.py   # What the pipeline learns: analysis, content, audio events, speech, transcription

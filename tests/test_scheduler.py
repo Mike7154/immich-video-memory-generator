@@ -180,6 +180,31 @@ class TestJobExecutor:
         assert params["memory_type"] == "year_in_review"
         assert params["year"] == 2024  # previous year
 
+    def test_build_annual_anniversary_command(self):
+        from immich_memories.scheduling.daemon import build_generation_command
+
+        cmd = build_generation_command(
+            {
+                "memory_type": "multi_person",
+                "year": 2026,
+                "group": "anniversary",
+                "annual_story": True,
+                "years_back": 20,
+                "duration_minutes": 10,
+                "include_photos": True,
+                "include_live_photos": True,
+                "upload_to_immich": True,
+                "album_name": "Anniversary",
+            }
+        )
+
+        assert "--group" in cmd
+        assert "anniversary" in cmd
+        assert "--annual-story" in cmd
+        assert cmd[cmd.index("--duration") + 1] == "600"
+        assert "--include-photos" in cmd
+        assert "--include-live-photos" in cmd
+
     def test_resolve_monthly_highlights(self):
         """Monthly highlights should auto-fill year and month from fire time."""
         from immich_memories.scheduling.executor import resolve_schedule_params

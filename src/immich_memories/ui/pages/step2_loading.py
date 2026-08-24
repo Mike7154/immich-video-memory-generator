@@ -11,6 +11,14 @@ from immich_memories.analysis.cache_projection import (
     apply_cached_segment,
     is_compatible_analysis_cache,
 )
+from immich_memories.analysis.identity_source import (
+    IdentitySelection,
+    fetch_identity_live_photos,
+    fetch_identity_photos,
+    fetch_identity_videos,
+    open_identity_clients,
+    resolve_identity_selection,
+)
 from immich_memories.analysis.live_photo_pipeline import fetch_live_photo_clips
 from immich_memories.api.immich import SyncImmichClient
 from immich_memories.api.models import VideoClipInfo
@@ -39,6 +47,17 @@ def _ui_phase(
 
 
 MIN_CLIP_DURATION = 1.5
+
+
+def _selected_identity(state) -> IdentitySelection | None:
+    """Resolve the saved logical subject or group selected in Step 1."""
+    if state.config is None:
+        return None
+    subject = state.memory_preset_params.get("identity_subject")
+    group = state.memory_preset_params.get("identity_group")
+    if not subject and not group:
+        return None
+    return resolve_identity_selection(state.config.identities, subject=subject, group=group)
 
 
 def _fetch_album(state) -> tuple[list[VideoClipInfo], list]:
@@ -93,6 +112,10 @@ def _dedup_by_id(assets: list) -> list:
 
 def _fetch_assets(state) -> list:
     """Blocking: fetch video assets from Immich API, one query per window."""
+    if selection := _selected_identity(state):
+        with open_identity_clients(state.config, selection) as clients:
+            return fetch_identity_videos(selection, clients, state.date_ranges)
+
     with SyncImmichClient(
         base_url=state.immich_url,
         api_key=state.immich_api_key,
@@ -148,6 +171,10 @@ def _build_clips(assets: list) -> tuple[list[VideoClipInfo], int]:
 
 def _fetch_photos(state) -> list:
     """Fetch photo assets (blocking), one query per window."""
+    if selection := _selected_identity(state):
+        with open_identity_clients(state.config, selection) as clients:
+            return fetch_identity_photos(selection, clients, state.date_ranges)
+
     person_id = state.selected_person.id if state.selected_person else None
     multi_ids = state.memory_preset_params.get("person_ids", [])
     with SyncImmichClient(
@@ -169,6 +196,12 @@ def _fetch_photos(state) -> list:
 
 def _fetch_live_photos(state) -> tuple[list[VideoClipInfo], set[str]]:
     """Fetch live photo clips (blocking), one query per window."""
+    if selection := _selected_identity(state):
+        with open_identity_clients(state.config, selection) as clients:
+            return fetch_identity_live_photos(
+                selection, clients, state.date_ranges, config=state.config
+            )
+
     lp_person_id = state.selected_person.id if state.selected_person else None
     multi_ids = state.memory_preset_params.get("person_ids", [])
 

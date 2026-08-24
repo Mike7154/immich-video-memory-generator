@@ -222,6 +222,205 @@ class TestCLIMemoryTypeFlags:
         result = _invoke(["generate", "--help"])
         assert "--person" in result.output
 
+    def test_logical_subject_and_group_flags_are_listed(self):
+        """Cross-account identity selection is discoverable from CLI help."""
+        result = _invoke(["generate", "--help"])
+
+        assert "--subject" in result.output
+        assert "--group" in result.output
+
+    def test_logical_subject_and_group_are_mutually_exclusive(self):
+        """One run has one configured logical identity source."""
+        config = Config(immich={"url": "http://immich.test", "api_key": "primary"})
+
+        result = _invoke(
+            ["generate", "--year", "2026", "--subject", "lucas", "--group", "kids"],
+            config=config,
+        )
+
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output
+
+    def test_logical_all_group_reaches_generation_with_requested_duration(self):
+        """A saved AND group retains both its Boolean mode and duration override."""
+        config = Config(
+            immich={"url": "http://immich.test", "api_key": "primary"},
+            identities={
+                "accounts": {
+                    "michael": {"api_key": "m-key"},
+                    "katie": {"api_key": "k-key"},
+                },
+                "subjects": {
+                    "michael": {
+                        "display_name": "Michael",
+                        "birth_date": "1988-02-14",
+                        "people": {"michael": "m-self", "katie": "k-michael"},
+                    },
+                    "katie": {
+                        "display_name": "Katie",
+                        "people": {"michael": "m-katie", "katie": "k-self"},
+                    },
+                },
+                "groups": {
+                    "parents": {
+                        "display_name": "Michael & Katie",
+                        "subjects": ["michael", "katie"],
+                        "match": "all",
+                        "event_date": "2012-09-22",
+                    }
+                },
+            },
+        )
+        primary = MagicMock()
+        primary.__enter__.return_value = primary
+        primary.__exit__.return_value = False
+
+        # WHY: the test verifies CLI-to-generation plumbing without opening a real
+        # Immich connection or running the expensive media pipeline.
+        with (
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=primary),
+            patch(
+                "immich_memories.cli.identity_generation.handle_identity_generation",
+                return_value=(Path("parents.mp4"), False, None),
+            ) as generate_identity,
+        ):
+            result = _invoke(
+                [
+                    "generate",
+                    "--year",
+                    "2026",
+                    "--group",
+                    "parents",
+                    "--duration",
+                    "180",
+                    "--dry-run",
+                    "--quiet",
+                ],
+                config=config,
+            )
+
+        assert result.exit_code == 0
+        call = generate_identity.call_args.kwargs
+        assert call["selection"].match == "all"
+        assert call["duration"] == 180
+
+    def test_annual_story_combines_history_and_latest_year_for_and_group(self):
+        """Anniversary discovery keeps AND matching across every event window."""
+        config = Config(
+            immich={"url": "http://immich.test", "api_key": "primary"},
+            identities={
+                "accounts": {"family": {"api_key": "family-key"}},
+                "subjects": {
+                    "michael": {
+                        "display_name": "Michael",
+                        "people": {"family": "michael-id"},
+                    },
+                    "katie": {
+                        "display_name": "Katie",
+                        "people": {"family": "katie-id"},
+                    },
+                },
+                "groups": {
+                    "anniversary": {
+                        "display_name": "Michael & Katie",
+                        "subjects": ["michael", "katie"],
+                        "match": "all",
+                        "event_date": "2012-09-22",
+                    }
+                },
+            },
+        )
+        primary = MagicMock()
+        primary.__enter__.return_value = primary
+        primary.__exit__.return_value = False
+
+        with (
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=primary),
+            patch(
+                "immich_memories.cli.identity_generation.handle_identity_generation",
+                return_value=(Path("anniversary.mp4"), False, None),
+            ) as generate_identity,
+        ):
+            result = _invoke(
+                [
+                    "generate",
+                    "--group",
+                    "anniversary",
+                    "--annual-story",
+                    "--year",
+                    "2026",
+                    "--years-back",
+                    "4",
+                    "--duration",
+                    "600",
+                    "--include-photos",
+                    "--quiet",
+                ],
+                config=config,
+            )
+
+        assert result.exit_code == 0
+        call = generate_identity.call_args.kwargs
+        assert call["selection"].match == "all"
+        assert call["annual_story"] is True
+        assert call["duration"] == 600
+        assert call["use_photos"] is True
+        assert len(call["date_ranges"]) == 5
+        assert call["date_ranges"][0].start.date() == date(2025, 9, 23)
+
+    def test_annual_birthday_story_uses_subject_birth_date(self):
+        config = Config(
+            immich={"url": "http://immich.test", "api_key": "primary"},
+            identities={
+                "accounts": {"family": {"api_key": "family-key"}},
+                "subjects": {
+                    "lucas": {
+                        "display_name": "Lucas",
+                        "birth_date": "2018-04-10",
+                        "people": {"family": "lucas-id"},
+                    }
+                },
+            },
+        )
+        primary = MagicMock()
+        primary.__enter__.return_value = primary
+        primary.__exit__.return_value = False
+
+        with (
+            patch("immich_memories.api.immich.SyncImmichClient", return_value=primary),
+            patch(
+                "immich_memories.cli.identity_generation.handle_identity_generation",
+                return_value=(Path("lucas.mp4"), False, None),
+            ) as generate_identity,
+        ):
+            result = _invoke(
+                [
+                    "generate",
+                    "--subject",
+                    "lucas",
+                    "--annual-story",
+                    "--year",
+                    "2026",
+                    "--years-back",
+                    "3",
+                    "--duration",
+                    "300",
+                    "--include-photos",
+                    "--include-live-photos",
+                    "--quiet",
+                ],
+                config=config,
+            )
+
+        assert result.exit_code == 0
+        call = generate_identity.call_args.kwargs
+        assert call["selection"].kind == "subject"
+        assert call["selection"].event_date == date(2018, 4, 10)
+        assert call["annual_story"] is True
+        assert call["duration"] == 300
+        assert call["use_photos"] is True
+        assert call["use_live_photos"] is True
+
 
 class TestCLIMemoryTypeResolve:
     """Test memory type date resolution in dry-run mode."""
