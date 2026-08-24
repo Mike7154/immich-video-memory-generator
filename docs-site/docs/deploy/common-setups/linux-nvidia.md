@@ -69,7 +69,6 @@ services:
     environment:
       IMMICH_URL: "${IMMICH_URL}"
       IMMICH_API_KEY: "${IMMICH_API_KEY}"
-      IMMICH_MEMORIES_OUTPUT__DIRECTORY: /app/output   # default is ~/Videos/Memories, outside every volume
       NVIDIA_DRIVER_CAPABILITIES: compute,video,utility   # `video` = NVENC/NVDEC libraries
     restart: unless-stopped
     deploy:
@@ -91,10 +90,8 @@ The port is published on loopback only. A GPU box is usually headless, so either
 [authentication](../configuration/authentication) first — the app holds an Immich API key to your
 whole photo library — then change the mapping to `"8080:8080"`.
 
-Two things the compose file cannot do for you:
+One thing the compose file cannot do for you:
 
-- **Output directory**: without `IMMICH_MEMORIES_OUTPUT__DIRECTORY` the videos are written to
-  `/home/immich/Videos/Memories` inside the container and vanish with it.
 - **Bind-mount ownership**: the container runs as UID/GID 1000. Create the output directory
   yourself (`mkdir -p output`; `chown 1000:1000 output` if your user isn't 1000) or Docker
   creates it as root and the app cannot write there. See
