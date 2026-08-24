@@ -11,13 +11,77 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from immich_memories.cli._helpers import print_success
+from immich_memories.cli._helpers import print_info, print_success, print_warning
 from immich_memories.timeperiod import DateRange
 
 if TYPE_CHECKING:
     from immich_memories.api.immich import SyncImmichClient
     from immich_memories.cli._live_display import ProgressDisplay
     from immich_memories.config_loader import Config
+
+
+def _window_label(date_range: DateRange) -> str:
+    """Name a window by its year, or by its dates when it is not a whole one."""
+    if date_range.start.year == date_range.end.year:
+        whole_year = (date_range.start.month, date_range.start.day) == (1, 1) and (
+            date_range.end.month,
+            date_range.end.day,
+        ) == (12, 31)
+        if whole_year:
+            return str(date_range.start.year)
+    return f"{date_range.start:%Y-%m-%d}..{date_range.end:%Y-%m-%d}"
+
+
+def _anchor_name(assets: list, person_ids: list[str]) -> str | None:
+    """The display name of the single person this fetch was narrowed to.
+
+    Read off whichever window did return material: Immich filters server-side,
+    so the empty window holds no Person object to take the name from.
+    """
+    if len(person_ids) != 1:
+        return None
+    wanted = person_ids[0]
+    for asset in assets:
+        for person in getattr(asset, "people", None) or []:
+            if person.id == wanted and getattr(person, "name", None):
+                return str(person.name)
+    return None
+
+
+def _empty_window_warning(label: str, anchor: str | None) -> str:
+    """Two different diagnoses that look identical from the count alone.
+
+    An unfiltered window with nothing in it means the library has nothing from
+    that period. A window narrowed to one person means the period is fine and
+    *they* are not in it — which is the memory type failing, not the library.
+    """
+    if anchor:
+        return (
+            f"{anchor} does not appear in {label} — a memory anchored on them "
+            f"cannot span both windows"
+        )
+    return f"no videos found for {label} — that window contributes nothing"
+
+
+def _report_per_window(assets: list, date_ranges: list[DateRange], person_ids: list[str]) -> None:
+    """Say what each window contributed, and shout when one contributed nothing.
+
+    A combined total hides the failure that matters on a multi-window memory: a
+    then-and-now whose older half is empty still renders, as a memory of the
+    recent half alone, and without this it looks like a clean run.
+    """
+    if len(date_ranges) < 2:
+        return
+
+    from immich_memories.memory_types.eras import count_by_era
+
+    counts = count_by_era([a.file_created_at for a in assets], date_ranges)
+    labels = [_window_label(r) for r in date_ranges]
+    anchor = _anchor_name(assets, person_ids)
+    print_info(" · ".join(f"{label}: {n}" for label, n in zip(labels, counts, strict=True)))
+    for label, n in zip(labels, counts, strict=True):
+        if n == 0:
+            print_warning(_empty_window_warning(label, anchor))
 
 
 def fetch_photos(
@@ -83,6 +147,7 @@ def fetch_videos_and_live_photos(
 
     progress.update(task, completed=True)
     print_success(f"Found {len(assets)} videos")
+    _report_per_window(assets, date_ranges, person_ids)
 
     live_photo_clips: list = []
     if use_live_photos:
