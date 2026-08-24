@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from immich_memories.analysis import llm_metrics
 from immich_memories.cli._helpers import console, print_error, print_success
+from immich_memories.cli._pool_coverage import report_pool_coverage
 from immich_memories.cli._run_inputs import ResolvedRunInputs
 from immich_memories.cli._run_summary import render_run_summary
 from immich_memories.timeperiod import DateRange
@@ -497,6 +498,7 @@ def run_pipeline_and_generate(
     )
 
     print_success(f"Selected {len(selected_clips)} clips for final video")
+    report_pool_coverage(pipeline_result.coverage)
 
     should_upload = resolved.should_upload
     album_name = album or config.upload.album_name
