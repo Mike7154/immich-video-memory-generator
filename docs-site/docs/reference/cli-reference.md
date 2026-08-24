@@ -192,8 +192,8 @@ immich-memories days-due [OPTIONS]
 Find days something happened on, and remember them for later.
 
 Meant to run occasionally rather than per generation: the point of a
-catalogue is a memory nobody asked for ï¿½ five years to the day since
-the wedding ï¿½ and that needs the days found in advance.
+catalogue is a memory nobody asked for — five years to the day since
+the wedding — and that needs the days found in advance.
 
 Days inside a trip are skipped, since a trip memory already tells that
 story, and so are holidays, which have their own.
@@ -275,7 +275,7 @@ immich-memories generate [OPTIONS]
 | `--short-form` | choice: `15` \| `30` \| `60` \| `90` | - | Short-form preset: sets the duration and makes the video vertical |
 | `--orientation` | choice: `landscape` \| `portrait` \| `square` | landscape | Output orientation |
 | `--scale-mode`, `-s` | choice: `fit` \| `blur` | - | How to fill an aspect mismatch: blurred background or black bars (default: from config, else blur) |
-| `--transition`, `-t` | choice: `smart` \| `cut` \| `crossfade` \| `none` | smart | Transition style (default: smart ï¿½ mix of fades & cuts) |
+| `--transition`, `-t` | choice: `smart` \| `cut` \| `crossfade` \| `none` | smart | Transition style (default: smart — mix of fades & cuts) |
 | `--resolution`, `-r` | choice: `auto` \| `4k` \| `1080p` \| `720p` | - | Output resolution (default: config value, 'auto' to match source clips) |
 | `--music-volume` | float | 0.5 | Music volume 0.0-1.0 (default: 0.5) |
 | `--format` | choice: `mp4` \| `h265` \| `prores` | - | Output format override (default: config value) |
@@ -284,7 +284,7 @@ immich-memories generate [OPTIONS]
 | `--music`, `-m` | text | - | Music: path to audio file, 'auto' to generate from config, or omit for default behavior |
 | `--no-music` | boolean | false | Disable all music (skip both provided files and AI generation) |
 | `--dry-run` | boolean | false | Show what would be done without generating |
-| `--no-render` | boolean | false | Run the real selection ï¿½ analysis, verify, judge, review ï¿½ and stop before encoding. Unlike --dry-run, which uses cached analysis only and skips the verify pass, this picks the clips it would actually ship |
+| `--no-render` | boolean | false | Run the real selection — analysis, verify, judge, review — and stop before encoding. Unlike --dry-run, which uses cached analysis only and skips the verify pass, this picks the clips it would actually ship |
 | `--trace-selection` | file | - | Write a stage-by-stage report of how the clips were chosen |
 | `--upload-to-immich` | boolean | false | Upload generated video back to Immich |
 | `--album` | text | - | Immich album name for uploaded video |
